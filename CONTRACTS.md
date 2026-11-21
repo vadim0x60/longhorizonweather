@@ -27,6 +27,11 @@ python3 datacollect/run.py --year <X> --out <data_dir>
 ```
 - Writes `manifest.json` and year `<= X` weather/climate datasets into `<data_dir>`.
 - Must support any historical integer `X` in `1980..2024`.
+- Standard output files in `<data_dir>` (extensible by additive modules):
+  - `manifest.json`: `{"year_x": <int>, "max_date": "<X>-12-31", "locations": [...]}`
+  - `daily_year_x.csv`: CSV with columns `location_id,lat,lon,date,temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max` for `{X}-01-01` .. `{X}-12-31` across the shared benchmark locations.
+  - `daily_history.csv`: same CSV schema for trailing historical years `max(1980, X-15)` .. `X` (strictly `date <= {X}-12-31`), enabling trends, climatology, and lag features without lookahead.
+  - Optional extra files (e.g. `indices_monthly.json`) strictly dated `<= {X}-12-31` and listed in `manifest.json`.
 
 ### `predict{i}/run.py`
 ```bash
