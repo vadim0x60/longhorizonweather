@@ -1,5 +1,5 @@
 {
-  "round": 0,
+  "round": 1,
   "started_at_utc": "2026-11-21T22:55:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
@@ -14,5 +14,27 @@
     "predict9": 0,
     "predict10": 0
   },
-  "history": []
+  "history": [
+    {
+      "round": 1,
+      "timestamp_utc": "2026-11-21T23:25:00Z",
+      "year_x": 1995,
+      "year_x_plus_1": 1996,
+      "contradictions_count": 0,
+      "resolved_count": 0,
+      "scores_delta": {
+        "predict1": 0,
+        "predict2": 0,
+        "predict3": 0,
+        "predict4": 0,
+        "predict5": 0,
+        "predict6": 0,
+        "predict7": 0,
+        "predict8": 0,
+        "predict9": 0,
+        "predict10": 0
+      },
+      "note": "All 10 predictors ran cleanly and passed intake (150 claims each, 114 for predict8; 296 shared targets), with 0 disjoint contradictions because round 1 models leaned in the same consensus directions or used overlapping intervals."
+    }
+  ]
 }

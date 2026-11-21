@@ -1,0 +1,25 @@
+{
+ "base_model": "Qwen/Qwen3-8B",
+ "stations": [
+  "london_uk",
+  "new_york_us",
+  "tokyo_jp",
+  "sydney_au",
+  "cairo_eg",
+  "mumbai_in",
+  "sao_paulo_br"
+ ],
+ "sampler_path": "tinker://8e3fb968-9e13-5383-b27e-e78200038767:train:0/sampler_weights/p2-regime-r1",
+ "scale": 0.0,
+ "val_corr": -0.0718,
+ "val_acc": 0.5714,
+ "train_years": [
+  1945,
+  1970
+ ],
+ "val_years": [
+  1971,
+  1978
+ ],
+ "prefill_usd_per_m": 0.195
+}

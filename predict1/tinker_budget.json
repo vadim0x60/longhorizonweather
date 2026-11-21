@@ -1,0 +1,214 @@
+{
+ "cap_usd": 50.0,
+ "entries": [
+  {
+   "utc": "2026-11-21T23:18:03Z",
+   "kind": "train",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 2828900,
+   "usd": 1.2447,
+   "note": "LoRA r16 40000 ex x1 ep, bs 256"
+  },
+  {
+   "utc": "2026-11-21T23:18:16Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 109420,
+   "usd": 0.0213,
+   "note": "validation on 1500 examples (1970-1979 targets)"
+  },
+  {
+   "utc": "2026-11-21T23:19:16Z",
+   "kind": "train",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 181000,
+   "usd": 0.08,
+   "note": "conservative estimate: accidental service auto-restart, stopped after ~35s (<=10 steps)"
+  },
+  {
+   "utc": "2026-11-21T23:19:29Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 12615,
+   "usd": 0.0025,
+   "note": "run.py inference X=1985, 170 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:19:38Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25683,
+   "usd": 0.005,
+   "note": "run.py inference X=2000, 373 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:19:46Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25523,
+   "usd": 0.005,
+   "note": "run.py inference X=2015, 371 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:20:11Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 12398,
+   "usd": 0.0024,
+   "note": "run.py inference X=1982, 170 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:20:16Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 24400,
+   "usd": 0.0048,
+   "note": "run.py inference X=1988, 371 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:20:22Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25908,
+   "usd": 0.0051,
+   "note": "run.py inference X=1993, 371 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:20:28Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25986,
+   "usd": 0.0051,
+   "note": "run.py inference X=1998, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:20:33Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25763,
+   "usd": 0.005,
+   "note": "run.py inference X=2003, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:20:38Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25731,
+   "usd": 0.005,
+   "note": "run.py inference X=2008, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:20:44Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25608,
+   "usd": 0.005,
+   "note": "run.py inference X=2013, 372 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:20:49Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25717,
+   "usd": 0.005,
+   "note": "run.py inference X=2018, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:20:54Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25728,
+   "usd": 0.005,
+   "note": "run.py inference X=2022, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:21:21Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25687,
+   "usd": 0.005,
+   "note": "run.py inference X=2011, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:22:00Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 27650,
+   "usd": 0.0054,
+   "note": "run.py inference X=1985, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:22:08Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 27710,
+   "usd": 0.0054,
+   "note": "run.py inference X=1990, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:22:17Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 27733,
+   "usd": 0.0054,
+   "note": "run.py inference X=1995, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:22:27Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25730,
+   "usd": 0.005,
+   "note": "run.py inference X=2000, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:22:36Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25722,
+   "usd": 0.005,
+   "note": "run.py inference X=2005, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:22:44Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25627,
+   "usd": 0.005,
+   "note": "run.py inference X=2010, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:22:52Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25485,
+   "usd": 0.005,
+   "note": "run.py inference X=2015, 372 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:23:00Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25731,
+   "usd": 0.005,
+   "note": "run.py inference X=2020, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:23:09Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 25744,
+   "usd": 0.005,
+   "note": "run.py inference X=2023, 374 prompts"
+  },
+  {
+   "utc": "2026-11-21T23:24:35Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 48697,
+   "usd": 0.0095,
+   "note": "run.py inference X=1995, 680 prompts"
+  }
+ ],
+ "total_usd": 1.4616
+}

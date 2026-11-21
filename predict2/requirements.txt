@@ -1,0 +1,2 @@
+tinker>=0.39
+transformers>=4.51

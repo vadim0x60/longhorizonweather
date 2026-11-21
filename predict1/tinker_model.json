@@ -1,0 +1,23 @@
+{
+ "base_model": "Qwen/Qwen3-8B",
+ "sampler_path": "tinker://c74b194b-17c0-5060-add4-efe55172de99:train:0/sampler_weights/p1-seqcorr-1795303083",
+ "bin_centers": {
+  " A": -1.4798665343220307,
+  " B": -0.6516156413151352,
+  " C": -0.01677345669522773,
+  " D": 0.6471522857490088,
+  " E": 1.894874847648645
+ },
+ "train_max_target_year": 1969,
+ "n_train": 40000,
+ "epochs": 1,
+ "validation_1970_1979": {
+  "n_val": 1500,
+  "logloss_model": 1.5707079763705643,
+  "logloss_marginal": 1.5790069249996275,
+  "mse_model": 1.137739065556645,
+  "mse_baseline": 1.144243861275857,
+  "sign_acc": 0.5106666666666667
+ },
+ "blend_weight": 0.3
+}

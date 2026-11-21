@@ -1,0 +1,25 @@
+{
+ "cap_usd": 50.0,
+ "round1_target_usd": 15.0,
+ "pricing_note": "Qwen/Qwen3-8B list price: train $0.44/M, prefill $0.195/M tokens",
+ "training_runs": [
+  {
+   "name": "p2-smoke",
+   "base_model": "Qwen/Qwen3-8B",
+   "train_tokens": 30,
+   "usd_est": 0.001,
+   "note": "API smoke test, 2 examples"
+  },
+  {
+   "name": "p2-regime-r1",
+   "base_model": "Qwen/Qwen3-8B",
+   "train_tokens": 219723,
+   "usd_est": 0.1229,
+   "sampler_path": "tinker://8e3fb968-9e13-5383-b27e-e78200038767:train:0/sampler_weights/p2-regime-r1"
+  }
+ ],
+ "training_usd_est": 0.1239,
+ "inference_runs": 5,
+ "inference_usd_est": 0.0079,
+ "total_usd_est": 0.1318
+}
