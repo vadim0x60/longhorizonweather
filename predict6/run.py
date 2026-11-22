@@ -368,6 +368,31 @@ def long_mean(pre, ys, vs, var, win, X):
     return (sum(old) + sum(new)) / (len(old) + len(new))
 
 
+ENSO_POINT_W = 0.5     # Round 10: weight of the lagged-ENSO point term (annual temp_mean/min only)
+ENSO_POINT_RIDGE = 3.0  # ridge, in multiples of the sample variance of Nino3.4
+
+
+def enso_point_shift(ys, vs, var, X, enso):
+    """Lagged ENSO term for a point: residuals of the last 16 years from the shrunk trend line
+    regressed (ridge) on the preceding year's Oct-Dec Nino3.4, evaluated at year X's value.
+    Only Nino3.4 months <= X-12 are used (load_enso)."""
+    if X not in enso:
+        return 0.0
+    sel = [(y, v) for y, v in zip(ys, vs) if y >= X - 15]
+    n = len(sel)
+    tb, yb = sum(y for y, _ in sel) / n, sum(v for _, v in sel) / n
+    sxx = sum((y - tb) ** 2 for y, _ in sel)
+    bo = sum((y - tb) * (v - yb) for y, v in sel) / sxx if sxx else 0.0
+    b = n / (n + 40.0) * bo + 40.0 / (n + 40.0) * 0.03
+    pts = [(enso[y - 1], v - (yb + b * (y - tb))) for y, v in sel if (y - 1) in enso]
+    if len(pts) < 4:
+        return 0.0
+    nb = sum(e for e, _ in pts) / len(pts)
+    snn = sum((e - nb) ** 2 for e, _ in pts)
+    beta = sum((e - nb) * r for e, r in pts) / (snn + ENSO_POINT_RIDGE * snn / len(pts)) if snn else 0.0
+    return beta * (enso[X] - nb)
+
+
 def shrunk_line(ys, vs, X, prior, k=40.0):
     """(value at X+1, residual of year X) of an OLS line whose slope is shrunk toward prior
     with weight k / (n + k)."""
@@ -462,6 +487,8 @@ def candidates(rows, meta, X, enso):
                     lm = long_mean(pre.get(loc), ys, vs, var, WINDOWS[win], X) if win == "year" else None
                     if lm is not None:  # Round 8: annual points meet a 1964..X mean (X <= 1995)
                         pv = (1 - LONG_W[var]) * pv + LONG_W[var] * lm
+                    if win == "year" and var in ("temp_mean_c", "temp_mean_min_c"):
+                        pv += ENSO_POINT_W * enso_point_shift(ys, vs, var, X, enso)
                     out.append((1.0, ("point", var, wclass(win)), {
                         "target": target(loc, win, var),
                         "assertion": {"kind": "point", "value": round(pv, 2 if var in TEMP_VARS else 1)},

@@ -154,7 +154,11 @@ PT_PARAMS = {"temp": (0.4, 1.0, 12, 0.015, 30.0, 0.1, 0.1),
 # +5 with the round-8 setting, -17 with the new one), so it keeps the old one there.
 PT_PRECIP_PRE1980 = (0.6, 0.4, 0, 0.0, 30.0, 0.1, 0.0)
 PT_SOND_ANN = 0.2          # Sep-Nov carry for annual-window temperature points (see above)
-PT_TEMP_PRE1980 = (0.8, 0.0, 12, 0.0, 30.0, 0.1, 0.0)
+# Round 10: against the round-9 field over X=1981..1994 that setting lost (-24, -58 on 1981..87;
+# Round 9 scored X=1986). Dropping the ridge (fit on the flat 1964..79 decades) for the history
+# mean + full trend term shrunk toward 0.015 C/yr + 0.1 x the Sep-Nov residual gives +39
+# (+23 on 1981..87, +16 on 1988..94); the post-1995 setting gives -19, a 0.025 prior -32.
+PT_TEMP_PRE1980 = (0.0, 1.0, 12, 0.015, 30.0, 0.0, 0.1)
 # Hot-day points from shifted daily highs (see point_value) beat the count-series formula in the
 # local arena for X=1985..1995 (-22 -> -2 on hot days over 1985-88, +43 net over 1985-95) but
 # lost for X=1998..2023 (+24 -> +10), so "auto" shifts only when the history reaches before 1980.

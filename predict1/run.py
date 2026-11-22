@@ -372,7 +372,7 @@ class Corrector:
     per-location coefficient. Fitted by walk-forward rows with t <= X only."""
 
     RIDGE = 30.0
-    RIDGE_ENSO = 60.0
+    RIDGE_ENSO = 15.0  # 60 -> 15: +91 -> +117 vs round-9 rival points over 21 years (from 1995: -6 -> +21)
 
     def __init__(self, F, enso):
         self.F, self.enso = F, enso

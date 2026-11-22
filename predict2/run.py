@@ -50,7 +50,7 @@ PRECIP_RECENT = ("precip_sum_mm",)
 PRECIP_BASE = os.environ.get("P2_PB", "clim16")  # short post-1980 means mislead early years; replay -14 -> +10
 PRECIP_DRIFT = float(os.environ.get("P2_PD", "0.3"))  # + drift * (last3 - clim16), predict6-style
 PRECIP_LINE_W = float(os.environ.get("P2_PLW", "0.5"))
-TREND_ADJ = float(os.environ.get("P2_TA", "1.0"))  # late-years replay (7 stations, X=1995-2023): -159 -> -32 with TP 0.03
+TREND_ADJ = float(os.environ.get("P2_TA", "0.7"))  # Round 9 rivals: early +2 -> +87, late20 -26 -> -1, late7 -46 -> -49
 SOND_CARRY = float(os.environ.get("P2_SC", "0.1"))  # + carry * year-X Sep-Dec anomaly, predict4-style; 0.3 lost badly in 1981-94
 PRECIP_MIN_YEAR = int(os.environ.get("P2_PMY", "0"))
 EPS = 0.01  # threshold margin so "le m" / "gt m" stay disjoint from rivals' gt/le at m

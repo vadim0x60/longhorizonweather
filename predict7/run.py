@@ -122,6 +122,14 @@ P4 = (0.03, 40.0, 0.2, 0.2)  # (prior slope, prior strength k, residual carry, S
 # +225 to +298); weights 0.4 / 0.6 scored +249 / +285, and using it for every X
 # (long history) lost badly (-417), so it is only for short histories.
 LONG_WEIGHT = 0.5
+# Lagged ENSO term for temperature-mean points: ridge regression of each window's
+# yearly anomaly (vs its 16-yr mean) on the previous Oct-Dec Nino-3.4 anomaly from
+# the data-dir's indices_monthly.json; point += ENSO_W * beta * (Nino_OND(X) - mean).
+# Round 10, full verify vs the round-9 field (with indices), X = 1985..2023, by ENSO_W:
+# 0 +52, 0.25 +164, 0.4 +211, 0.5 +201, 0.6 +150, 0.75 +112, 1.0 -66. Long-mean weight
+# at ENSO_W 0.4: 0.25 +158, 0.5 +211, 0.75 +107. Without the indices file the term is 0.
+ENSO_W = 0.4
+ENSO_RIDGE = 6.0
 LONG_FIRST = 1964
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRE1980 = os.path.join(HERE, "pre1980_monthly.csv")
@@ -585,6 +593,35 @@ def residual_point(years, vals, target_year, anom):
     return yb + b * (target_year - tb) + a * resid + cs * anom
 
 
+def load_enso(data_dir, year_x):
+    path = os.path.join(data_dir, "indices_monthly.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        doc = json.load(f)
+    acc = defaultdict(list)
+    for r in doc.get("series", doc).get("nino34_anom") or []:
+        y, m = int(r["date"][:4]), int(r["date"][5:7])
+        if y <= year_x and m >= 10 and r.get("value") is not None:
+            acc[y].append(float(r["value"]))
+    return {y: sum(v) / 3 for y, v in acc.items() if len(v) == 3}
+
+
+def enso_shift(years, vals, enso, year_x):
+    if year_x not in enso:
+        return 0.0
+    clim = sum(vals) / len(vals)
+    pts = [(enso[t - 1], v - clim) for t, v in zip(years, vals) if t - 1 in enso]
+    if len(pts) < 6:
+        return 0.0
+    nb = sum(n for n, _ in pts) / len(pts)
+    snn = sum((n - nb) ** 2 for n, _ in pts)
+    if snn <= 0:
+        return 0.0
+    beta = sum((n - nb) * r for n, r in pts) / (snn + ENSO_RIDGE * snn / len(pts))
+    return beta * (enso[year_x] - nb)
+
+
 def sep_dec_anomaly(days, hist_years, year_x):
     ser = window_series(days, "09-01", "12-31", hist_years)
     yr = yearly("temp_mean_c", ser)
@@ -622,6 +659,7 @@ def build_claims(year_x, data_dir):
     hist_years = list(range(max(1980, year_x - 15), year_x + 1))
     cands, points = [], []
     pre_all = load_pre1980()
+    enso = load_enso(data_dir, year_x)
     for lid in sorted(rows):
         days = {d: v for d, v in rows[lid].items() if d <= f"{year_x}-12-31"}
         lat, lon = meta[lid]
@@ -672,6 +710,10 @@ def build_claims(year_x, data_dir):
                                 lm = (sum(pre[y] for y in long_ys) + sum(vals)) / (len(long_ys) + len(vals))
                                 pv = round((1 - LONG_WEIGHT) * pv + LONG_WEIGHT * lm, 2)
                                 pwhy += f"; then {LONG_WEIGHT:.2f} x {LONG_FIRST}..{year_x} mean {lm:.2f}"
+                            if ENSO_W:
+                                es = ENSO_W * enso_shift(yrs, vals, enso, year_x)
+                                pv = round(pv + es, 2)
+                                pwhy += f"; ENSO shift {es:+.2f}"
                             pwhy = (f"{w1:.2f} x [{pwhy}] + {w2:.2f} x trend-corrected clim "
                                     f"{tcv:.2f} (slope {slope:+.3f}/yr over {len(pre)} pre-1980 + "
                                     f"{len(yrs)} recent yrs) + {w3:.2f} x damped trend-residual "

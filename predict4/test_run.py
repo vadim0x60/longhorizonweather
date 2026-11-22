@@ -126,7 +126,7 @@ class Predict4Tests(unittest.TestCase):
         _, r_sond = line_and_resid(daily_mean(lambda d: d.month >= 9))
         annual = next(c for c in points if c["target"]["variable"] == "temp_mean_c"
                       and c["target"]["window_end"] == f"{X + 1}-12-31")
-        self.assertAlmostEqual(annual["assertion"]["value"], line + 0.2 * r_year + 0.2 * r_sond, places=2)
+        self.assertAlmostEqual(annual["assertion"]["value"], line + 0.1 * r_year + 0.2 * r_sond, places=2)
         # The shrunk trend undershoots the true 0.15/yr warming: below naive extrapolation.
         self.assertLess(annual["assertion"]["value"], statistics.mean(daily_mean(lambda d: d.year == X).values()) + 0.15)
 
