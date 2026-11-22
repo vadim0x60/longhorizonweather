@@ -3,20 +3,24 @@
 
 Models each yearly target series y_t (one value per trailing year <= X) as
 
-    y_t = level + trend * t + cycle(t) + AR(1) anomaly + noise
+    y_t = level + trend * t + cycle(t) + AR(1) anomaly + ENSO(t) + noise
 
 * trend: Theil-Sen slope, shrunk toward a physical prior (warming for temps).
-* AR(1): lag-1 autocorrelation of detrended residuals (damped persistence),
-  so an extreme year X is mostly expected to mean-revert in X+1.
+* AR(1): lag-1 autocorrelation of detrended residuals, heavily shrunk, so an
+  extreme year X mostly mean-reverts in X+1.
 * cycle: strongest periodogram harmonic with period 2..8 years, added only
   when it passes a Fisher g-test, with amplitude shrunk.
-* noise: residual spread inflated for parameter uncertainty and calibrated
-  by rolling-origin backtests (see INFLATE).
+* ENSO: ridge regression of residuals on the preceding Oct-Dec Nino3.4 anomaly
+  (from indices_monthly.json, months <= X-12), used for temperatures at
+  |lat| < 35 deg, where the lagged ENSO teleconnection showed out-of-sample skill.
+  A late-X El Nino makes us call a warmer X+1 where mean-reversion models call
+  cooling; a La Nina makes us call "le baseline" against warming extrapolators.
 
-Claims are 80%-ish intervals around the forecast, booleans for
-warmer/wetter-than-year-X when the forecast is far from the year-X value
-(mean-reversion bets), and categorical hottest/wettest month when the
-climatological mode is dominant. Stdlib only; reads only --data-dir.
+Claims are thresholds at the naive 15/16-year climatologies that trend and
+climatology rivals anchor on (so a disagreement is an exact contradiction),
+plus warmer/wetter-than-year-X booleans. Candidates are ranked by
+(2p - 1) x how often rivals take the opposite side of that kind of target.
+Stdlib only; reads only --data-dir (dates <= X-12-31).
 """
 import argparse
 import calendar
@@ -62,6 +66,27 @@ def load(data_dir, year_x):
                                           num("wind_speed_10m_max"))
             meta[r["location_id"]] = (float(r["lat"]), float(r["lon"]))
     return rows, meta
+
+
+def load_enso(data_dir, year_x):
+    """{year: Oct-Dec mean Nino3.4 anomaly} for years <= X, from indices_monthly.json if present."""
+    path = os.path.join(data_dir, "indices_monthly.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        rows = json.load(open(path)).get("series", {}).get("nino34_anom", [])
+    except (ValueError, AttributeError):
+        return {}
+    m = {r["date"]: r["value"] for r in rows if r.get("date", "9999") <= f"{year_x}-12" and r.get("value") is not None}
+    out = {}
+    for y in range(1900, year_x + 1):
+        v = [m.get(f"{y}-{k}") for k in ("10", "11", "12")]
+        if None not in v:
+            out[y] = sum(v) / 3
+    return out
+
+
+ENSO_MAX_LAT = 35.0  # ENSO teleconnection used only for tropical/subtropical temperatures (backtested)
 
 
 def window_days(year, ms, ds, me, de):
@@ -160,7 +185,21 @@ def spectral_cycle(t, r, t_next):
     return shrink * (a * math.cos(w * t_next) + b * math.sin(w * t_next)), 2 * math.pi / w
 
 
-def forecast(years, vals, var, year_next):
+ENSO_LAMBDA = 2.0  # ridge pseudo-variance (degC^2 of Nino3.4) shrinking the ENSO coefficient
+
+
+def enso_term(years, rc, enso, year_next):
+    """Ridge regression of detrended residuals on Oct-Dec Nino3.4 of the preceding year."""
+    pr = [(enso[y - 1], r) for y, r in zip(years, rc) if (y - 1) in enso]
+    if not enso or len(pr) < 8 or (year_next - 1) not in enso:
+        return 0.0, 0.0, [0.0] * len(rc)
+    me = sum(e for e, _ in pr) / len(pr)
+    beta = sum((e - me) * r for e, r in pr) / (sum((e - me) ** 2 for e, _ in pr) + ENSO_LAMBDA)
+    fit = [beta * (enso[y - 1] - me) if (y - 1) in enso else 0.0 for y in years]
+    return beta * (enso[year_next - 1] - me), beta, fit
+
+
+def forecast(years, vals, var, year_next, enso=None):
     n = len(vals)
     t = [y - years[-1] for y in years]  # t=0 is year X
     tn = year_next - years[-1]
@@ -176,42 +215,50 @@ def forecast(years, vals, var, year_next):
     phi = sum(rc[i] * rc[i - 1] for i in range(1, n)) / den if den > 0 else 0.0
     phi = max(-0.4, min(0.5, phi * n / (n + PHI_SHRINK)))
     cyc, period = spectral_cycle(t, rc, tn)
-    mu = a + b * tn + mr + phi * rc[-1] + cyc
+    ens, beta, fit = enso_term(years, rc, enso or {}, year_next)
+    mu = a + b * tn + mr + phi * rc[-1] + cyc + ens
     sd = math.sqrt(den / max(n - 2, 1)) if den > 0 else 0.0
     sigma = sd * math.sqrt(1 + 1.0 / n + (tn - sum(t) / n) ** 2 / max(sum((ti - sum(t) / n) ** 2 for ti in t), 1e-9)) * INFLATE
     return {"mu": mu, "sigma": sigma, "trend": b, "phi": phi, "period": period, "cyc": cyc,
-            "last": vals[-1], "clim": sum(vals) / n, "n": n, "resid": rc}
+            "enso": ens, "beta": beta, "last": vals[-1], "clim": sum(vals) / n, "n": n, "resid": rc}
 
 
 # ---------------------------------------------------------------- claims
-WINDOWS = {
-    "year": (1, 1, 12, 31),
-    "jja": (6, 1, 8, 31),
-    "djf_jf": (1, 1, 2, 31),
-    "mam": (3, 1, 5, 31),
-    "son": (9, 1, 11, 30),
-    "jan": (1, 1, 1, 31),
-    "jul": (7, 1, 7, 31),
-}
+# Windows that rivals also use (exact canonical targets are needed for contradictions).
+WINDOWS = {"year": (1, 1, 12, 31), "jf": (1, 1, 2, 31), "mam": (3, 1, 5, 31), "jja": (6, 1, 8, 31),
+           "son": (9, 1, 11, 30), "q1": (1, 1, 3, 31), "q2": (4, 1, 6, 30), "q3": (7, 1, 9, 30),
+           "q4": (10, 1, 12, 31)}
+WINDOWS.update({f"m{m:02d}": (m, 1, m, 31) for m in range(1, 13)})
 
 COUNT_VARS = {"hot_days_ge_30c", "frost_days_lt_0c", "rainy_days_ge_1mm"}
-NONNEG = COUNT_VARS | {"precip_sum_mm", "precip_max_day_mm", "wind_max_kmh"}
+
+# Selection weight per (kind, variable, window class, side): roughly how often a rival
+# claims the disjoint side of that target (rolling backtest of all ten round-1
+# predictors over X=1995..2023), plus a small floor so accurate filler still ranks.
+# Contradictions concentrate where warming extrapolators claim "gt baseline" and we
+# expect cooling (ENSO / mean reversion), and on whole-year booleans.
+def cat_weight(cat, side):
+    kind, var, wc = cat
+    if kind == "thr":
+        if var.startswith("temp"):
+            if side == "le":
+                return {"year": 0.30, "season": 0.06, "month": 0.012}[wc]
+            return 0.004
+        return {"year": 0.08, "season": 0.01, "month": 0.002}[wc]
+    return {"year": 0.08, "season": 0.02, "month": 0.004}[wc]
 
 
-def rnd(v, var):
-    return round(v) if var in COUNT_VARS else round(v, 1)
+PMIN = 0.60
+BOOL_PMIN = 0.70  # booleans near 0.6 lost more contradictions than they won in backtests
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--year-x", type=int, required=True)
-    ap.add_argument("--data-dir", required=True)
-    ap.add_argument("--out", required=True)
-    args = ap.parse_args()
-    X = args.year_x
+def wclass(win):
+    return "year" if win == "year" else ("month" if win.startswith("m") else "season")
+
+
+def candidates(rows, meta, X, enso):
     Y1 = X + 1
-    rows, meta = load(args.data_dir, X)
-    cands = []  # (priority, claim)
+    out = []
 
     def target(loc, win, var):
         lat, lon = meta[loc]
@@ -223,115 +270,81 @@ def main():
 
     for loc in sorted(rows):
         lr = rows[loc]
-        years = sorted({int(d[:4]) for d in lr})
-        years = [y for y in years if y <= X]
+        years = sorted(y for y in {int(d[:4]) for d in lr} if y <= X)
+        for win in WINDOWS:
+            for var in ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "precip_sum_mm"):
+                ys, vs = yearly_series(lr, years, WINDOWS[win], var)
+                if len(vs) < 8 or ys[-1] != X:
+                    continue
+                use_enso = var in TEMP_VARS and abs(meta[loc][0]) < ENSO_MAX_LAT
+                f = forecast(ys, vs, var, Y1, enso if use_enso else None)
+                if f["sigma"] <= 0:
+                    continue
+                if var == "precip_sum_mm" and f["clim"] < 10:
+                    continue  # dry-season totals: skewed, ties near zero
+                cyc = f" cycle P={f['period']:.1f}y {f['cyc']:+.2f};" if f["period"] else ""
+                if f["enso"]:
+                    cyc += f" ENSO(Nino3.4 OND {X}={enso[X]:+.2f}) {f['enso']:+.2f};"
+                model = (f"trend {f['trend']:+.3f}/y, AR phi={f['phi']:.2f},{cyc} fcst {f['mu']:.2f}"
+                         f"±{f['sigma']:.2f}")
+                cdf = lambda v: ND.cdf((v - f["mu"]) / f["sigma"])
+                # thresholds at the naive climatologies a trend/climatology rival anchors on
+                b16 = sum(vs) / len(vs)
+                r15 = [v for y, v in zip(ys, vs) if y >= X - 14]
+                b15 = sum(r15) / len(r15)
+                lo_b, hi_b = round(min(b15, b16), 2), round(max(b15, b16), 2)
+                p_le = cdf(lo_b)
+                p_gt = 1 - cdf(hi_b)
+                if p_le >= p_gt:
+                    a, p = {"kind": "threshold", "op": "le", "value": lo_b}, p_le
+                    why = f"{var} at or below naive climatology {lo_b}: {model}."
+                else:
+                    a, p = {"kind": "threshold", "op": "gt", "value": hi_b}, p_gt
+                    why = f"{var} above naive climatology {hi_b}: {model}."
+                out.append((p, ("thr", var, wclass(win)), {"target": target(loc, win, var), "assertion": a,
+                            "confidence": round(min(p, 0.9), 3), "rationale": "Spectral/AR damped-cycle model; " + why}))
+                if var in ("temp_mean_c", "precip_sum_mm"):
+                    bvar = "warmer_than_year_x" if var == "temp_mean_c" else "wetter_than_year_x"
+                    pu = 1 - cdf(f["last"])
+                    val = pu >= 0.5
+                    p = max(pu, 1 - pu)
+                    out.append((p, ("bool", bvar, wclass(win)), {
+                        "target": target(loc, win, bvar), "assertion": {"kind": "boolean", "value": val},
+                        "confidence": round(min(p, 0.9), 3),
+                        "rationale": (f"Year X {var}={f['last']:.2f} vs {model}: P(X+1 > X)={pu:.2f}"
+                                      f"{'; year-X extreme mean-reverts' if p > 0.7 else ''}.")}))
+    return out
 
-        def fc(win, var):
-            ys, vs = yearly_series(lr, years, WINDOWS[win], var)
-            if len(vs) < 8 or ys[-1] != X:
-                return None
-            return forecast(ys, vs, var, Y1)
 
-        # --- interval claims on continuous targets
-        specs = [("year", "temp_mean_c", 10), ("jja", "temp_mean_c", 9), ("year", "precip_sum_mm", 8),
-                 ("djf_jf", "temp_mean_c", 6), ("jul", "temp_mean_c", 6), ("jan", "temp_mean_c", 6),
-                 ("year", "temp_mean_max_c", 4), ("year", "temp_mean_min_c", 4),
-                 ("year", "rainy_days_ge_1mm", 3), ("year", "hot_days_ge_30c", 5),
-                 ("year", "frost_days_lt_0c", 5), ("year", "temp_max_c", 4)]
-        for win, var, pri in specs:
-            f = fc(win, var)
-            if f is None or f["sigma"] <= 0:
-                continue
-            if var in COUNT_VARS and f["clim"] < 3:
-                continue  # rare-event counts are not Gaussian; skip
-            z = ND.inv_cdf(0.5 + COVER / 2)
-            lo, hi = f["mu"] - z * f["sigma"], f["mu"] + z * f["sigma"]
-            if var in NONNEG:
-                lo = max(0.0, lo)
-            lo, hi = rnd(lo, var), rnd(hi, var)
-            if var in COUNT_VARS:
-                lo, hi = math.floor(f["mu"] - z * f["sigma"]), math.ceil(f["mu"] + z * f["sigma"])
-                lo = max(0, lo)
-            anom = (f["mu"] - f["last"]) / f["sigma"]
-            cyc = f" cycle P={f['period']:.1f}y adds {f['cyc']:+.2f}." if f["period"] else ""
-            cands.append((pri, {
-                "target": target(loc, win, var),
-                "assertion": {"kind": "interval", "low": lo, "high": hi},
-                "confidence": COVER,
-                "rationale": (f"Damped AR(1)+trend: X={f['last']:.2f}, clim={f['clim']:.2f}, "
-                              f"trend={f['trend']:+.3f}/y, phi={f['phi']:.2f}, fcst={f['mu']:.2f}"
-                              f"±{f['sigma']:.2f}.{cyc} Forecast minus year X = {anom:+.1f} sd"
-                              f"{' (mean reversion of extreme year X)' if abs(anom) >= 1 else ''}."),
-            }))
-
-        # --- warmer/wetter than year X: mean-reversion bets
-        for win, var, bvar, pri in [("year", "temp_mean_c", "warmer_than_year_x", 9),
-                                    ("jja", "temp_mean_c", "warmer_than_year_x", 7),
-                                    ("djf_jf", "temp_mean_c", "warmer_than_year_x", 6),
-                                    ("year", "precip_sum_mm", "wetter_than_year_x", 8),
-                                    ("jja", "precip_sum_mm", "wetter_than_year_x", 5)]:
-            f = fc(win, var)
-            if f is None or f["sigma"] <= 0 or f["clim"] < 5 and var == "precip_sum_mm":
-                continue
-            p = 1 - ND.cdf((f["last"] - f["mu"]) / f["sigma"])
-            if 0.30 < p < 0.70:
-                continue
-            val = p >= 0.5
-            conf = max(p, 1 - p)
-            cands.append((pri + 2 * (conf - 0.7), {
-                "target": target(loc, win, bvar),
-                "assertion": {"kind": "boolean", "value": val},
-                "confidence": round(min(conf, 0.85), 3),
-                "rationale": (f"Year X {var}={f['last']:.2f} vs damped-cycle forecast {f['mu']:.2f}±{f['sigma']:.2f}: "
-                              f"P(X+1 > X)={p:.2f}; extreme year X swings back."),
-            }))
-
-        # --- hottest / wettest month (climatological mode, full year)
-        for cvar, base, pri in [("hottest_month", "temp_mean_c", 7), ("wettest_month", "precip_sum_mm", 3)]:
-            counts = defaultdict(int)
-            ny = 0
-            for y in years:
-                best = None
-                ok = True
-                for m in range(1, 13):
-                    v = aggregate([lr.get(d) for d in window_days(y, m, 1, m, 31)], base)
-                    if v is None:
-                        ok = False
-                        break
-                    if best is None or v > best[0]:
-                        best = (v, m)
-                if ok:
-                    counts[best[1]] += 1
-                    ny += 1
-            if ny < 8:
-                continue
-            m, c = max(counts.items(), key=lambda kv: kv[1])
-            p = (c + 0.5) / (ny + 1.5)
-            if p < 0.80:
-                continue
-            cands.append((pri + 2 * (p - 0.7), {
-                "target": target(loc, "year", cvar),
-                "assertion": {"kind": "categorical", "value": f"{m:02d}"},
-                "confidence": round(min(p, 0.88), 3),
-                "rationale": f"Seasonal phase locked: month {m:02d} was the {cvar.split('_')[0]} month in {c}/{ny} trailing years.",
-            }))
-
-    cands.sort(key=lambda pc: -pc[0])
-    out, seen = [], set()
-    for _, c in cands:
-        t = c["target"]
-        key = (t["location_id"], t["window_start"], t["window_end"], t["variable"])
-        if key in seen:
-            continue
-        seen.add(key)
-        c = {"claim_id": f"p6_{len(out) + 1:03d}", **c}
-        out.append(c)
-        if len(out) >= MAX_CLAIMS:
-            break
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--year-x", type=int, required=True)
+    ap.add_argument("--data-dir", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--all", action="store_true", help="debug: dump every candidate (not contract-compliant)")
+    args = ap.parse_args()
+    X = args.year_x
+    rows, meta = load(args.data_dir, X)
+    cands = candidates(rows, meta, X, load_enso(args.data_dir, X))
+    out = []
+    if args.all:
+        for p, cat, c in cands:
+            out.append({"claim_id": f"p6_{len(out) + 1:04d}", **c, "_cat": list(cat), "_p": p})
+    else:
+        def side(c):
+            a = c["assertion"]
+            return a.get("op", a.get("value"))
+        ranked = sorted(((2 * p - 1) * (cat_weight(cat, side(c)) + 0.01), i)
+                        for i, (p, cat, c) in enumerate(cands)
+                        if p >= (BOOL_PMIN if cat[0] == "bool" else PMIN))
+        for _, i in reversed(ranked):
+            out.append({"claim_id": f"p6_{len(out) + 1:03d}", **cands[i][2]})
+            if len(out) >= MAX_CLAIMS:
+                break
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(out, f, indent=1)
-    print(f"predict6: wrote {len(out)} claims for X+1={Y1} -> {args.out}")
+    print(f"predict6: wrote {len(out)} claims for X+1={X + 1} -> {args.out}")
 
 
 if __name__ == "__main__":

@@ -1,30 +1,43 @@
 #!/usr/bin/env python3
 """predict8: spatial-graph + pooled ridge ensemble with time-series CV (stdlib only).
 
-For year X, reads only <data_dir>/daily_history.csv (dates <= X-12-31) and emits
-claims about year X+1. Per variable, one pooled model is fit across all
-locations and windows on standardized anomalies z = (s_t - clim_<t) / sd_<t, with
-causal features computed only from years < t:
-  ptrend     network-pooled warming/drying rate (all cities, same variable and
-             window group) extrapolated to t
-  trend      this series' own OLS trend extrapolation (z units)
-  lag1/lag3  persistence of last year / last 3 years
-  net        cross-city mean of lag1 (network signal, leave-one-out)
-  nbr        distance-weighted lag1 of the 3 nearest cities (spatial graph)
-  late       this city's Sep-Dec(t-1) temperature anomaly
-  enso       Lima Sep-Dec(t-1) temperature anomaly (coastal Nino-1+2 proxy),
-             with a per-city coefficient
-Models (climatology, trend, full, full+teleconnection) compete in an
-expanding-window CV over years <= X, separately per variable and window group
-(annual, season, month). A (variable, group) is only claimed when the best
-model beats climatology with a year-blocked t-stat >= 2. Intervals come from
-empirical CV residual quantiles, so their stated confidence is the CV coverage.
+For year X, reads only <data_dir>/daily_history.csv and the optional
+<data_dir>/indices_monthly.json (both strictly <= X-12-31) and emits claims about
+year X+1.
+
+Model. Per variable and window group (annual, season/quarter, month) one pooled
+ridge model is fit across all locations and windows on standardized anomalies
+z = (s_t - clim_<t) / sd_<t, with causal features from years < t only:
+  ptrend   network-pooled trend of the variable (all cities) extrapolated to t
+  trend    the series' own OLS trend extrapolation
+  lag1/3   persistence of last year / mean of the last 3 years
+  net      cross-city mean of lag1 (network signal, leave-one-out)
+  nbr      distance-weighted lag1 of the 3 nearest cities (spatial graph)
+  late     the city's own Sep-Dec(t-1) temperature anomaly
+  (temperatures are modelled net of a fixed 0.025 C/yr warming-prior offset)
+  per-city teleconnections: Oct-Dec(t-1) Nino3.4 (Lima Sep-Dec anomaly as a
+  fallback when no index file), and in "tele2" also Oct-Dec PDO and Nov-Dec NAO.
+Models (climatology, trend, full, tele, tele2) compete in expanding-window CV over
+years <= X; the one with the lowest CV MSE is the forecast, and its CV residuals
+(empirical, per window group) give the predictive distribution.
+
+Claims (one per target, <= 150), on the windows other predictors commonly use:
+  * warmer/wetter_than_year_x booleans where P(side) >= BOOL_MIN, confidence
+    capped by the CV hit rate of such calls.
+  * sharp thresholds at the forecast median: "gt median" when the forecast sits
+    above the naive baselines (climatology mean, last year), else "le median".
+    Under the model each holds with ~50%, but any rival whose whole claim lies on
+    the other side of our median contradicts it and loses with probability
+    > 50% if our forecast is the better one.
+  * hottest_month / wettest_month categoricals when the Monte Carlo argmax is
+    dominant and the climatological argmax was historically reliable.
 """
 import argparse
 import calendar
 import csv
 import json
 import math
+import os
 import random
 import sys
 from collections import defaultdict
@@ -33,10 +46,20 @@ COLS = ["temperature_2m_mean", "temperature_2m_max", "temperature_2m_min",
         "precipitation_sum", "wind_speed_10m_max"]
 TM, TX, TN, PR, WS = range(5)
 
-WINDOWS = [("ANN", 1, 12)] + [("JF", 1, 2), ("MAM", 3, 5), ("JJA", 6, 8), ("SON", 9, 11)] + \
-          [("M%02d" % m, m, m) for m in range(1, 13)]
+# name -> (start month, start day, end month, end day); end day 0 = last day of month
+WINDOWS = {
+    "ANN": (1, 1, 12, 0),
+    "JF": (1, 1, 2, 0), "JF28": (1, 1, 2, 28), "MAM": (3, 1, 5, 0), "JJA": (6, 1, 8, 0), "SON": (9, 1, 11, 0),
+    "Q1": (1, 1, 3, 0), "Q2": (4, 1, 6, 0), "Q3": (7, 1, 9, 0), "Q4": (10, 1, 12, 0),
+}
+for _m in range(1, 13):
+    WINDOWS["M%02d" % _m] = (_m, 1, _m, 0)
 
-# variable -> (daily column, aggregator)
+
+def wgroup(win):
+    return "ANN" if win == "ANN" else ("MON" if win[0] == "M" and win != "MAM" else "SEAS")
+
+
 VARS = {
     "temp_mean_c": (TM, "mean"),
     "temp_mean_max_c": (TX, "mean"),
@@ -50,32 +73,62 @@ VARS = {
     "frost_days_lt_0c": (TN, "lt0"),
     "wind_max_kmh": (WS, "max"),
 }
-NONNEG = {"precip_sum_mm", "precip_max_day_mm", "rainy_days_ge_1mm", "hot_days_ge_30c",
-          "frost_days_lt_0c", "wind_max_kmh"}
 COUNTS = {"rainy_days_ge_1mm", "hot_days_ge_30c", "frost_days_lt_0c"}
+TEMPS = {"temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "temp_max_c", "temp_min_c"}
+WARMING_C_PER_YR = float(os.environ.get("P8_WARM", "0.025"))  # physical prior: global land warming rate since 1980 (offset, not fitted)
+NONNEG = COUNTS | {"precip_sum_mm", "precip_max_day_mm", "wind_max_kmh"}
 
-INTERVAL_COVER = 0.70     # central CV-residual coverage of interval claims
-MIN_TSTAT = 2.0           # year-blocked t-stat of CV MSE gain over climatology
+# popularity weights: how often other predictors claim this kind of target
+VAR_POP = {"temp_mean_c": 1.0, "temp_mean_max_c": 0.8, "temp_mean_min_c": 0.8, "hot_days_ge_30c": 0.7,
+           "frost_days_lt_0c": 0.6, "precip_sum_mm": 0.6, "rainy_days_ge_1mm": 0.4, "temp_max_c": 0.4,
+           "temp_min_c": 0.3}
+WIN_POP = {"ANN": 1.0, "JJA": 0.9, "JF": 0.7, "JF28": 0.7, "MAM": 0.6, "SON": 0.6,
+           "Q1": 0.5, "Q2": 0.5, "Q3": 0.5, "Q4": 0.5}
+WIN_POP.update({"M%02d" % m: 0.35 for m in range(1, 13)})
+
+
+def anchor_targets(T):
+    for var, vw in VAR_POP.items():
+        for win, w in WIN_POP.items():
+            if win == "JF28" and not calendar.isleap(T):
+                continue  # identical to JF
+            yield (var, win), vw * w
+
+
+BOOL_WINDOWS = {"ANN": 1.0, "JJA": 0.9, "MAM": 0.8, "SON": 0.8, "JF": 0.8,
+                "Q1": 0.7, "Q2": 0.7, "Q3": 0.7, "Q4": 0.7}
+BOOL_WINDOWS.update({"M%02d" % m: 0.6 for m in range(1, 13)})
+
+BOOL_MIN = 0.62           # minimum model probability for a boolean claim
+# Anchored-threshold sides we claim, with the minimum model probability for each. Chosen from
+# cross-year calibration (X=1996..2023, every candidate scored on X+1): warm-side temperature,
+# hot-day and both precipitation sides were calibrated; cool-side temperature, frost-day and
+# low rainy-day claims hit 5-15 points below their stated probability, so they are not made.
+THRESH_SIDES = {
+    "temp_mean_c": {"gt": 0.62}, "temp_mean_max_c": {"gt": 0.62}, "temp_max_c": {"gt": 0.62},
+    "hot_days_ge_30c": {"gt": 0.6}, "precip_sum_mm": {"gt": 0.6, "le": 0.6},
+    "rainy_days_ge_1mm": {"gt": 0.62},
+}
+if os.environ.get("P8_TMIN"):  # analysis hook: every side at this probability
+    THRESH_SIDES = {v: {"gt": float(os.environ["P8_TMIN"]), "le": float(os.environ["P8_TMIN"]),
+                        "ge": float(os.environ["P8_TMIN"]), "lt": float(os.environ["P8_TMIN"])}
+                    for v in VARS}        # minimum model probability for an anchored threshold claim
 MIN_PAST = 5              # years of past data needed to standardize a target year
 MAX_CLAIMS = 150
-WIN_W = {"ANN": 1.0, "JF": 0.8, "MAM": 0.8, "JJA": 0.85, "SON": 0.8}
-VAR_W = {"temp_mean_c": 1.0, "precip_sum_mm": 0.9, "warmer_than_year_x": 0.85,
-         "wetter_than_year_x": 0.8, "hottest_month": 0.9, "wettest_month": 0.8,
-         "temp_mean_max_c": 0.75, "temp_mean_min_c": 0.75, "temp_max_c": 0.7,
-         "temp_min_c": 0.7, "hot_days_ge_30c": 0.7, "frost_days_lt_0c": 0.7,
-         "rainy_days_ge_1mm": 0.65, "precip_max_day_mm": 0.6, "wind_max_kmh": 0.5}
+MODELS = ["clim", "trend", "full", "tele", "tele2"]
+LAMBDA = {"trend": 0.05, "full": 0.2, "tele": 0.4, "tele2": 0.8}
+LAMBDA = {k: v * float(os.environ.get("P8_LSCALE", "1")) for k, v in LAMBDA.items()}
 
 
 # ---------------------------------------------------------------- data
 
 def load(data_dir, year_x):
-    days = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))  # loc -> year -> month -> rows
+    days = defaultdict(lambda: defaultdict(dict))  # loc -> year -> "MM-DD" -> vals
     meta = {}
-    with open(f"{data_dir}/daily_history.csv", newline="") as f:
+    with open(os.path.join(data_dir, "daily_history.csv"), newline="") as f:
         for r in csv.DictReader(f):
             d = r["date"]
-            y = int(d[:4])
-            if y > year_x:  # causality guard
+            if int(d[:4]) > year_x:  # causality guard
                 continue
             vals = []
             for c in COLS:
@@ -83,13 +136,49 @@ def load(data_dir, year_x):
                 vals.append(float(v) if v not in ("", None, "nan", "NaN") else None)
             loc = r["location_id"]
             meta[loc] = (float(r["lat"]), float(r["lon"]))
-            days[loc][y][int(d[5:7])].append(vals)
+            days[loc][int(d[:4])][d[5:]] = vals
     return days, meta
+
+
+def load_indices(data_dir, year_x):
+    """{name: {(year, month): value}} restricted to months <= X-12."""
+    p = os.path.join(data_dir, "indices_monthly.json")
+    out = {}
+    if not os.path.exists(p):
+        return out
+    try:
+        with open(p) as f:
+            ser = json.load(f).get("series", {})
+    except (OSError, ValueError):
+        return out
+    for name, rows in ser.items():
+        d = {}
+        for r in rows:
+            y, m = int(r["date"][:4]), int(r["date"][5:7])
+            if y <= year_x and r.get("value") is not None:
+                d[(y, m)] = float(r["value"])
+        out[name] = d
+    return out
+
+
+def window_mds(year, win):
+    m0, d0, m1, d1 = WINDOWS[win]
+    d1 = d1 or calendar.monthrange(year, m1)[1]
+    return "%02d-%02d" % (m0, d0), "%02d-%02d" % (m1, d1)
+
+
+def window_rows(by_md, year, win):
+    a, b = window_mds(year, win)
+    rows = [v for md, v in by_md.items() if a <= md <= b]
+    n_exp = sum(calendar.monthrange(year, m)[1] for m in range(int(a[:2]), int(b[:2]) + 1))
+    if len(rows) < n_exp:
+        return None
+    return rows
 
 
 def agg(rows, col, how):
     v = [r[col] for r in rows if r[col] is not None]
-    if not v or len(v) < 0.9 * len(rows):
+    if len(v) < len(rows):
         return None
     if how == "mean":
         return sum(v) / len(v)
@@ -98,7 +187,7 @@ def agg(rows, col, how):
     if how == "min":
         return min(v)
     if how == "sum":
-        return sum(v) * len(rows) / len(v)
+        return sum(v)
     if how == "ge1":
         return float(sum(1 for x in v if x >= 1.0))
     if how == "ge30":
@@ -108,30 +197,20 @@ def agg(rows, col, how):
     raise ValueError(how)
 
 
-def window_rows(ym, m0, m1):
-    rows = []
-    for m in range(m0, m1 + 1):
-        mr = ym.get(m)
-        if not mr or len(mr) < 27:
-            return None
-        rows.extend(mr)
-    return rows
-
-
 def build_series(days, years):
     """series[var][(loc, win)] = {year: value}"""
     series = {v: {} for v in VARS}
     for loc, by_year in days.items():
-        for wname, m0, m1 in WINDOWS:
+        for win in WINDOWS:
+            per_year = {y: window_rows(by_year.get(y, {}), y, win) for y in years}
             for var, (col, how) in VARS.items():
                 s = {}
-                for y in years:
-                    rows = window_rows(by_year.get(y, {}), m0, m1)
+                for y, rows in per_year.items():
                     if rows is not None:
                         val = agg(rows, col, how)
                         if val is not None:
                             s[y] = val
-                series[var][(loc, wname)] = s
+                series[var][(loc, win)] = s
     return series
 
 
@@ -146,17 +225,31 @@ def sd(a):
     return math.sqrt(sum((x - m) ** 2 for x in a) / max(1, len(a) - 1))
 
 
+def clip(x, lim=3.0):
+    return max(-lim, min(lim, x))
+
+
 def quantile(sorted_a, q):
-    if not sorted_a:
-        return 0.0
     p = q * (len(sorted_a) - 1)
     i = int(math.floor(p))
     j = min(i + 1, len(sorted_a) - 1)
     return sorted_a[i] + (sorted_a[j] - sorted_a[i]) * (p - i)
 
 
+def prob_gt(sorted_resid, x):
+    """P(resid > x) from the empirical residual distribution (smoothed)."""
+    lo, hi = 0, len(sorted_resid)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sorted_resid[mid] <= x:
+            lo = mid + 1
+        else:
+            hi = mid
+    return (len(sorted_resid) - lo + 0.5) / (len(sorted_resid) + 1.0)
+
+
 def std_stats(s, t):
-    """climatology, spread and trend extrapolation from years < t only."""
+    """climatology, spread and own-trend extrapolation from years < t only."""
     past = sorted(y for y in s if y < t)
     if len(past) < MIN_PAST:
         return None
@@ -168,14 +261,7 @@ def std_stats(s, t):
     ym = mean(past)
     sxx = sum((y - ym) ** 2 for y in past)
     slope = sum((y - ym) * (s[y] - c) for y in past) / sxx
-    trend = c + slope * (t - ym)
-    return c, sdev, past, trend
-
-
-def zval(s, y, st):
-    if y not in s:
-        return None
-    return (s[y] - st[0]) / st[1]
+    return c, sdev, past, c + slope * (t - ym)
 
 
 def haversine(a, b):
@@ -193,57 +279,76 @@ def solve(a, b):
         if abs(m[c][c]) < 1e-12:
             continue
         for r in range(n):
-            if r != c:
+            if r != c and m[r][c]:
                 f = m[r][c] / m[c][c]
-                if f:
-                    for k in range(c, n + 1):
-                        m[r][k] -= f * m[c][k]
+                mr, mc = m[r], m[c]
+                for k in range(c, n + 1):
+                    mr[k] -= f * mc[k]
     return [m[i][n] / m[i][i] if abs(m[i][i]) > 1e-12 else 0.0 for i in range(n)]
 
 
-def ridge(X, y, lam):
-    """ridge with unpenalized intercept in column 0."""
-    k = len(X[0])
+def ridge(rows, y, k, lam):
+    """rows: sparse [(idx, val)], ridge with unpenalized intercept at index 0."""
     a = [[0.0] * k for _ in range(k)]
     b = [0.0] * k
-    for xi, yi in zip(X, y):
-        for i in range(k):
-            xv = xi[i]
-            if xv == 0.0:
-                continue
+    for xi, yi in zip(rows, y):
+        for i, xv in xi:
             b[i] += xv * yi
             ai = a[i]
-            for j in range(k):
-                ai[j] += xv * xi[j]
-    n = len(X)
+            for j, xw in xi:
+                ai[j] += xv * xw
+    n = len(rows)
     for i in range(1, k):
         a[i][i] += lam * n
     return solve(a, b)
 
 
-def dot(w, x):
-    return sum(wi * xi for wi, xi in zip(w, x))
+def sdot(w, xi):
+    return sum(w[i] * v for i, v in xi)
 
 
 # ---------------------------------------------------------------- features
 
 class Featurizer:
-    def __init__(self, series, meta, years):
+    def __init__(self, series, meta, indices):
         self.series = series
         self.meta = meta
         self.locs = sorted(meta)
-        self.years = years
+        self.li = {l: i for i, l in enumerate(self.locs)}
         self.nbrs = {}
         for l in self.locs:
             d = sorted((haversine(meta[l], meta[o]), o) for o in self.locs if o != l)[:3]
             self.nbrs[l] = [(1.0 / max(dist, 100.0), o) for dist, o in d]
-        self.enso_loc = "lima_pe" if "lima_pe" in meta else None
-        self._late = {}
-        self._lag1 = {}
-        self._pslope = {}
+        self.idx = {name: self._index_anoms(indices.get(name), months)
+                    for name, months in (("nino34_anom", (10, 11, 12)), ("pdo", (10, 11, 12)),
+                                         ("nao", (11, 12)))}
+        if not self.idx["nino34_anom"] and "lima_pe" in meta:
+            self.idx["nino34_anom"] = None  # fallback to Lima late-year anomaly
+        self._late, self._lag1, self._pslope = {}, {}, {}
+
+    @staticmethod
+    def _index_anoms(d, months):
+        """year -> standardized mean of the index over `months` of that year."""
+        if not d:
+            return {}
+        raw = {}
+        for y in sorted({k[0] for k in d}):
+            v = [d[(y, m)] for m in months if (y, m) in d]
+            if len(v) == len(months):
+                raw[y] = mean(v)
+        if len(raw) < 5:
+            return {}
+        s = sd(list(raw.values())) or 1.0
+        mu = mean(list(raw.values()))
+        return {y: clip((v - mu) / s) for y, v in raw.items()}
+
+    def index_feat(self, name, t):
+        d = self.idx.get(name)
+        if d is None:  # Nino fallback
+            return self.late_anom("lima_pe", t)
+        return d.get(t - 1, 0.0)
 
     def pooled_slope(self, var, grp, t):
-        """network-pooled trend in z units per year, fit on years < t across all cities/windows."""
         key = (var, grp, t)
         if key not in self._pslope:
             sxy = sxx = 0.0
@@ -262,15 +367,13 @@ class Featurizer:
         return self._pslope[key]
 
     def late_anom(self, loc, t):
-        """Sep-Dec(t-1) temp_mean anomaly vs earlier Sep-Dec, from years < t."""
         key = (loc, t)
         if key not in self._late:
-            sep = self.series["temp_mean_c"].get((loc, "SON"), {})
+            son = self.series["temp_mean_c"].get((loc, "SON"), {})
             dec = self.series["temp_mean_c"].get((loc, "M12"), {})
-            s = {y: 0.75 * sep[y] + 0.25 * dec[y] for y in sep if y in dec}
+            s = {y: 0.75 * son[y] + 0.25 * dec[y] for y in son if y in dec}
             st = std_stats(s, t - 1)
-            z = zval(s, t - 1, st) if st else None
-            self._late[key] = 0.0 if z is None else max(-3.0, min(3.0, z))
+            self._late[key] = clip((s[t - 1] - st[0]) / st[1]) if st and (t - 1) in s else 0.0
         return self._late[key]
 
     def lag1(self, var, loc, win, t):
@@ -278,23 +381,20 @@ class Featurizer:
         if key not in self._lag1:
             s = self.series[var].get((loc, win), {})
             st = std_stats(s, t)
-            z = zval(s, t - 1, st) if st else None
-            self._lag1[key] = None if z is None else max(-3.0, min(3.0, z))
+            self._lag1[key] = clip((s[t - 1] - st[0]) / st[1]) if st and (t - 1) in s else None
         return self._lag1[key]
 
     def row(self, var, loc, win, t):
-        """returns (features, clim, sd, z_target or None) for target year t, or None."""
+        """(features, clim, sd) for target year t, or None."""
         s = self.series[var].get((loc, win), {})
         st = std_stats(s, t)
         if st is None:
             return None
         c, sdev, past, trend = st
-        if var in COUNTS:
-            vals = [s[y] for y in past]
-            if sum(1 for v in vals if v == 0) > 0.3 * len(vals):
-                return None
-        zs = [max(-3.0, min(3.0, (s[y] - c) / sdev)) for y in past]
-        f_trend = max(-3.0, min(3.0, (trend - c) / sdev))
+        if var in COUNTS and sum(1 for y in past if s[y] == 0) > 0.3 * len(past):
+            return None
+        zs = [clip((s[y] - c) / sdev) for y in past]
+        f_trend = clip((trend - c) / sdev)
         f_lag1 = zs[-1] if past[-1] == t - 1 else 0.0
         f_lag3 = mean(zs[-3:])
         others = [self.lag1(var, o, win, t) for o in self.locs if o != loc]
@@ -307,29 +407,27 @@ class Featurizer:
                 wsum += w
                 vsum += w * z
         f_nbr = vsum / wsum if wsum else 0.0
-        f_late = self.late_anom(loc, t)
-        f_enso = self.late_anom(self.enso_loc, t) if self.enso_loc else 0.0
         f_ptrend = self.pooled_slope(var, wgroup(win), t) * (t - mean(past))
-        feats = [f_ptrend, f_trend, f_lag1, f_lag3, f_net, f_nbr, f_late, f_enso]
-        z_t = (s[t] - c) / sdev if t in s else None
-        return feats, c, sdev, z_t
+        feats = [f_ptrend, f_trend, f_lag1, f_lag3, f_net, f_nbr, self.late_anom(loc, t),
+                 self.index_feat("nino34_anom", t), self.index_feat("pdo", t), self.index_feat("nao", t)]
+        prior = WARMING_C_PER_YR * (t - mean(past)) / sdev if var in TEMPS else 0.0
+        return feats, c, sdev, prior
 
-
-MODELS = ["clim", "trend", "full", "tele"]
-
-
-def design(model, feats, loc, locs):
-    if model == "trend":
-        return [1.0, feats[0]]
-    base = [1.0] + feats[:7]
-    if model == "full":
-        return base
-    enso = [0.0] * len(locs)
-    enso[locs.index(loc)] = feats[7]
-    return base + enso
-
-
-LAMBDA = {"trend": 0.05, "full": 0.2, "tele": 0.4}
+    def design(self, model, feats, loc):
+        """sparse row [(idx, val)] and dimension."""
+        if model == "trend":
+            return [(0, 1.0), (1, feats[0])], 2
+        base = [(0, 1.0)] + [(i + 1, v) for i, v in enumerate(feats[:7])]
+        if model == "full":
+            return base, 8
+        n = len(self.locs)
+        li = self.li[loc]
+        base.append((8 + li, feats[7]))
+        if model == "tele":
+            return base, 8 + n
+        base.append((8 + n + li, feats[8]))
+        base.append((8 + 2 * n + li, feats[9]))
+        return base, 8 + 3 * n
 
 
 # ---------------------------------------------------------------- per-variable modelling
@@ -337,224 +435,193 @@ LAMBDA = {"trend": 0.05, "full": 0.2, "tele": 0.4}
 def fit_variable(var, grp, fz, years, year_x):
     keys = [k for k in fz.series[var] if wgroup(k[1]) == grp]
     samples = []  # (t, loc, win, feats, z)
-    first = years[0] + MIN_PAST
-    for t in range(first, year_x + 1):
+    for t in range(years[0] + MIN_PAST, year_x + 1):
         for loc, win in keys:
+            s = fz.series[var][(loc, win)]
+            if t not in s:
+                continue
             r = fz.row(var, loc, win, t)
-            if r and r[3] is not None:
-                samples.append((t, loc, win, r[0], max(-4.0, min(4.0, r[3]))))
+            if r:
+                samples.append((t, loc, win, r[0], clip((s[t] - r[1]) / r[2] - r[3], 4.0), r[3]))
     tyears = sorted({s[0] for s in samples})
     eval_years = [t for t in tyears if t - tyears[0] >= 3] if tyears else []
     if len(eval_years) < 4:
         return None
-    res = {m: [] for m in MODELS}           # (t, loc, win, residual, zhat)
+    designs = {m: [fz.design(m, s[3], s[1]) for s in samples] for m in MODELS[1:]}
+    cands = MODELS + ["ens"]
+    res = {m: [] for m in cands}  # (t, loc, win, residual, zhat incl. prior)
     for t in eval_years:
-        train = [s for s in samples if s[0] < t]
-        test = [s for s in samples if s[0] == t]
-        for m in MODELS:
-            if m == "clim":
-                w = None
-            else:
-                w = ridge([design(m, s[3], s[1], fz.locs) for s in train], [s[4] for s in train], LAMBDA[m])
-            for s in test:
-                zhat = 0.0 if w is None else dot(w, design(m, s[3], s[1], fz.locs))
-                res[m].append((t, s[1], s[2], s[4] - zhat, zhat))
-    # year-blocked comparison against climatology
-    def year_mse(m):
-        d = defaultdict(list)
-        for t, _, _, r, _ in res[m]:
-            d[t].append(r * r)
-        return {t: mean(v) for t, v in d.items()}
-    clim_y = year_mse("clim")
-    best = None
-    for m in MODELS[1:]:
-        my = year_mse(m)
-        diffs = [clim_y[t] - my[t] for t in clim_y]
-        md = mean(diffs)
-        sdd = sd(diffs) if len(diffs) > 1 else 0.0
-        tstat = md / (sdd / math.sqrt(len(diffs))) if sdd > 0 else (99.0 if md > 0 else 0.0)
-        skill = md / mean(list(clim_y.values()))
-        cand = (skill, tstat, m)
-        if best is None or skill > best[0]:
-            best = cand
-    skill, tstat, m = best
-    w = None if m == "clim" else ridge([design(m, s[3], s[1], fz.locs) for s in samples],
-                                       [s[4] for s in samples], LAMBDA[m])
-    resid = sorted(r[3] for r in res[m])
-    return {"model": m, "w": w, "skill": skill, "tstat": tstat, "resid": resid,
-            "cv": res[m], "n_eval_years": len(eval_years)}
+        tr = [i for i, s in enumerate(samples) if s[0] < t]
+        te = [i for i, s in enumerate(samples) if s[0] == t]
+        preds = {}
+        for m in MODELS[1:]:
+            k = designs[m][0][1]
+            w = ridge([designs[m][i][0] for i in tr], [samples[i][4] for i in tr], k, LAMBDA[m])
+            preds[m] = [sdot(w, designs[m][i][0]) for i in te]
+        preds["clim"] = [0.0] * len(te)
+        preds["ens"] = [mean([preds[m][j] for m in MODELS[1:]]) for j in range(len(te))]
+        for m in cands:
+            for j, i in enumerate(te):
+                s = samples[i]
+                res[m].append((t, s[1], s[2], s[4] - preds[m][j], preds[m][j] + s[5]))
+    mse = {m: mean([r[3] ** 2 for r in res[m]]) for m in cands}
+    # The ensemble is fixed: selecting per X among models on ~5-10 CV years was noisy and,
+    # in cross-year backtests (X=1996..2023), lost to the plain ensemble on every variable checked.
+    m = os.environ.get("P8_FORCE_MODEL", "ens")
+    clim_y, m_y = defaultdict(list), defaultdict(list)
+    for r in res["clim"]:
+        clim_y[r[0]].append(r[3] ** 2)
+    for r in res[m]:
+        m_y[r[0]].append(r[3] ** 2)
+    diffs = [mean(clim_y[t]) - mean(m_y[t]) for t in clim_y]
+    sdd = sd(diffs) if len(diffs) > 1 else 0.0
+    tstat = mean(diffs) / (sdd / math.sqrt(len(diffs))) if sdd > 0 else 0.0
+    members = []
+    for mm in (MODELS[1:] if m == "ens" else ([m] if m != "clim" else [])):
+        k = designs[mm][0][1]
+        members.append((mm, ridge([d[0] for d in designs[mm]], [s[4] for s in samples], k, LAMBDA[mm])))
+    return {"model": m, "members": members, "skill": 1 - mse[m] / mse["clim"], "tstat": tstat,
+            "resid": sorted(r[3] for r in res[m]), "cv": res[m], "n_eval_years": len(eval_years)}
 
 
-def wgroup(win):
-    return "ANN" if win == "ANN" else ("MON" if win.startswith("M") and win != "MAM" else "SEAS")
+class Forecaster:
+    def __init__(self, fz, fits, series, X):
+        self.fz, self.fits, self.series, self.X = fz, fits, series, X
+
+    def get(self, var, loc, win):
+        """(zhat, clim, sd, sorted z-residuals, fit) for X+1, or None."""
+        fit = self.fits.get((var, wgroup(win)))
+        if not fit:
+            return None
+        r = self.fz.row(var, loc, win, self.X + 1)
+        if r is None:
+            return None
+        feats, c, sdev, prior = r
+        mem = fit["members"]
+        zhat = prior + (mean([sdot(w, self.fz.design(m, feats, loc)[0]) for m, w in mem]) if mem else 0.0)
+        return zhat, c, sdev, fit["resid"], fit
+
+    def value_quantile(self, f, q):
+        zhat, c, sdev, resid, _ = f
+        return c + sdev * (zhat + quantile(resid, q))
 
 
-def predict(var, fit, fz, loc, win, t):
-    r = fz.row(var, loc, win, t)
-    if r is None:
-        return None
-    feats, c, sdev, _ = r
-    zhat = 0.0 if fit["w"] is None else dot(fit["w"], design(fit["model"], feats, loc, fz.locs))
-    return zhat, c, sdev
-
-
-def boolean_cv_accuracy(var, fit, fz):
-    """CV accuracy of P(s_t > s_{t-1}) majority calls, from CV residuals."""
+def boolean_cv_accuracy(var, fit, series, pmin):
     hits = n = 0
+    resid = fit["resid"]
     for t, loc, win, r, zhat in fit["cv"]:
-        resid = fit["resid"]
-        s = fz.series[var][(loc, win)]
+        s = series[var][(loc, win)]
         st = std_stats(s, t)
         if st is None or (t - 1) not in s or t not in s:
             continue
-        zprev = (s[t - 1] - st[0]) / st[1]
-        p = prob_gt(resid, zprev - zhat)
-        if abs(p - 0.5) < 0.15:
+        p = prob_gt(resid, (s[t - 1] - st[0]) / st[1] - zhat)
+        if max(p, 1 - p) < pmin:
             continue
         n += 1
         hits += int((p > 0.5) == (s[t] > s[t - 1]))
     return hits, n
 
 
-def prob_gt(sorted_resid, x):
-    """P(resid > x) from the empirical residual distribution."""
-    lo, hi = 0, len(sorted_resid)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if sorted_resid[mid] <= x:
-            lo = mid + 1
-        else:
-            hi = mid
-    return (len(sorted_resid) - lo + 0.5) / (len(sorted_resid) + 1.0)
-
-
 # ---------------------------------------------------------------- claims
 
-def window_dates(t, m0, m1):
-    return "%04d-%02d-01" % (t, m0), "%04d-%02d-%02d" % (t, m1, calendar.monthrange(t, m1)[1])
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--year-x", type=int, required=True)
-    ap.add_argument("--data-dir", required=True)
-    ap.add_argument("--out", required=True)
-    a = ap.parse_args()
-    X, T = a.year_x, a.year_x + 1
-    days, meta = load(a.data_dir, X)
-    years = sorted({y for l in days for y in days[l]})
-    claims = []
-    if len(years) >= MIN_PAST + 4:
-        claims = make_claims(days, meta, years, X, T)
-    claims = claims[:MAX_CLAIMS]
-    for i, c in enumerate(claims, 1):
-        c["claim_id"] = "p8_%03d" % i
-    with open(a.out, "w") as f:
-        json.dump(claims, f, indent=1)
-
-
-def make_claims(days, meta, years, X, T):
+def make_claims(days, meta, years, X, indices, log):
+    T = X + 1
     series = build_series(days, years)
-    fz = Featurizer(series, meta, years)
-    rng = random.Random(X)
-    cands = []  # (score, loc, claim)
+    fz = Featurizer(series, meta, indices)
     fits = {}
     for var in VARS:
         for grp in ("ANN", "SEAS", "MON"):
             f = fits[var, grp] = fit_variable(var, grp, fz, years, X)
             if f:
-                print("%-20s %-4s model=%-5s skill=%+.3f t=%+.2f eval_years=%d" % (
-                    var, grp, f["model"], f["skill"], f["tstat"], f["n_eval_years"]), file=sys.stderr)
-    wins = {w[0]: w for w in WINDOWS}
+                log("%-18s %-4s model=%-5s skill=%+.3f t=%+.2f" % (var, grp, f["model"], f["skill"], f["tstat"]))
+    fc = Forecaster(fz, fits, series, X)
+    rng = random.Random(X)
+    cands = []  # (priority, loc, claim)
 
     def target(loc, win, var):
-        _, m0, m1 = wins[win]
-        ws, we = window_dates(T, m0, m1)
+        a, b = window_mds(T, win)
         lat, lon = meta[loc]
-        return {"location_id": loc, "lat": lat, "lon": lon, "window_start": ws, "window_end": we,
-                "variable": var}
+        return {"location_id": loc, "lat": lat, "lon": lon, "window_start": "%d-%s" % (T, a),
+                "window_end": "%d-%s" % (T, b), "variable": var}
 
-    # 1. interval claims on variables with solid CV edge over climatology
-    for (var, grp), fit in fits.items():
-        if not fit or grp == "MON" or fit["tstat"] < MIN_TSTAT or fit["skill"] <= 0.02:
-            continue
-        a_lo = quantile(fit["resid"], (1 - INTERVAL_COVER) / 2)
-        a_hi = quantile(fit["resid"], 1 - (1 - INTERVAL_COVER) / 2)
+    # 1. warmer/wetter than year X
+    for bvar, var in (("warmer_than_year_x", "temp_mean_c"), ("wetter_than_year_x", "precip_sum_mm")):
+        acc = {}
+        for grp in ("ANN", "SEAS", "MON"):
+            fit = fits.get((var, grp))
+            if fit:
+                h, n = boolean_cv_accuracy(var, fit, series, BOOL_MIN)
+                acc[grp] = (h + 1) / (n + 2)
         for loc in fz.locs:
-            for win in WIN_W:
-                if wgroup(win) != grp:
-                    continue
-                p = predict(var, fit, fz, loc, win, T)
-                if p is None:
-                    continue
-                zhat, c, sdev = p
-                lo, hi = c + sdev * (zhat + a_lo), c + sdev * (zhat + a_hi)
-                if var in NONNEG:
-                    lo = max(0.0, lo)
-                if var in COUNTS:
-                    lo, hi = float(math.floor(lo)), float(math.ceil(hi))
-                    if hi <= 0:
-                        continue
-                else:
-                    lo, hi = math.floor(lo * 10) / 10, math.ceil(hi * 10) / 10
-                score = WIN_W[win] * VAR_W[var] * INTERVAL_COVER * (1 + min(fit["skill"], 0.5))
-                cands.append((score, loc, {
-                    "target": target(loc, win, var),
-                    "assertion": {"kind": "interval", "low": lo, "high": hi},
-                    "confidence": INTERVAL_COVER,
-                    "rationale": "%s ridge (CV skill %.0f%% vs climatology, t=%.1f over %d yrs); "
-                                 "clim %.1f, forecast %.1f; central %d%% CV-residual band" % (
-                                     fit["model"], 100 * fit["skill"], fit["tstat"], fit["n_eval_years"],
-                                     c, c + sdev * zhat, 100 * INTERVAL_COVER)}))
-
-    # 2. warmer/wetter_than_year_x booleans (regression to the mean + trend)
-    for (bvar, var), grp in [(bv, g) for bv in (("warmer_than_year_x", "temp_mean_c"),
-                                                 ("wetter_than_year_x", "precip_sum_mm")) for g in ("ANN", "SEAS")]:
-        fit = fits.get((var, grp))
-        if not fit:
-            continue
-        hits, n = boolean_cv_accuracy(var, fit, fz)
-        # one-sided binomial z-test vs a 50% coin flip
-        if n < 20 or (hits - 0.5 * n) / math.sqrt(0.25 * n) < MIN_TSTAT:
-            continue
-        acc = hits / n
-        for loc in fz.locs:
-            for win in WIN_W:
-                if wgroup(win) != grp:
-                    continue
-                p = predict(var, fit, fz, loc, win, T)
+            for win, ww in BOOL_WINDOWS.items():
+                f = fc.get(var, loc, win)
                 s = series[var].get((loc, win), {})
-                if p is None or X not in s:
+                if f is None or X not in s or acc.get(wgroup(win), 0) < 0.55:
                     continue
-                zhat, c, sdev = p
-                pg = prob_gt(fit["resid"], (s[X] - c) / sdev - zhat)
-                conf = max(pg, 1 - pg)
-                if conf < 0.68:
+                zhat, c, sdev, resid, fit = f
+                pg = prob_gt(resid, (s[X] - c) / sdev - zhat)
+                p = max(pg, 1 - pg)
+                if p < BOOL_MIN:
                     continue
-                conf = min(conf, acc)
-                score = WIN_W[win] * VAR_W[bvar] * conf
-                cands.append((score, loc, {
+                conf = min(p, acc[wgroup(win)])
+                cands.append((ww * (2 * conf - 1), loc, {
                     "target": target(loc, win, bvar),
                     "assertion": {"kind": "boolean", "value": pg > 0.5},
                     "confidence": round(conf, 3),
-                    "rationale": "Year X %s was %.1f vs forecast %.1f (clim %.1f); CV accuracy of "
-                                 "confident calls %d/%d" % (var, s[X], c + sdev * zhat, c, hits, n)}))
+                    "rationale": "Year X %s %.1f vs forecast median %.1f (%s model, CV skill %+.0f%%); "
+                                 "P=%.2f" % (var, s[X], fc.value_quantile(f, 0.5), fit["model"],
+                                             100 * fit["skill"], p)}))
 
-    # 3. hottest / wettest month (annual window) via Monte Carlo over CV residuals
-    for cvar, var, minp in (("hottest_month", "temp_mean_c", 0.7), ("wettest_month", "precip_sum_mm", 0.7)):
-        fit = fits.get((var, "MON"))
-        if not fit:
+    # 2. thresholds anchored at the trailing-history baseline (the value naive and
+    #    trend-only predictors anchor on), on the side our model favours, gated per side by THRESH_SIDES
+    for (var, win), ww in anchor_targets(T):
+        if var not in THRESH_SIDES:
             continue
-        resid = fit["resid"]
         for loc in fz.locs:
-            preds = {}
-            for m in range(1, 13):
-                p = predict(var, fit, fz, loc, "M%02d" % m, T)
-                if p:
-                    preds[m] = p
-            if len(preds) < 12:
+            f = fc.get(var, loc, win)
+            s = series[var].get((loc, win), {})
+            if f is None or X not in s or len(s) < 10:
                 continue
-            # causal check: how often was the climatological argmax month right in history?
+            zhat, c, sdev, resid, fit = f
+            base = mean(list(s.values()))
+            if var in COUNTS:
+                if base < 3.0:
+                    continue
+                if var == "frost_days_lt_0c":
+                    v = float(math.ceil(base))
+                    p_hi = prob_gt(resid, (v - 0.5 - c) / sdev - zhat)  # P(count >= v)
+                    hi_a, lo_a = ("ge", v), ("lt", v)
+                else:
+                    v = float(math.floor(base))
+                    p_hi = prob_gt(resid, (v + 0.5 - c) / sdev - zhat)  # P(count > v)
+                    hi_a, lo_a = ("gt", v), ("le", v)
+            else:
+                v = round(base, 2)
+                p_hi = prob_gt(resid, (v - c) / sdev - zhat)
+                hi_a, lo_a = ("gt", v), ("le", v)
+            up = p_hi >= 0.5
+            p = p_hi if up else 1 - p_hi
+            op, val = hi_a if up else lo_a
+            if p < THRESH_SIDES.get(var, {}).get(op, 2.0):
+                continue
+            # thresholds are where rivals' trend/persistence anchors disagree with us, so they get
+            # double priority; stated confidence is shrunk 30% toward 0.5, matching the
+            # cross-year hit rate of these claims (raw model P was ~8 points overconfident)
+            cands.append((2 * ww * (2 * p - 1), loc, {
+                "target": target(loc, win, var),
+                "assertion": {"kind": "threshold", "op": op, "value": val},
+                "confidence": round(0.5 + 0.7 * (p - 0.5), 3),
+                "rationale": "%s model forecast median %.2f vs %d-yr baseline %.2f (year X %.2f); "
+                             "P(%s %.2f)=%.2f" % (fit["model"], fc.value_quantile(f, 0.5), len(s), base,
+                                                  s[X], op, val, p)}))
+
+    # 3. hottest / wettest month over the year via Monte Carlo over CV residuals
+    for cvar, var, minp in (("hottest_month", "temp_mean_c", 0.7), ("wettest_month", "precip_sum_mm", 0.7)):
+        for loc in fz.locs:
+            fs = {m: fc.get(var, loc, "M%02d" % m) for m in range(1, 13)}
+            if any(v is None for v in fs.values()):
+                continue
+            resid = fs[1][3]
             s_by_m = {m: series[var][(loc, "M%02d" % m)] for m in range(1, 13)}
             hist_hits = hist_n = 0
             for y in years[MIN_PAST:]:
@@ -565,7 +632,7 @@ def make_claims(days, meta, years, X, T):
             wins_ct = defaultdict(int)
             N = 2000
             for _ in range(N):
-                best = max(preds, key=lambda m: preds[m][1] + preds[m][2] * (preds[m][0] + rng.choice(resid)))
+                best = max(fs, key=lambda m: fs[m][1] + fs[m][2] * (fs[m][0] + rng.choice(resid)))
                 wins_ct[best] += 1
             mbest = max(wins_ct, key=wins_ct.get)
             pm = wins_ct[mbest] / N
@@ -573,18 +640,21 @@ def make_claims(days, meta, years, X, T):
                 pm = min(pm, (hist_hits + 1) / (hist_n + 2))
             if pm < minp:
                 continue
-            score = VAR_W[cvar] * pm
-            cands.append((score, loc, {
+            cands.append((0.8 * pm, loc, {
                 "target": target(loc, "ANN", cvar),
                 "assertion": {"kind": "categorical", "value": "%02d" % mbest},
                 "confidence": round(pm, 3),
                 "rationale": "Monte Carlo over monthly %s forecasts: P=%.2f; climatological argmax "
                              "right %d/%d past years" % (var, wins_ct[mbest] / N, hist_hits, hist_n)}))
 
-    # round-robin across locations so every city gets its best claims first
+    if os.environ.get("P8_DUMP"):  # analysis hook: every candidate before selection
+        with open(os.environ["P8_DUMP"], "w") as f:
+            json.dump([cl for _, _, cl in cands], f)
+
+    # highest priority first, round-robin across locations
     by_loc = defaultdict(list)
-    for score, loc, cl in cands:
-        by_loc[loc].append((score, cl))
+    for pr, loc, cl in cands:
+        by_loc[loc].append((pr, cl))
     for l in by_loc:
         by_loc[l].sort(key=lambda x: -x[0])
     out, seen, i = [], set(), 0
@@ -596,10 +666,29 @@ def make_claims(days, meta, years, X, T):
                 key = (tg["location_id"], tg["window_start"], tg["window_end"], tg["variable"])
                 if key not in seen:
                     seen.add(key)
-                    out.append({"claim_id": "", "target": tg, "assertion": cl["assertion"],
-                                "confidence": cl["confidence"], "rationale": cl["rationale"]})
+                    out.append(dict(claim_id="", **cl))
         i += 1
     return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--year-x", type=int, required=True)
+    ap.add_argument("--data-dir", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+    X = a.year_x
+    log = (lambda *_: None) if a.quiet else (lambda m: print(m, file=sys.stderr))
+    days, meta = load(a.data_dir, X)
+    indices = load_indices(a.data_dir, X)
+    years = sorted({y for l in days for y in days[l]})
+    claims = make_claims(days, meta, years, X, indices, log) if len(years) >= MIN_PAST + 4 else []
+    claims = claims[:MAX_CLAIMS]
+    for i, c in enumerate(claims, 1):
+        c["claim_id"] = "p8_%03d" % i
+    with open(a.out, "w") as f:
+        json.dump(claims, f, indent=1)
 
 
 if __name__ == "__main__":

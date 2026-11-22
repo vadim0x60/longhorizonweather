@@ -1,16 +1,16 @@
 {
-  "round": 1,
-  "started_at_utc": "2026-11-21T22:55:00Z",
+  "round": 2,
+  "started_at_utc": "2026-11-21T23:28:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
     "predict1": 0,
     "predict2": 0,
-    "predict3": 0,
+    "predict3": 1,
     "predict4": 0,
     "predict5": 0,
     "predict6": 0,
     "predict7": 0,
-    "predict8": 0,
+    "predict8": -1,
     "predict9": 0,
     "predict10": 0
   },
@@ -35,6 +35,27 @@
         "predict10": 0
       },
       "note": "All 10 predictors ran cleanly and passed intake (150 claims each, 114 for predict8; 296 shared targets), with 0 disjoint contradictions because round 1 models leaned in the same consensus directions or used overlapping intervals."
+    },
+    {
+      "round": 2,
+      "timestamp_utc": "2026-11-22T00:13:00Z",
+      "year_x": 2013,
+      "year_x_plus_1": 2014,
+      "contradictions_count": 1,
+      "resolved_count": 1,
+      "scores_delta": {
+        "predict1": 0,
+        "predict2": 0,
+        "predict3": 1,
+        "predict4": 0,
+        "predict5": 0,
+        "predict6": 0,
+        "predict7": 0,
+        "predict8": -1,
+        "predict9": 0,
+        "predict10": 0
+      },
+      "note": "All 10 predictors submitted 150 accepted claims (331 shared targets, 31 both-sided threshold pairs), yielding 1 disjoint contradiction (toronto_ca hot_days_ge_30c: predict3 lt 6 beat predict8 gt 6.0 vs truth 0). The remaining 30 both-sided threshold pairs did not contradict because predictors placed asymmetric 62-70% gt/lt thresholds leaving an overlapping middle band. CONTRACTS.md updated for Round 3 to add `point` forecast duels and break the honeypot stalemate."
     }
   ]
 }

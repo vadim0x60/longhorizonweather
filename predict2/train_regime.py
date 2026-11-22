@@ -42,7 +42,7 @@ def load_json_dir(d):
     return locs
 
 
-def examples(all_locs, xs):
+def examples(all_locs, xs, index=None):
     out = []
     for X in xs:
         view = {lid: {"lat": l["lat"], "lon": l["lon"],
@@ -53,7 +53,7 @@ def examples(all_locs, xs):
                 continue
             _, info = core.build_ensemble(loc, X, [])
             resid = core.annual_mean(all_locs[lid]["days"][X + 1]) - info["target_level"]
-            out.append({"X": X, "lid": lid, "prompt": regime.prompt_for(view, lid, X, list(view), summ), "resid": resid,
+            out.append({"X": X, "lid": lid, "prompt": regime.prompt_for(view, lid, X, list(view), summ, index and {k: {d: v for d, v in s.items() if d <= "%d-12" % X} for k, s in index.items()}), "resid": resid,
                         "label": regime.label(resid)})
     return out
 
@@ -64,14 +64,20 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--max-usd", type=float, default=5.0)
+    ap.add_argument("--indices", help="indices_monthly.json-style file (series name -> [{date, value}])")
+    ap.add_argument("--name", default="p2-regime-r2")
     a = ap.parse_args()
     import tinker
     from tinker import types
     from transformers import AutoTokenizer
 
     locs = load_json_dir(a.json_dir)
-    tr = examples(locs, range(1945, 1971))
-    va = examples(locs, range(1971, 1979))
+    index = None
+    if a.indices:
+        js = json.load(open(a.indices))
+        index = {k: {r["date"]: r["value"] for r in v} for k, v in js.get("series", js).items()}
+    tr = examples(locs, range(1951, 1971), index)
+    va = examples(locs, range(1971, 1979), index)
     assert max(e["X"] for e in tr + va) + 1 <= 1979
     tok = AutoTokenizer.from_pretrained(BASE)
     counts = {L: sum(e["label"] == L for e in tr) for L in regime.LETTERS}
@@ -109,7 +115,7 @@ def main():
                      for x, d in zip(r.loss_fn_outputs, batch))
             step += 1
             print("epoch %d step %d nll/ex %.3f" % (ep, step, -lp / len(batch)), flush=True)
-    path = tc.save_weights_for_sampler(name="p2-regime-r1").result().path
+    path = tc.save_weights_for_sampler(name=a.name).result().path
     print("sampler", path, flush=True)
 
     samp = tc.create_sampling_client(path)
@@ -135,12 +141,12 @@ def main():
     print("val acc %.3f (majority %.3f) corr %.3f scale %.3f" %
           (correct / len(va), max(vcounts.values()) / len(va), corr, scale), flush=True)
     json.dump({"base_model": BASE, "stations": list(locs), "sampler_path": path, "scale": round(scale, 4), "val_corr": round(corr, 4),
-               "val_acc": round(correct / len(va), 4), "train_years": [1945, 1970], "val_years": [1971, 1978],
+               "val_acc": round(correct / len(va), 4), "uses_indices": bool(index), "train_years": [1951, 1970], "val_years": [1971, 1978],
                "prefill_usd_per_m": PRICE["prefill"]},
               open(regime.MODEL_FILE, "w"), indent=1)
     bpath = os.path.join(HERE, "tinker_budget.json")
     b = json.load(open(bpath)) if os.path.exists(bpath) else {"cap_usd": 50.0, "training_runs": [], "training_usd_est": 0.0}
-    b["training_runs"].append({"name": "p2-regime-r1", "base_model": BASE, "train_tokens": ntok,
+    b["training_runs"].append({"name": a.name, "base_model": BASE, "train_tokens": ntok,
                                "usd_est": round(est, 4), "sampler_path": path})
     b["training_usd_est"] = round(b["training_usd_est"] + est, 4)
     b["total_usd_est"] = round(b["training_usd_est"] + b.get("inference_usd_est", 0.0), 4)

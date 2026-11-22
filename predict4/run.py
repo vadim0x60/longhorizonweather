@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
-"""predict4: calibrated base rates with Bayesian shrinkage and anomaly reversion.
+"""predict4: the Adversarial Referee. Calibrated forecasts placed on rivals' focal lines.
 
     python3 predict4/run.py --year-x <X> --data-dir <data_dir> --out <claims_json>
 
-For each location and window, the year-by-year history of a variable (from
-daily_history.csv, all dates <= X-12-31) gives a predictive distribution for X+1:
+A point is only won in a contradiction, so claims go where rival predictors draw their lines:
+  * Seasonal/annual means: threshold predictors cut at the trailing climatology (the 16-year
+    mean of max(1980, X-15)..X, or the 15-year mean of X-14..X) and lean warm. predict4 states the
+    side of the *lower* (or upper) of those lines that its own model favours, so a disagreement
+    is disjoint with every rival on that line.
+  * Day counts: rivals cut at floor/ceil of the 16-year mean; predict4 takes the other side when
+    its model says so.
+  * Booleans (warmer/wetter than year X) on every window rivals use; any disagreement counts.
 
-  mean   = climatology + shrunken linear trend + shrunken AR(1) carry-over of year X's anomaly
-  spread = residual standard deviation, inflated for parameter uncertainty
-
-The trend is shrunk toward a weak prior (slow warming for temperatures, none otherwise) and
-the carry-over toward zero, so one hot or wet year X moves the forecast only a little.
-Claims sit where this model disagrees with naive persistence (repeating year X), with the
-threshold halfway between the two, so the claim holds with probability > 0.5 under the model
-and contradicts a rival that extrapolates the last year. Each claim states its model probability.
-
-Runs offline, Python stdlib only.
+The model behind every probability (per location, window, variable; all inputs dated <= X-12-31):
+  mean = climatology + trend shrunk toward a weak prior
+         + AR(1) carry-over of year X's residual, shrunk toward zero
+  spread = residual SD inflated for parameter uncertainty.
+Calibration was checked by a walk-forward backtest (X=1988..1994 against the real next year):
+boolean probabilities match observed frequencies per decile, so they are stated as is; line
+probabilities were overconfident (selection on noise), so they are shrunk halfway to 0.5.
+A Nino3.4 regression term made forecasts worse at <= 16 years of history and is not used.
+Stated confidence is capped at 0.90. Runs offline, stdlib only.
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import datetime as dt
 import json
 import math
 import statistics
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
 CATALOG = {
@@ -47,14 +53,43 @@ FIELDS = ["temperature_2m_mean", "temperature_2m_max", "temperature_2m_min",
 MAX_CLAIMS = 150
 MIN_YEARS = 6
 
-# Prior trend per year and its strength in "pseudo-years of evidence".
-PRIOR_TREND = {"temp_mean_c": 0.025, "temp_mean_max_c": 0.025, "temp_mean_min_c": 0.025}
-TREND_PRIOR_STRENGTH = 20.0
-AR_PRIOR_STRENGTH = 10.0   # shrink the lag-1 autocorrelation toward 0
-AR_CAP = 0.5
-SD_INFLATION = 1.15        # calibration guard: rivals' overconfidence is our edge, not ours
-MIN_PROB = 0.58            # only claim what the model believes clearly
+TEMP_VARS = {"temp_mean_c", "temp_mean_max_c", "temp_mean_min_c"}
 COUNT_VARS = {"hot_days_ge_30c", "frost_days_lt_0c", "rainy_days_ge_1mm"}
+PRIOR_TREND = {v: 0.025 for v in TEMP_VARS}
+TREND_PRIOR_STRENGTH = 20.0   # prior trend counts as this many years' worth of evidence
+AR_PRIOR_STRENGTH = 10.0      # shrink lag-1 autocorrelation toward 0
+AR_CAP = 0.5
+SD_INFLATION = 1.15
+LINE_SHRINK = 0.5             # line probabilities move this fraction of the way from 0.5
+MIN_PROB = 0.55              # lines (after shrinking)
+MIN_BOOL_PROB = 0.60
+MAX_CONF = 0.90
+
+# Windows rivals use, as (start month-day, end month-day); day "end" is the month's last day.
+WINDOWS = {
+    "year": ((1, 1), (12, 31)), "jja": ((6, 1), (8, 31)), "mam": ((3, 1), (5, 31)),
+    "son": ((9, 1), (11, 30)), "jf": ((1, 1), (2, "end")), "jfm": ((1, 1), (3, 31)),
+    "ond": ((10, 1), (12, 31)),
+    **{f"m{m:02d}": ((m, 1), (m, "end")) for m in range(1, 13)},
+}
+# How many rivals tend to claim each window (from reading their code); used only for ranking.
+WINDOW_WEIGHT = {"year": 1.0, "jja": 0.85, "mam": 0.6, "son": 0.6, "jf": 0.55, "jfm": 0.4, "ond": 0.35,
+                 **{f"m{m:02d}": 0.3 for m in range(1, 13)}}
+WINDOW_WEIGHT["m01"] = WINDOW_WEIGHT["m07"] = 0.45
+THRESHOLD_JOBS = [  # (variable, windows)
+    ("temp_mean_c", ["year", "jja", "mam", "son", "jf", "m01", "m07"]),
+    ("temp_mean_max_c", ["year", "jja"]),
+    ("temp_mean_min_c", ["year", "jja"]),
+    ("hot_days_ge_30c", ["year", "jja"]),
+    ("frost_days_lt_0c", ["year", "jf"]),
+]
+BOOLEAN_JOBS = [
+    ("warmer_than_year_x", "temp_mean_c", list(WINDOWS)),
+    ("wetter_than_year_x", "precip_sum_mm", list(WINDOWS)),
+]
+VAR_WEIGHT = {"temp_mean_c": 1.0, "temp_mean_max_c": 0.7, "temp_mean_min_c": 0.7,
+              "hot_days_ge_30c": 0.6, "frost_days_lt_0c": 0.6,
+              "warmer_than_year_x": 0.9, "wetter_than_year_x": 0.8}
 
 
 # ---------------------------------------------------------------------------
@@ -102,49 +137,40 @@ def claim_coords(loc: str, csv_coords):
     return (lat, lon) if loc == f"grid_{lat:.2f}_{lon:.2f}" else None
 
 
-def window_values(days: dict, year: int, ms: tuple, me: tuple, field: str):
-    """Daily values of `field` for month-day window ms..me in `year`; None if incomplete."""
-    try:
-        d, end = dt.date(year, *ms), dt.date(year, *me)
-    except ValueError:
-        return None
+def window_dates(year: int, wname: str):
+    (sm, sd), (em, ed) = WINDOWS[wname]
+    if ed == "end":
+        ed = calendar.monthrange(year, em)[1]
+    return dt.date(year, sm, sd), dt.date(year, em, ed)
+
+
+def window_values(days: dict, year: int, wname: str, field: str):
+    """Daily values of `field` over window `wname` in `year`; None if any day is missing."""
+    d, end = window_dates(year, wname)
     out = []
     while d <= end:
         rec = days.get(d.isoformat())
         if rec is None or rec.get(field) is None:
             return None
-        out.append((d, rec[field]))
+        out.append(rec[field])
         d += dt.timedelta(days=1)
     return out
 
 
-def variable_value(variable, days, year, ms, me):
-    field, fn = {
-        "temp_mean_c": ("temperature_2m_mean", lambda v: sum(v) / len(v)),
-        "temp_mean_max_c": ("temperature_2m_max", lambda v: sum(v) / len(v)),
-        "temp_mean_min_c": ("temperature_2m_min", lambda v: sum(v) / len(v)),
-        "temp_max_c": ("temperature_2m_max", max),
-        "temp_min_c": ("temperature_2m_min", min),
-        "precip_sum_mm": ("precipitation_sum", sum),
-        "precip_max_day_mm": ("precipitation_sum", max),
-        "wind_max_kmh": ("wind_speed_10m_max", max),
-        "hot_days_ge_30c": ("temperature_2m_max", lambda v: sum(x >= 30.0 for x in v)),
-        "frost_days_lt_0c": ("temperature_2m_min", lambda v: sum(x < 0.0 for x in v)),
-        "rainy_days_ge_1mm": ("precipitation_sum", lambda v: sum(x >= 1.0 for x in v)),
-    }[variable]
-    vals = window_values(days, year, ms, me, field)
-    return None if vals is None else fn([v for _, v in vals])
+AGG = {
+    "temp_mean_c": ("temperature_2m_mean", lambda v: sum(v) / len(v)),
+    "temp_mean_max_c": ("temperature_2m_max", lambda v: sum(v) / len(v)),
+    "temp_mean_min_c": ("temperature_2m_min", lambda v: sum(v) / len(v)),
+    "precip_sum_mm": ("precipitation_sum", sum),
+    "hot_days_ge_30c": ("temperature_2m_max", lambda v: sum(x >= 30.0 for x in v)),
+    "frost_days_lt_0c": ("temperature_2m_min", lambda v: sum(x < 0.0 for x in v)),
+}
 
 
-def hottest_month(days, year):
-    vals = window_values(days, year, (1, 1), (12, 31), "temperature_2m_mean")
-    if vals is None:
-        return None
-    by = defaultdict(list)
-    for d, v in vals:
-        by[d.month].append(v)
-    means = {m: sum(v) / len(v) for m, v in by.items()}
-    return f"{max(means, key=means.get):02d}"
+def variable_value(variable, days, year, wname):
+    field, fn = AGG[variable]
+    vals = window_values(days, year, wname, field)
+    return None if vals is None else fn(vals)
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +182,7 @@ def norm_cdf(z):
 
 
 def forecast(series: dict, year_x: int, variable: str):
-    """series: {year: value}. Returns (mean, sd, n) for year X+1, or None."""
+    """series: {year: value}. Returns (mean, sd, n) for X+1, or None."""
     years = sorted(series)
     n = len(years)
     if n < MIN_YEARS or year_x not in series:
@@ -165,64 +191,70 @@ def forecast(series: dict, year_x: int, variable: str):
     tbar, ybar = sum(years) / n, sum(ys) / n
     sxx = sum((t - tbar) ** 2 for t in years)
     b_ols = sum((t - tbar) * (y - ybar) for t, y in zip(years, ys)) / sxx if sxx else 0.0
-    prior = PRIOR_TREND.get(variable, 0.0)
-    # Precision-weighted shrinkage: OLS slope variance ~ 1/sxx, prior ~ 1/(strength * mean sxx per year).
-    w = sxx / (sxx + TREND_PRIOR_STRENGTH * sxx / n)
-    b = w * b_ols + (1 - w) * prior
+    w = n / (n + TREND_PRIOR_STRENGTH)
+    b = w * b_ols + (1 - w) * PRIOR_TREND.get(variable, 0.0)
     resid = [y - (ybar + b * (t - tbar)) for t, y in zip(years, ys)]
+    rx = resid[years.index(year_x)]
+    mean = ybar + b * (year_x + 1 - tbar)
+
+
     sd = statistics.pstdev(resid) * math.sqrt(n / max(n - 2, 1))
     pairs = [(resid[i - 1], resid[i]) for i in range(1, n) if years[i] - years[i - 1] == 1]
-    phi = 0.0
-    if len(pairs) >= 4 and sd > 0:
-        r1 = sum(a * c for a, c in pairs) / sum(a * a for a, _ in pairs) if any(a for a, _ in pairs) else 0.0
+    den = sum(a * a for a, _ in pairs)
+    if len(pairs) >= 4 and den > 0:
+        r1 = sum(a * c for a, c in pairs) / den
         phi = max(0.0, min(AR_CAP, r1 * len(pairs) / (len(pairs) + AR_PRIOR_STRENGTH)))
-    mean = ybar + b * (year_x + 1 - tbar) + phi * resid[years.index(year_x)]
+        mean += phi * rx
     sd = sd * math.sqrt(1 + 1 / n) * SD_INFLATION
-    if variable in COUNT_VARS or variable.startswith("precip") or variable == "wind_max_kmh":
+    if variable not in TEMP_VARS:
         mean = max(mean, 0.0)
     return mean, max(sd, 1e-6), n
 
 
-def prob_above(mean, sd, t, variable, strict):
-    """P(value > t) (or >= t), with a continuity correction for integer counts."""
-    if variable in COUNT_VARS:
-        t = (math.floor(t) + 0.5) if strict else (math.ceil(t) - 0.5)
+def p_above(mean, sd, t):
     return 1.0 - norm_cdf((t - mean) / sd)
 
 
-def threshold_claim(variable, mean, sd, persist, clim):
-    """Pick (assertion, probability, anchor description) or None."""
-    # Anchor: what a naive rival says; the threshold sits halfway, our side toward the model mean.
-    if abs(mean - persist) >= 0.3 * sd:
-        anchor, label = persist, "persistence of year X"
-    elif abs(mean - clim) >= 0.3 * sd:
-        anchor, label = clim, "flat climatology"
-    else:
-        return None
-    t = (mean + anchor) / 2
-    up = mean > anchor
-    if variable in COUNT_VARS:
-        t = math.floor(t) if up else math.ceil(t)
-        if (up and t >= mean) or (not up and t <= mean):
-            return None
-        op = "gt" if up else "lt"
-        p = prob_above(mean, sd, t, variable, strict=True) if up else 1 - prob_above(mean, sd, t, variable, strict=False)
-    else:
-        t = round(t, 2)
-        op = "gt" if up else "le"
-        p = prob_above(mean, sd, t, variable, True) if up else 1 - prob_above(mean, sd, t, variable, True)
-    return {"kind": "threshold", "op": op, "value": t}, p, label, anchor
+def p_count_ge(mean, sd, k):
+    """P(integer count >= k) with a continuity correction."""
+    return p_above(mean, sd, k - 0.5)
 
 
 # ---------------------------------------------------------------------------
 # Claim generation
 # ---------------------------------------------------------------------------
 
-WINDOWS = {
-    "year": ((1, 1), (12, 31)),
-    "jja": ((6, 1), (8, 31)),
-    "jan_feb": ((1, 1), (2, 28)),
-}
+def focal_lines(series: dict, year_x: int):
+    """Trailing means rivals cut at: 16-year (max(1980, X-15)..X) and 15-year (X-14..X)."""
+    out = []
+    for first in (max(1980, year_x - 15), year_x - 14):
+        vals = [v for y, v in series.items() if first <= y <= year_x]
+        if len(vals) >= MIN_YEARS:
+            out.append(sum(vals) / len(vals))
+    return out
+
+
+def threshold_candidate(variable, mean, sd, lines):
+    """The side of the rivals' lines this model favours, as (assertion, p, note) or None."""
+    if not lines:
+        return None
+    if variable in COUNT_VARS:   # rival lines: hot gt floor(mean16), frost lt ceil(mean16)
+        k = math.floor(lines[0]) if variable == "hot_days_ge_30c" else math.ceil(lines[0])
+        p_hi = p_count_ge(mean, sd, k + 1) if variable == "hot_days_ge_30c" else p_count_ge(mean, sd, k)
+        if variable == "hot_days_ge_30c":
+            a = ({"kind": "threshold", "op": "gt", "value": k}, p_hi) if p_hi >= 0.5 else \
+                ({"kind": "threshold", "op": "le", "value": k}, 1 - p_hi)
+        else:
+            a = ({"kind": "threshold", "op": "ge", "value": k}, p_hi) if p_hi >= 0.5 else \
+                ({"kind": "threshold", "op": "lt", "value": k}, 1 - p_hi)
+        return a[0], a[1], f"rival line at {k}"
+    # Continuous: "le" at the lowest line is disjoint with every rival "gt" on any line;
+    # "gt" at the highest line is disjoint with every rival "lt"/"le" on any line.
+    lo, hi = round(min(lines), 2), round(max(lines), 2)
+    p_le, p_gt = 1 - p_above(mean, sd, lo), p_above(mean, sd, hi)
+    if p_le >= p_gt:
+        return {"kind": "threshold", "op": "le", "value": lo}, p_le, f"lowest rival line {lo}"
+    return {"kind": "threshold", "op": "gt", "value": hi}, p_gt, f"highest rival line {hi}"
 
 
 def build_claims(year_x: int, daily, coords):
@@ -230,14 +262,14 @@ def build_claims(year_x: int, daily, coords):
     candidates = []
 
     def add(loc, wname, variable, assertion, p, rationale):
-        ms, me = WINDOWS[wname]
         lat, lon = claim_coords(loc, coords.get(loc))
+        ws, we = window_dates(y1, wname)
         candidates.append({
-            "target": {"location_id": loc, "lat": lat, "lon": lon,
-                       "window_start": dt.date(y1, *ms).isoformat(),
-                       "window_end": dt.date(y1, *me).isoformat(), "variable": variable},
-            "assertion": assertion, "confidence": round(min(max(p, 0.5), 0.90), 3),
+            "target": {"location_id": loc, "lat": lat, "lon": lon, "window_start": ws.isoformat(),
+                       "window_end": we.isoformat(), "variable": variable},
+            "assertion": assertion, "confidence": round(min(max(p, 0.5), MAX_CONF), 3),
             "rationale": rationale,
+            "_rank": (p - 0.5) * WINDOW_WEIGHT[wname] * VAR_WEIGHT[variable],
         })
 
     for loc in sorted(daily):
@@ -249,75 +281,61 @@ def build_claims(year_x: int, daily, coords):
 
         def series(variable, wname):
             if (variable, wname) not in cache:
-                ms, me = WINDOWS[wname]
                 s = {}
                 for y in years:
-                    v = variable_value(variable, days, y, ms, me)
+                    v = variable_value(variable, days, y, wname)
                     if v is not None:
                         s[y] = v
                 cache[(variable, wname)] = s
             return cache[(variable, wname)]
 
-        jobs = [("temp_mean_c", "year"), ("precip_sum_mm", "year"), ("temp_mean_c", "jja"),
-                ("temp_mean_c", "jan_feb"), ("precip_sum_mm", "jja")]
-        hot = series("hot_days_ge_30c", "year")
-        frost = series("frost_days_lt_0c", "year")
-        if hot and statistics.mean(hot.values()) >= 5:
-            jobs.append(("hot_days_ge_30c", "year"))
-        if frost and statistics.mean(frost.values()) >= 5:
-            jobs.append(("frost_days_lt_0c", "year"))
-        jobs.append(("rainy_days_ge_1mm", "year"))
+        def model(variable, wname):
+            return forecast(series(variable, wname), year_x, variable)
 
-        for variable, wname in jobs:
-            s = series(variable, wname)
-            f = forecast(s, year_x, variable)
-            if f is None:
-                continue
-            mean, sd, n = f
-            clim = statistics.mean(s.values())
-            tc = threshold_claim(variable, mean, sd, s[year_x], clim)
-            if tc is None:
-                continue
-            assertion, p, label, anchor = tc
-            if p < MIN_PROB:
-                continue
-            add(loc, wname, variable, assertion, p,
-                f"{n}-yr shrunk trend+AR(1) forecast {mean:.2f}±{sd:.2f} vs {label} {anchor:.2f}; "
-                f"threshold at midpoint, model P={p:.2f}")
+        for variable, wnames in THRESHOLD_JOBS:
+            for wname in wnames:
+                s = series(variable, wname)
+                f = model(variable, wname)
+                if f is None:
+                    continue
+                if variable in COUNT_VARS and not (3 <= statistics.mean(s.values()) <= 0.9 * len(
+                        window_values(days, year_x, wname, "temperature_2m_mean") or [0])):
+                    continue  # rivals skip near-zero and saturated counts
+                mean, sd, n = f
+                c = threshold_candidate(variable, mean, sd, focal_lines(s, year_x))
+                if c is None:
+                    continue
+                assertion, p_model, note = c
+                p = 0.5 + LINE_SHRINK * (p_model - 0.5)
+                if p < MIN_PROB:
+                    continue
+                add(loc, wname, variable, assertion, p,
+                    f"forecast {mean:.2f}±{sd:.2f} ({n} yrs, shrunk trend+AR1) vs {note}: "
+                    f"model P={p_model:.2f}, backtest-calibrated P={p:.2f}")
 
-        # Booleans: is X+1 warmer / wetter than year X? Uses the same predictive distributions.
-        for bvar, base in (("warmer_than_year_x", "temp_mean_c"), ("wetter_than_year_x", "precip_sum_mm")):
-            for wname in ("year", "jja"):
+        for bvar, base, wnames in BOOLEAN_JOBS:
+            for wname in wnames:
                 s = series(base, wname)
-                f = forecast(s, year_x, base)
+                f = model(base, wname)
                 if f is None:
                     continue
                 mean, sd, n = f
-                p_up = prob_above(mean, sd, s[year_x], base, True)
+                p_up = p_above(mean, sd, s[year_x])
                 val = p_up >= 0.5
                 p = p_up if val else 1 - p_up
-                if p < MIN_PROB:
+                if p < MIN_BOOL_PROB:
                     continue
                 add(loc, wname, bvar, {"kind": "boolean", "value": val}, p,
                     f"year X {base}={s[year_x]:.2f} vs forecast {mean:.2f}±{sd:.2f}: "
-                    f"P({'higher' if val else 'not higher'})={p:.2f} (anomaly reversion)")
+                    f"P({'higher' if val else 'not higher'})={p:.2f}")
 
-        # Categorical: hottest month of the full year, by Laplace-smoothed base rate.
-        hm = [h for h in (hottest_month(days, y) for y in years) if h]
-        if len(hm) >= MIN_YEARS:
-            month, cnt = Counter(hm).most_common(1)[0]
-            p = (cnt + 1) / (len(hm) + 12)
-            if p >= MIN_PROB:
-                add(loc, "year", "hottest_month", {"kind": "categorical", "value": month}, p,
-                    f"hottest month was {month} in {cnt}/{len(hm)} years; Laplace-smoothed P={p:.2f}")
-
-    # Keep the most confident claims within the cap; one claim per target by construction.
-    candidates.sort(key=lambda c: -c["confidence"])
-    claims = candidates[:MAX_CLAIMS]
-    for i, c in enumerate(claims, 1):
-        c["claim_id"] = f"p4_{i:03d}"
-    return [{"claim_id": c["claim_id"], **{k: c[k] for k in ("target", "assertion", "confidence", "rationale")}}
-            for c in claims]
+    candidates.sort(key=lambda c: (-c["_rank"], c["target"]["location_id"], c["target"]["window_start"],
+                                   c["target"]["window_end"], c["target"]["variable"]))
+    claims = []
+    for i, c in enumerate(candidates[:MAX_CLAIMS], 1):
+        claims.append({"claim_id": f"p4_{i:03d}", "target": c["target"], "assertion": c["assertion"],
+                       "confidence": c["confidence"], "rationale": c["rationale"]})
+    return claims
 
 
 def main(argv=None) -> int:

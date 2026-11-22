@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""predict7: Extreme-Value & Tail-Risk Contrarian.
+"""predict7: Extreme-Value & Tail-Risk Contrarian (round 2).
 
-Emits calibrated interval/threshold claims for year X+1 on tail metrics
-(annual/seasonal maxima and minima, extreme daily precipitation and wind,
-threshold-exceedance day counts) using only `--data-dir` (dated <= X-12-31).
+Builds a full predictive distribution (a quantile table) for every
+(location, window, variable) target in year X+1 from data dated <= X-12-31,
+then emits sharp one-sided threshold claims and booleans on the targets rivals
+use most, priced so each claim holds with a calibrated probability.
 
-Models (stdlib only):
+Distributions (stdlib only):
   * Block maxima/minima (temp_max_c, temp_min_c): GEV fitted by L-moments to
     yearly block extremes after a shrunken Theil-Sen trend shift to year X+1.
-  * Daily extremes (precip_max_day_mm, wind_max_kmh): average of the block-max
-    GEV quantile and a peaks-over-threshold model (declustered GPD
-    exceedances, Poisson arrivals) converted to the block-maximum law.
-  * Day counts (hot/frost/rainy days): trend-shifted empirical quantiles with
-    small-sample widening and a binomial-noise floor.
-  * Window precipitation totals: skewed empirical quantiles (gamma-like tail).
+  * Daily extremes (precip_max_day_mm, wind_max_kmh): average of block-max GEV
+    and declustered peaks-over-threshold (Poisson-GPD) quantiles.
+  * Window means (temp_mean_c, temp_mean_max_c, temp_mean_min_c): Gaussian
+    kernel mixture over trend-shifted yearly values.
+  * Skewed, non-negative totals and day counts (precip_sum_mm, hot/frost/rainy
+    days): the same kernel mixture in sqrt space, so the right tail is heavy and
+    the median sits below the mean, as it does in the data.
+All spreads are widened by factors set in a 2010-2023 hindcast.
+
+Claims: "gt"/"lt" thresholds at the quantile where the claim holds with
+probability P_SIDE, pointing to the side of climatology our forecast leans to,
+and warmer/wetter-than-year-X booleans when P >= P_BOOL. When another
+predictor's claim falls on the far side of our threshold, our claim holds with
+at least P_SIDE probability and theirs with at most 1 - P_SIDE.
 """
 import argparse
 import csv
@@ -25,34 +34,26 @@ from collections import defaultdict
 
 FIELDS = ("temperature_2m_mean", "temperature_2m_max", "temperature_2m_min",
           "precipitation_sum", "wind_speed_10m_max")
-
-# Nominal central coverage of interval claims (calibrated by backtest).
-Q_LO, Q_HI = 0.09, 0.91
-# Extra width multipliers on (quantile - median), (lower side, upper side) in
-# physical units: short-record fits under-disperse, upper tails especially.
-# Tuned by a 2010-2023 hindcast (20 locations, ERA5 via Open-Meteo): raw
-# coverage was 0.76 with 2:1 upper-side misses; these give ~0.86-0.90.
-WIDEN = {
-    "default": (1.2, 1.2),
-    "temp_max_c": (1.15, 1.6),
-    "temp_min_c": (1.35, 1.35),
-    "precip_max_day_mm": (1.1, 1.6),
-    "wind_max_kmh": (1.15, 1.8),
-    "hot_days_ge_30c": (1.1, 1.8),
-    "frost_days_lt_0c": (1.4, 1.2),
-    "rainy_days_ge_1mm": (1.1, 1.6),
-    "precip_sum_mm": (1.2, 1.2),
-}
-CONF = 0.85  # hindcast hit rate of the widened intervals
-
-
-def widen(var, med, lo, hi):
-    a, b = WIDEN.get(var, WIDEN["default"])
-    return med + a * (lo - med), med + b * (hi - med)
 MAX_CLAIMS = 150
+TEMP_TREND_PRIOR = 0.025  # degC / yr
 
-# Prior warming rate of temperature extremes (degC / yr) used for shrinkage.
-TEMP_TREND_PRIOR = 0.025
+CFG = {
+    "P_SIDE": 0.62,      # probability our one-sided threshold claims hold
+    "P_BOOL": 0.70,      # minimum probability for a boolean claim
+    "KERNEL": 0.6,       # kernel bandwidth as a fraction of Silverman's rule
+    # Spread multipliers (lower side, upper side) around the median.
+    "WIDEN": {
+        "temp_max_c": (1.1, 1.5), "temp_min_c": (1.35, 1.25),
+        "precip_max_day_mm": (0.95, 1.6), "wind_max_kmh": (0.95, 1.75),
+        "hot_days_ge_30c": (1.0, 1.55), "frost_days_lt_0c": (1.2, 1.2),
+        "rainy_days_ge_1mm": (1.05, 1.35), "precip_sum_mm": (1.0, 1.5),
+        "temp_mean_c": (1.3, 1.25), "temp_mean_max_c": (1.1, 1.5),
+        "temp_mean_min_c": (1.45, 1.1),
+    },
+}
+
+# Probability grid of the quantile tables.
+GRID = [0.0025 + i * (0.995 / 200) for i in range(201)]
 
 
 # --------------------------------------------------------------------------- io
@@ -93,10 +94,21 @@ def median(xs):
     return quantile(xs, 0.5)
 
 
+def stdev(xs):
+    m = sum(xs) / len(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / max(1, len(xs) - 1))
+
+
 def theil_sen(ts, ys):
     slopes = [(ys[j] - ys[i]) / (ts[j] - ts[i])
               for i in range(len(ts)) for j in range(i + 1, len(ts)) if ts[j] != ts[i]]
     return median(slopes) if slopes else 0.0
+
+
+def shrunk_trend(ts, ys, prior, weight=0.5, lo=-1e9, hi=1e9):
+    if len(ts) < 6:
+        return prior
+    return max(lo, min(hi, weight * theil_sen(ts, ys) + (1 - weight) * prior))
 
 
 def lmoments(xs):
@@ -105,10 +117,7 @@ def lmoments(xs):
     b0 = sum(s) / n
     b1 = sum(i * s[i] for i in range(n)) / (n * (n - 1))
     b2 = sum(i * (i - 1) * s[i] for i in range(n)) / (n * (n - 1) * (n - 2))
-    l1 = b0
-    l2 = 2 * b1 - b0
-    l3 = 6 * b2 - 6 * b1 + b0
-    return l1, l2, l3
+    return b0, 2 * b1 - b0, 6 * b2 - 6 * b1 + b0
 
 
 def gev_fit(xs):
@@ -118,14 +127,12 @@ def gev_fit(xs):
         return l1, 0.0, 0.0
     t3 = l3 / l2
     c = 2.0 / (3.0 + t3) - math.log(2) / math.log(3)
-    k = 7.8590 * c + 2.9554 * c * c
-    k = max(-0.4, min(0.45, k))  # 16 blocks: keep the shape physically sane
+    k = max(-0.4, min(0.45, 7.8590 * c + 2.9554 * c * c))
     if abs(k) < 1e-6:
         a = l2 / math.log(2)
         return l1 - 0.5772156649 * a, a, 0.0
     a = l2 * k / ((1 - 2 ** (-k)) * math.gamma(1 + k))
-    loc = l1 - a * (1 - math.gamma(1 + k)) / k
-    return loc, a, k
+    return l1 - a * (1 - math.gamma(1 + k)) / k, a, k
 
 
 def gev_q(par, p):
@@ -141,17 +148,15 @@ def gpd_fit(exc):
     n = len(exc)
     m = sum(exc) / n
     s = sorted(exc)
-    b1 = sum(i * s[i] for i in range(n)) / (n * (n - 1))
-    l2 = 2 * b1 - m
+    l2 = 2 * sum(i * s[i] for i in range(n)) / (n * (n - 1)) - m
     if l2 <= 1e-9:
         return m, 0.0
-    k = m / l2 - 2
-    k = max(-0.4, min(0.4, k))
+    k = max(-0.4, min(0.4, m / l2 - 2))
     return (1 + k) * m, k
 
 
-def pot_block_q(daily_by_year, p, per_year=5.0, run=1):
-    """Block-max quantile from declustered POT exceedances (Poisson-GPD)."""
+def pot_model(daily_by_year, per_year=5.0, run=1):
+    """Declustered POT exceedances -> (u, lam, scale, k) or None."""
     years = [y for y in daily_by_year if daily_by_year[y]]
     nyr = len(years)
     allv = sorted(v for y in years for v in daily_by_year[y])
@@ -179,35 +184,133 @@ def pot_block_q(daily_by_year, p, per_year=5.0, run=1):
                 i += 1
     if len(peaks) < 10:
         return None
-    lam = len(peaks) / nyr
     a, k = gpd_fit(peaks)
-    S = -math.log(p) / lam  # conditional exceedance probability
-    if S >= 1 or a <= 0:
+    return (u, len(peaks) / nyr, a, k) if a > 0 else None
+
+
+def pot_q(pm, p):
+    u, lam, a, k = pm
+    S = -math.log(p) / lam
+    if S >= 1:
         return None
     if abs(k) < 1e-6:
         return u - a * math.log(S)
     return u + a / k * (1 - S ** k)
 
 
+def norm_cdf(z):
+    return 0.5 * math.erfc(-z / math.sqrt(2))
+
+
+def kernel_table(points, h):
+    """Quantile table of an equal-weight Gaussian mixture (CDF grid inversion)."""
+    lo_b = min(points) - 6 * h
+    hi_b = max(points) + 6 * h
+    m = 400
+    xs = [lo_b + (hi_b - lo_b) * i / m for i in range(m + 1)]
+    n = len(points)
+    fs = [sum(norm_cdf((x - c) / h) for c in points) / n for x in xs]
+    out, j = [], 0
+    for p in GRID:
+        while j < m - 1 and fs[j + 1] < p:
+            j += 1
+        span = fs[j + 1] - fs[j]
+        f = 0.0 if span <= 0 else min(1.0, max(0.0, (p - fs[j]) / span))
+        out.append(xs[j] + f * (xs[j + 1] - xs[j]))
+    return out
+
+
+class Dist:
+    """Predictive distribution as a monotone quantile table on GRID."""
+
+    def __init__(self, qs, why, lower=None, upper=None):
+        self.qs = qs
+        self.why = why
+        self.lower, self.upper = lower, upper
+
+    def q(self, p):
+        p = min(GRID[-1], max(GRID[0], p))
+        x = (p - GRID[0]) / (GRID[1] - GRID[0])
+        i = min(len(GRID) - 2, int(x))
+        v = self.qs[i] + (x - i) * (self.qs[i + 1] - self.qs[i])
+        if self.lower is not None:
+            v = max(self.lower, v)
+        if self.upper is not None:
+            v = min(self.upper, v)
+        return v
+
+    def cdf(self, v):
+        """P(Y <= v)."""
+        qs = self.qs
+        if v < qs[0]:
+            return GRID[0] / 2
+        if v >= qs[-1]:
+            return 1 - (1 - GRID[-1]) / 2
+        lo, hi = 0, len(qs) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if qs[mid] <= v:
+                lo = mid
+            else:
+                hi = mid
+        span = qs[hi] - qs[lo]
+        f = 0.0 if span <= 0 else (v - qs[lo]) / span
+        return GRID[lo] + f * (GRID[hi] - GRID[lo])
+
+
+def widen_table(var, qs):
+    a, b = CFG["WIDEN"].get(var, (1.2, 1.2))
+    med = qs[len(qs) // 2]
+    return [med + (a if v < med else b) * (v - med) for v in qs]
+
+
 # ------------------------------------------------------------------- windows
-def windows(year):
-    """(tag, start, end, priority) windows inside the target year."""
-    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
-    return [
-        ("FY", f"{year}-01-01", f"{year}-12-31", 3.0),
-        ("JJA", f"{year}-06-01", f"{year}-08-31", 2.0),
-        ("DJF1", f"{year}-01-01", f"{year}-02-{29 if leap else 28}", 1.0),
-    ]
+# Windows rivals target most (template popularity, not outcomes), with weight.
+WINDOWS = [
+    ("FY", "01-01", "12-31", 3.0),
+    ("JJA", "06-01", "08-31", 2.5),
+    ("MAM", "03-01", "05-31", 1.6),
+    ("SON", "09-01", "11-30", 1.6),
+    ("JF", "01-01", "02-28", 1.3),  # ends 02-29 in leap target years
+    ("Q1", "01-01", "03-31", 1.0),
+    ("Q4", "10-01", "12-31", 1.0),
+    ("JUL", "07-01", "07-31", 0.9),
+    ("JAN", "01-01", "01-31", 0.9),
+]
+
+# variable: (field index, family, weight)
+VARS = {
+    "temp_mean_c": (0, "mean", 1.0),
+    "warmer_than_year_x": (0, "bool", 1.0),
+    "precip_sum_mm": (3, "total", 1.0),
+    "wetter_than_year_x": (3, "bool", 0.9),
+    "temp_mean_max_c": (1, "mean", 0.8),
+    "temp_mean_min_c": (2, "mean", 0.8),
+    "hot_days_ge_30c": (1, "count", 0.9),
+    "frost_days_lt_0c": (2, "count", 0.9),
+    "rainy_days_ge_1mm": (3, "count", 0.8),
+    "temp_max_c": (1, "blockmax", 0.9),
+    "temp_min_c": (2, "blockmin", 0.6),
+    "precip_max_day_mm": (3, "dailymax", 0.6),
+    "wind_max_kmh": (4, "dailymax", 0.4),
+}
+COUNT_TEST = {"hot_days_ge_30c": lambda v: v >= 30.0,
+              "frost_days_lt_0c": lambda v: v < 0.0,
+              "rainy_days_ge_1mm": lambda v: v >= 1.0}
+
+
+def is_leap(y):
+    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
 
 
 def window_series(days, start_md, end_md, years):
-    """Per historical year, list of daily value rows inside the same MM-DD span."""
+    """Per historical year, (values rows, expected day count) inside the MM-DD span."""
     out = {}
     for y in years:
-        d0 = dt.date(y, int(start_md[:2]), int(start_md[3:]) if start_md != "02-29" else 28)
+        d0 = dt.date(y, int(start_md[:2]), int(start_md[3:]))
         e_day = int(end_md[3:])
         if end_md[:2] == "02" and e_day >= 28:
-            e_day = 29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28
+            e_day = 29 if is_leap(y) else 28
         d1 = dt.date(y, int(end_md[:2]), e_day)
         n_exp = (d1 - d0).days + 1
         seq = []
@@ -222,138 +325,127 @@ def window_series(days, start_md, end_md, years):
     return out
 
 
+def stat(var, vals):
+    if var in ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c"):
+        return sum(vals) / len(vals)
+    if var == "precip_sum_mm":
+        return sum(vals)
+    if var in COUNT_TEST:
+        f = COUNT_TEST[var]
+        return float(sum(1 for v in vals if f(v)))
+    if var in ("temp_max_c", "precip_max_day_mm", "wind_max_kmh"):
+        return max(vals)
+    if var == "temp_min_c":
+        return min(vals)
+    raise ValueError(var)
+
+
 # --------------------------------------------------------------------- models
-VARS = {
-    # name: (field index, kind, priority weight)
-    "temp_max_c": (1, "blockmax", 1.0),
-    "temp_min_c": (2, "blockmin", 1.0),
-    "precip_max_day_mm": (3, "dailymax", 1.0),
-    "wind_max_kmh": (4, "dailymax", 0.9),
-    "hot_days_ge_30c": (1, "count_ge30", 0.95),
-    "frost_days_lt_0c": (2, "count_lt0", 0.95),
-    "rainy_days_ge_1mm": (3, "count_ge1", 0.9),
-    "precip_sum_mm": (3, "total", 0.6),
-}
+def yearly(var, ser):
+    idx = VARS[var][0]
+    out = {}
+    for y, (seq, n_exp) in ser.items():
+        vals = [r[idx] for r in seq if r[idx] is not None]
+        if len(vals) >= 0.97 * n_exp:
+            out[y] = (vals, n_exp)
+    return out
 
 
-def shrunk_trend(ts, ys, prior, weight=0.5, lo=-1e9, hi=1e9):
-    if len(ts) < 6:
-        return prior
-    return max(lo, min(hi, weight * theil_sen(ts, ys) + (1 - weight) * prior))
-
-
-def model(var, ser, target_year):
-    idx, kind, _ = VARS[var]
-    years = sorted(ser)
+def distribution(var, ser, target_year):
+    """Predictive Dist for var over the window in target_year, or None."""
+    fam = VARS[var][1]
+    yr = yearly(var, ser)
+    years = sorted(yr)
     if len(years) < 8:
         return None
-    vals = {y: [r[idx] for r in ser[y][0] if r[idx] is not None] for y in years}
-    n_days = {y: ser[y][1] for y in years}
-    if any(len(vals[y]) < 0.97 * n_days[y] for y in years):
-        years = [y for y in years if len(vals[y]) >= 0.97 * n_days[y]]
-        if len(years) < 8:
-            return None
-    n_target = max(n_days.values())
+    n = len(years)
+    n_target = max(n_exp for _, n_exp in yr.values())
+    ys = [stat(var, yr[y][0]) for y in years]
 
-    if kind in ("blockmax", "blockmin"):
-        sign = 1.0 if kind == "blockmax" else -1.0
-        ys = [sign * (max(vals[y]) if sign > 0 else min(vals[y])) for y in years]
-        # Warm extremes rise (+); cold extremes rise too (-> negated series falls).
-        b = shrunk_trend(years, ys, sign * TEMP_TREND_PRIOR, lo=-0.03 if sign > 0 else -0.10,
-                         hi=0.10 if sign > 0 else 0.03)
-        shifted = [v + b * (target_year - y) for v, y in zip(ys, years)]
-        par = gev_fit(shifted)
-        n = len(shifted)
+    if fam in ("blockmax", "blockmin"):
+        sign = 1.0 if fam == "blockmax" else -1.0
+        zs = [sign * v for v in ys]
+        b = shrunk_trend(years, zs, sign * TEMP_TREND_PRIOR,
+                         lo=-0.03 if sign > 0 else -0.10, hi=0.10 if sign > 0 else 0.03)
+        par = gev_fit([v + b * (target_year - y) for v, y in zip(zs, years)])
         infl = math.sqrt(1 + 1.0 / n)
         med = gev_q(par, 0.5)
-        qlo = med + infl * (gev_q(par, Q_LO) - med)
-        qhi = med + infl * (gev_q(par, Q_HI) - med)
+        qs = [med + infl * (gev_q(par, p) - med) for p in GRID]
         if sign < 0:
-            qlo, qhi, med = -qhi, -qlo, -med
-        qlo, qhi = widen(var, med, qlo, qhi)
-        return {"kind": "interval", "low": round(qlo, 1), "high": round(qhi, 1),
-                "conf": CONF, "degenerate": False,
-                "why": f"GEV(L-mom, k={par[2]:.2f}) on {n} trend-shifted ({b * sign:+.3f}/yr) block "
-                       f"{'maxima' if sign > 0 else 'minima'}"}
+            qs = [-v for v in reversed(qs)]
+        return Dist(widen_table(var, qs), f"GEV (L-moments, k={par[2]:.2f}) on {n} "
+                    f"trend-shifted block {'maxima' if sign > 0 else 'minima'}")
 
-    if kind == "dailymax":
-        ys = [max(vals[y]) for y in years]
+    if fam == "dailymax":
         par = gev_fit(ys)
-        daily = {y: vals[y] for y in years}
-        per_year = 5.0 * n_target / 365.0 if n_target < 300 else 5.0
-        per_year = max(2.0, per_year)
-        run = 1 if var == "wind_max_kmh" else 0
-        out = []
-        for p in (Q_LO, 0.5, Q_HI):
+        daily = {y: yr[y][0] for y in years}
+        per_year = max(2.0, 5.0 * n_target / 365.0) if n_target < 300 else 5.0
+        pm = pot_model(daily, per_year=per_year, run=1 if var == "wind_max_kmh" else 0)
+        raw = []
+        for p in GRID:
             g = gev_q(par, p)
-            pq = pot_block_q(daily, p, per_year=per_year, run=run)
-            out.append(g if pq is None else 0.5 * (g + pq))
-        med = out[1]
-        infl = math.sqrt(1 + 1.0 / len(ys))
-        lo = max(0.0, med + infl * (out[0] - med))
-        hi = med + infl * (out[2] - med)
-        lo, hi = widen(var, med, lo, hi)
-        lo = max(0.0, lo)
-        return {"kind": "interval", "low": round(lo, 1), "high": round(hi, 1),
-                "conf": CONF, "degenerate": hi - lo < 0.2,
-                "why": f"blend of block-max GEV (k={par[2]:.2f}) and declustered POT-GPD "
-                       f"annual-max law over {len(ys)} yrs"}
+            pq = pot_q(pm, p) if pm else None
+            raw.append(g if pq is None else 0.5 * (g + pq))
+        for i in range(1, len(raw)):
+            raw[i] = max(raw[i], raw[i - 1])
+        med = raw[len(raw) // 2]
+        infl = math.sqrt(1 + 1.0 / n)
+        qs = widen_table(var, [med + infl * (v - med) for v in raw])
+        return Dist(qs, f"block-max GEV (k={par[2]:.2f}) blended with declustered POT-GPD",
+                    lower=0.0)
 
-    if kind.startswith("count"):
-        if kind == "count_ge30":
-            f = lambda v: v >= 30.0
-            prior = 0.0
-        elif kind == "count_lt0":
-            f = lambda v: v < 0.0
-            prior = 0.0
-        else:
-            f = lambda v: v >= 1.0
-            prior = 0.0
-        ys = [float(sum(1 for v in vals[y] if f(v))) for y in years]
-        b = shrunk_trend(years, ys, prior)
-        shifted = [max(0.0, v + b * (target_year - y)) for v, y in zip(ys, years)]
-        n = len(shifted)
-        med = median(shifted)
-        infl = math.sqrt(1 + 1.0 / n) * 1.05
-        lo = med + infl * (quantile(shifted, Q_LO) - med)
-        hi = med + infl * (quantile(shifted, Q_HI) - med)
-        lo, hi = widen(var, med, lo, hi)
-        # Binomial sampling floor on the half-width (days are noisy events).
-        pday = min(0.999, max(1e-6, med / n_target))
-        floor = 1.34 * math.sqrt(n_target * pday * (1 - pday))
-        lo = min(lo, med - floor)
-        hi = max(hi, med + floor)
-        lo = max(0, int(math.floor(lo)))
-        hi = min(n_target, int(math.ceil(hi)))
-        if max(ys) == 0:
-            # Never observed in the record: one-sided "le 0"-style claim.
-            return {"kind": "threshold", "op": "le", "value": 0, "conf": 0.95, "degenerate": True,
-                    "why": f"zero exceedances in all {n} historical windows"}
-        if min(ys) >= n_target:
-            return {"kind": "threshold", "op": "ge", "value": n_target, "conf": 0.95,
-                    "degenerate": True, "why": f"every day exceeded in all {n} historical windows"}
-        return {"kind": "interval", "low": lo, "high": hi, "conf": CONF,
-                "degenerate": False,
-                "why": f"trend-shifted ({b:+.2f}/yr) empirical count quantiles, {n} yrs, "
-                       f"binomial floor"}
-
-    if kind == "total":
-        ys = [sum(vals[y]) for y in years]
-        # Window totals are right-skewed: fit quantiles in log space.
-        lg = [math.log(max(v, 0.1)) for v in ys]
-        n = len(lg)
-        med = median(lg)
-        infl = math.sqrt(1 + 1.0 / n) * 1.05
-        lo = math.exp(med + infl * (quantile(lg, Q_LO) - med))
-        hi = math.exp(med + infl * (quantile(lg, Q_HI) - med))
-        lo, hi = widen(var, math.exp(med), lo, hi)
-        return {"kind": "interval", "low": round(lo, 0), "high": round(hi, 0),
-                "conf": CONF, "degenerate": hi - lo < 1,
-                "why": f"log-space (skew-aware) empirical quantiles of {n} window totals"}
-    return None
+    # Kernel-mixture families.
+    if fam == "mean":
+        b = shrunk_trend(years, ys, TEMP_TREND_PRIOR, lo=-0.03, hi=0.08)
+        pts = [v + b * (target_year - y) for v, y in zip(ys, years)]
+        fwd, back = (lambda v: v), (lambda v: v)
+        why = f"kernel mixture of {n} trend-shifted ({b:+.3f}/yr) window means"
+        lower = upper = None
+    else:  # total / count: sqrt space, trend shrunk toward zero
+        b = shrunk_trend(years, ys, 0.0)
+        pts_raw = [max(0.0, v + b * (target_year - y)) for v, y in zip(ys, years)]
+        if max(pts_raw) <= 0:
+            return Dist([0.0] * len(GRID), f"zero in all {n} historical windows", 0.0, 0.0)
+        pts = [math.sqrt(v) for v in pts_raw]
+        fwd, back = math.sqrt, (lambda v: max(0.0, v) ** 2)
+        why = f"sqrt-space (skew-aware) kernel mixture of {n} trend-shifted ({b:+.2f}/yr) values"
+        lower, upper = 0.0, (float(n_target) if fam == "count" else None)
+    sd = stdev(pts)
+    if sd <= 1e-9:
+        sd = 0.05 * (abs(pts[0]) + 1)
+    h = CFG["KERNEL"] * 1.06 * sd * n ** -0.2
+    infl = math.sqrt(1 + 1.0 / n)
+    tq = kernel_table(pts, h)
+    med = tq[len(tq) // 2]
+    tq = [med + infl * (v - med) for v in tq]
+    qs = widen_table(var, [back(v) for v in tq])
+    return Dist(qs, why, lower, upper)
 
 
-# ----------------------------------------------------------------------- main
+# --------------------------------------------------------------------- claims
+def fmt(v, var):
+    return int(v) if VARS[var][1] == "count" else round(v, 1)
+
+
+def numeric_claim(var, dist, clim_med):
+    """One-sided threshold on the side of climatology our median leans to."""
+    p = CFG["P_SIDE"]
+    med = dist.q(0.5)
+    if VARS[var][1] == "count":
+        if med >= clim_med:
+            v = math.floor(dist.q(1 - p) - 1e-9)  # gt v  <=>  >= v+1
+            prob = 1 - dist.cdf(v + 0.5)
+            return {"kind": "threshold", "op": "gt", "value": int(v)}, prob
+        v = math.ceil(dist.q(p) + 1e-9)  # lt v  <=>  <= v-1
+        prob = dist.cdf(v - 0.5)
+        return {"kind": "threshold", "op": "lt", "value": int(v)}, prob
+    if med >= clim_med:
+        v = math.floor(dist.q(1 - p) * 10) / 10
+        return {"kind": "threshold", "op": "gt", "value": v}, 1 - dist.cdf(v)
+    v = math.ceil(dist.q(p) * 10) / 10
+    return {"kind": "threshold", "op": "lt", "value": v}, dist.cdf(v)
+
+
 def build_claims(year_x, data_dir):
     rows, meta = load(data_dir)
     target = year_x + 1
@@ -362,29 +454,49 @@ def build_claims(year_x, data_dir):
     for lid in sorted(rows):
         days = {d: v for d, v in rows[lid].items() if d <= f"{year_x}-12-31"}
         lat, lon = meta[lid]
-        for tag, ws, we, wprio in windows(target):
-            ser = window_series(days, ws[5:], we[5:], hist_years)
-            for var, (_, _, vprio) in VARS.items():
-                if tag != "FY" and var == "precip_sum_mm":
-                    continue
-                m = model(var, ser, target)
-                if m is None:
-                    continue
-                prio = wprio * vprio * (0.15 if m["degenerate"] else 1.0)
-                if m["kind"] == "interval":
-                    assertion = {"kind": "interval", "low": m["low"], "high": m["high"]}
+        for tag, s_md, e_md, wprio in WINDOWS:
+            if e_md == "02-28" and is_leap(target):
+                e_md = "02-29"
+            ws = f"{target}-{s_md}"
+            we = f"{target}-{e_md}"
+            ser = window_series(days, s_md, e_md, hist_years)
+            for var, (_, fam, vprio) in VARS.items():
+                if fam == "bool":
+                    base = "temp_mean_c" if var == "warmer_than_year_x" else "precip_sum_mm"
+                    dist = distribution(base, ser, target)
+                    yr = yearly(base, ser)
+                    if dist is None or year_x not in yr:
+                        continue
+                    ref = stat(base, yr[year_x][0])
+                    p_true = 1 - dist.cdf(ref)
+                    val = p_true >= 0.5
+                    prob = max(p_true, 1 - p_true)
+                    if prob < CFG["P_BOOL"]:
+                        continue
+                    assertion = {"kind": "boolean", "value": val}
+                    why = f"P({base} X+1 > X={ref:.1f}) = {p_true:.2f} from {dist.why}"
+                    edge = prob - 0.5
                 else:
-                    assertion = {"kind": "threshold", "op": m["op"], "value": m["value"]}
-                cands.append((prio, {
+                    dist = distribution(var, ser, target)
+                    if dist is None or dist.q(0.05) == dist.q(0.95):
+                        continue
+                    yr = yearly(var, ser)
+                    clim = median([stat(var, yr[y][0]) for y in yr])
+                    assertion, prob = numeric_claim(var, dist, clim)
+                    if prob > CFG["P_SIDE"] + 0.2 or assertion["value"] < 0:
+                        continue  # degenerate (e.g. "gt -1" hot days): nobody disagrees
+                    lean = (dist.q(0.5) - clim) / max(1e-6, dist.q(0.75) - dist.q(0.25))
+                    why = f"{dist.why}; median {dist.q(0.5):.1f} vs climatology {clim:.1f}"
+                    edge = prob - 0.5 + 0.3 * min(1.0, abs(lean))
+                cands.append((wprio * vprio * (0.5 + edge), {
                     "target": {"location_id": lid, "lat": lat, "lon": lon,
                                "window_start": ws, "window_end": we, "variable": var},
                     "assertion": assertion,
-                    "confidence": round(m["conf"], 2),
-                    "rationale": f"EVT/tail model: {m['why']}; window {tag}.",
+                    "confidence": round(prob, 3),
+                    "rationale": f"EVT/tail-risk: {why}; window {tag}.",
                 }))
     cands.sort(key=lambda c: -c[0])
-    claims = []
-    seen = set()
+    claims, seen = [], set()
     for _, c in cands:
         t = c["target"]
         key = (t["location_id"], t["window_start"], t["window_end"], t["variable"])

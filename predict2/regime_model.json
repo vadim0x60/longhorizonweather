@@ -9,12 +9,13 @@
   "mumbai_in",
   "sao_paulo_br"
  ],
- "sampler_path": "tinker://8e3fb968-9e13-5383-b27e-e78200038767:train:0/sampler_weights/p2-regime-r1",
+ "sampler_path": "tinker://3aafd4e3-a1f7-5390-922c-c5b0146eed45:train:0/sampler_weights/p2-regime-r2",
  "scale": 0.0,
- "val_corr": -0.0718,
+ "val_corr": 0.0239,
  "val_acc": 0.5714,
+ "uses_indices": true,
  "train_years": [
-  1945,
+  1951,
   1970
  ],
  "val_years": [

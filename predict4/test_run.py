@@ -26,12 +26,12 @@ VERIFY = _load("verify_run", HERE.parent / "verify" / "run.py")  # contract vali
 X = 2020
 
 
-def write_data(td, hot_last_year=8.0, leak_value=99.0):
-    """Synthetic London history 2005..X: 10 °C ± noise, year X much hotter; plus a leaked X+1 row."""
+def write_data(td, hot_last_year=8.0, leak_value=99.0, trend=0.0):
+    """Synthetic London history 2005..X: 10 °C ± noise (+trend/yr), year X hotter; plus a leaked X+1 row."""
     rng = random.Random(4)
     rows = []
     for year in range(2005, X + 2):
-        bump = rng.gauss(0, 0.3) + (hot_last_year if year == X else 0.0)
+        bump = rng.gauss(0, 0.3) + (hot_last_year if year == X else 0.0) + trend * (year - 2005)
         d = dt.date(year, 1, 1)
         while d.year == year:
             t = (leak_value if year == X + 1 else 10.0 + bump + rng.gauss(0, 1))
@@ -48,11 +48,16 @@ def write_data(td, hot_last_year=8.0, leak_value=99.0):
 
 class Predict4Tests(unittest.TestCase):
     def run_p4(self, **kw):
+        return self.run_p4_rows(**kw)[0]
+
+    def run_p4_rows(self, **kw):
         with tempfile.TemporaryDirectory() as td:
             write_data(td, **kw)
             out = Path(td) / "claims.json"
             P4.main(["--year-x", str(X), "--data-dir", td, "--out", str(out)])
-            return json.loads(out.read_text())
+            with open(Path(td) / "daily_history.csv") as fh:
+                rows = list(csv.DictReader(fh))
+            return json.loads(out.read_text()), rows
 
     def test_claims_are_valid_and_unique(self):
         claims = self.run_p4()
@@ -67,12 +72,25 @@ class Predict4Tests(unittest.TestCase):
     def test_reverts_after_outlier_year(self):
         claims = {(c["target"]["variable"], c["target"]["window_start"], c["target"]["window_end"]): c
                   for c in self.run_p4()}
-        annual = claims[("temp_mean_c", f"{X + 1}-01-01", f"{X + 1}-12-31")]
-        # Year X was ~18 °C against a ~10 °C base: expect a claim below persistence, well above 10.
-        self.assertEqual(annual["assertion"]["op"], "le")
-        self.assertTrue(10 < annual["assertion"]["value"] < 18, annual)
+        # Year X was ~18 °C against a ~10 °C base: next year is very likely not warmer.
         warmer = claims[("warmer_than_year_x", f"{X + 1}-01-01", f"{X + 1}-12-31")]
         self.assertIs(warmer["assertion"]["value"], False)
+        self.assertGreaterEqual(warmer["confidence"], 0.8)
+
+    def test_threshold_sits_on_rival_line(self):
+        # Steady warming: the claim is "gt" the higher trailing mean, which under warming is the
+        # 15-year mean of X-14..X (the 16-year mean of X-15..X includes the colder first year).
+        claims, rows = self.run_p4_rows(hot_last_year=0.0, trend=0.15)
+        annual = [c for c in claims if c["target"]["variable"] == "temp_mean_c"
+                  and c["target"]["window_start"] == f"{X + 1}-01-01" and c["target"]["window_end"] == f"{X + 1}-12-31"]
+        self.assertEqual(len(annual), 1)
+        by_year = {}
+        for r in rows:
+            by_year.setdefault(int(r["date"][:4]), []).append(float(r["temperature_2m_mean"]))
+        yearly = {y: sum(v) / len(v) for y, v in by_year.items() if y <= X}
+        mean15 = sum(yearly[y] for y in range(X - 14, X + 1)) / 15
+        self.assertEqual(annual[0]["assertion"], {"kind": "threshold", "op": "gt", "value": round(mean15, 2)})
+        self.assertLessEqual(annual[0]["confidence"], 0.75)  # line claims are shrunk toward 0.5
 
     def test_ignores_rows_after_year_x(self):
         a = self.run_p4(leak_value=99.0)

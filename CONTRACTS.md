@@ -99,13 +99,22 @@ Each entry in `<claims_json>` must follow:
 2. `interval`: `{"kind": "interval", "low": <number>, "high": <number>}` (inclusive)
 3. `boolean`: `{"kind": "boolean", "value": true|false}`
 4. `categorical`: `{"kind": "categorical", "value": "<string>"}`
+5. `point`: `{"kind": "point", "value": <number>}` — a direct numeric forecast for any numeric variable. Two `point` claims on the same canonical target constitute a **disagreement** whenever `|value_a - value_b| >= min_gap[variable]`, and the side strictly closer to ground truth (`|value - truth|`) wins `+1` while the farther side gets `-1` (`0`/`0` on exact tie). Minimum gap thresholds:
+   - `temp_mean_c`, `temp_mean_max_c`, `temp_mean_min_c`: `0.25` °C
+   - `temp_max_c`, `temp_min_c`: `0.50` °C
+   - `precip_sum_mm`: `20.0` mm
+   - `precip_max_day_mm`: `3.0` mm
+   - `wind_max_kmh`: `2.0` km/h
+   - `hot_days_ge_30c`, `frost_days_lt_0c`, `rainy_days_ge_1mm`: `2.0` days
 
 ### Anti-spam & Scoring Rules
-- **At most 1 claim per `(predictor, location_id, window_start, window_end, variable)`** and **at most 150 claims per predictor per round**. Duplicates or excess claims are rejected by `verify`.
-- For each unordered pair `(predict{i}, predict{j})` with a claim on the exact same canonical `target` whose assertions are mathematically disjoint (cannot both be true):
-  - If `i` is True and `j` is False: `predict{i}` gets `+1`, `predict{j}` gets `-1`.
-  - If `j` is True and `i` is False: `predict{j}` gets `+1`, `predict{i}` gets `-1`.
-  - If both are False: `0` / `0`.
+- **At most 1 claim per `(predictor, location_id, window_start, window_end, variable)`**, **at most 12 claims per `location_id`**, and **at most 150 claims per predictor per round** (starting Round 3, include **at least 60 `point` claims** across diverse catalog locations so predictors cannot hide exclusively behind wide intervals or asymmetric 65% thresholds). Duplicates or excess claims are rejected by `verify`.
+- For each unordered pair `(predict{i}, predict{j})` with a claim on the exact same canonical `target`:
+  - If both are `point` claims with `|value_i - value_j| >= min_gap[variable]`: the side strictly closer to truth gets `+1`, the other `-1`.
+  - If their `threshold`/`interval`/`boolean`/`categorical` assertions are mathematically disjoint:
+    - If `i` is True and `j` is False: `predict{i}` gets `+1`, `predict{j}` gets `-1`.
+    - If `j` is True and `i` is False: `predict{j}` gets `+1`, `predict{i}` gets `-1`.
+    - If both are False: `0` / `0`.
 
 ## 5. Suggested Shared Benchmark Locations
 

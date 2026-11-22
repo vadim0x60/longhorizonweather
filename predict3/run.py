@@ -12,14 +12,20 @@ Offline, stdlib-only statistical forecaster for year X+1:
   * Skewed, non-negative variables (precipitation, day counts) are modelled in
     sqrt space.
   * Predictive spread = residual spread with parameter-uncertainty inflation.
-  * Claims: central intervals (~65% coverage) for continuous targets, booleans
-    for warmer/wetter-than-year-X when the model is confident, categorical
-    hottest/wettest month when the empirical frequency is dominant.
+  * Claims are built to be contradicted (scoring only happens on disjoint claims):
+      - directional thresholds halfway between the trailing climatology, where
+        rivals anchor, and our forecast median, kept only when P >= 0.55;
+      - warmer/wetter-than-year-X booleans when P >= 0.65;
+      - hottest/wettest month inside popular windows.
+    Claims are ranked by how many rival claims a target attracts (POP, measured by
+    running the other predictors' published code offline on past years) times the
+    expected net margin, then capped at 150 (10 per location).
 
-Calibration (offline backtests over X=2006..2023, 150 claims/year, scored on X+1):
-mean stated confidence 0.70, realised hit rate 0.70 (0.72 for 2006-14, 0.68 for 2015-23).
-Ablations: persistence clearly helps; per-location ENSO fits hurt; pooled ENSO is
-neutral-to-slightly-positive for temperature.
+Dev-time evaluation (X=2008..2023; rivals' round-1 code run offline, scored with
+verify/run.py logic on locally collected truth): net +30 over 53 contradictions
+(40 won), no losing year. Claim calibration: mean confidence 0.66, hit rate 0.66.
+Model ablations: Sep-Dec persistence clearly helps; per-location ENSO fits hurt;
+pooled ENSO is neutral-to-slightly-positive for temperature.
 
 Usage: python3 predict3/run.py --year-x <X> --data-dir <data_dir> --out <claims_json>
 """
@@ -37,51 +43,70 @@ from collections import defaultdict
 ND = statistics.NormalDist()
 
 MAX_CLAIMS = 150
-MAX_PER_LOCATION = 9
-COVERAGE = 0.65          # nominal central-interval coverage
+MAX_PER_LOCATION = 10
+LAMBDA = 0.5             # threshold position between climatology (0) and our median (1)
+THRESHOLD_WEIGHT = 0.3   # base ranking weight of threshold claims relative to booleans
 SIGMA_INFLATE = 1.00     # calibrated so out-of-sample z-scores have ~unit spread (backtests X=2006..2023)
 PHI_MAX = 0.7            # cap on pooled persistence coefficient
 USE_ENSO = True          # pooled ENSO term, temperature variables only (backtest: small gain 2015-2023, neutral 2006-2014)
 ENSO_VARS = {"temp_mean_c", "temp_max_c", "temp_min_c", "temp_mean_max_c", "temp_mean_min_c"}
 OTHER_TREND_SHRINK = 0.5  # extra shrink of EB-weighted trends for non-temperature variables
-BOOL_MIN_CONF = 0.64
-CAT_MIN_CONF = 0.65
+BOOL_MIN_CONF = 0.65
+THR_MIN_CONF = 0.55
+WET_BOOL_MIN_CONF = 0.65
+CAT_MIN_CONF = 0.5
 
-# window key -> (start MM-DD, end MM-DD, popularity weight)
+# window key -> (start MM-DD, end MM-DD). A Feb end is always 02-28, as rivals use.
 WINDOWS = {
-    "ANN": ("01-01", "12-31", 1.0),
-    "JJA": ("06-01", "08-31", 0.8),
-    "MAM": ("03-01", "05-31", 0.5),
-    "SON": ("09-01", "11-30", 0.5),
-    "JF": ("01-01", "02-29", 0.45),
-    "JFM": ("01-01", "03-31", 0.4),
-    "JAN": ("01-01", "01-31", 0.4),
-    "JUL": ("07-01", "07-31", 0.4),
+    "ANN": ("01-01", "12-31"), "JJA": ("06-01", "08-31"), "MAM": ("03-01", "05-31"),
+    "SON": ("09-01", "11-30"), "JF": ("01-01", "02-28"), "JFM": ("01-01", "03-31"),
+    "AMJ": ("04-01", "06-30"), "JAS": ("07-01", "09-30"), "OND": ("10-01", "12-31"),
 }
+for _m in range(1, 13):
+    WINDOWS[f"M{_m:02d}"] = (f"{_m:02d}-01", f"{_m:02d}-{[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][_m - 1]:02d}")
 
-# variable -> (daily column, aggregation, transform, popularity weight, rounding step)
+# variable -> (daily column, aggregation, transform, rounding step)
 CONT_VARS = {
-    "temp_mean_c": ("temperature_2m_mean", "mean", "id", 1.0, 0.05),
-    "precip_sum_mm": ("precipitation_sum", "sum", "sqrt", 0.85, 1.0),
-    "temp_max_c": ("temperature_2m_max", "max", "id", 0.5, 0.1),
-    "temp_min_c": ("temperature_2m_min", "min", "id", 0.5, 0.1),
-    "temp_mean_max_c": ("temperature_2m_max", "mean", "id", 0.35, 0.05),
-    "temp_mean_min_c": ("temperature_2m_min", "mean", "id", 0.35, 0.05),
-    "precip_max_day_mm": ("precipitation_sum", "max", "sqrt", 0.3, 0.5),
-    "wind_max_kmh": ("wind_speed_10m_max", "max", "id", 0.3, 0.5),
-    "hot_days_ge_30c": ("temperature_2m_max", "count_ge30", "sqrt", 0.6, 1),
-    "frost_days_lt_0c": ("temperature_2m_min", "count_lt0", "sqrt", 0.6, 1),
-    "rainy_days_ge_1mm": ("precipitation_sum", "count_ge1", "id", 0.4, 1),
+    "temp_mean_c": ("temperature_2m_mean", "mean", "id", 0.05),
+    "precip_sum_mm": ("precipitation_sum", "sum", "sqrt", 1.0),
+    "temp_max_c": ("temperature_2m_max", "max", "id", 0.1),
+    "temp_min_c": ("temperature_2m_min", "min", "id", 0.1),
+    "temp_mean_max_c": ("temperature_2m_max", "mean", "id", 0.05),
+    "temp_mean_min_c": ("temperature_2m_min", "mean", "id", 0.05),
+    "precip_max_day_mm": ("precipitation_sum", "max", "sqrt", 0.5),
+    "wind_max_kmh": ("wind_speed_10m_max", "max", "id", 0.5),
+    "hot_days_ge_30c": ("temperature_2m_max", "count_ge30", "sqrt", 1),
+    "frost_days_lt_0c": ("temperature_2m_min", "count_lt0", "sqrt", 1),
+    "rainy_days_ge_1mm": ("precipitation_sum", "count_ge1", "id", 1),
 }
 COUNT_VARS = {"hot_days_ge_30c", "frost_days_lt_0c", "rainy_days_ge_1mm"}
 TEMP_VARS = {"temp_mean_c", "temp_max_c", "temp_min_c", "temp_mean_max_c", "temp_mean_min_c", "hot_days_ge_30c", "frost_days_lt_0c"}
-# Which (window, variable) pairs to consider; window popularity * variable popularity ranks them.
-PAIRS = (
-    [("ANN", v) for v in CONT_VARS]
-    + [(w, "temp_mean_c") for w in ("JJA", "MAM", "SON", "JF", "JFM", "JAN", "JUL")]
-    + [(w, "precip_sum_mm") for w in ("JJA", "MAM", "SON", "JF")]
-    + [("JJA", "temp_max_c"), ("JJA", "hot_days_ge_30c"), ("JF", "frost_days_lt_0c"), ("JF", "temp_min_c")]
-)
+BOOL_BASE = {"warmer_than_year_x": "temp_mean_c", "wetter_than_year_x": "precip_sum_mm"}
+
+# Expected number of rival claims per location on each (window, variable), measured by running
+# the other predictors' published code offline on past years. Contradictions only happen on
+# shared targets, so claims are ranked by this popularity times their expected margin.
+POP = {
+    ("ANN", "temp_mean_c"): 3.8, ("ANN", "warmer_than_year_x"): 3.7, ("JJA", "warmer_than_year_x"): 3.3,
+    ("ANN", "wetter_than_year_x"): 3.2, ("JJA", "temp_mean_c"): 3.1, ("ANN", "precip_sum_mm"): 2.7,
+    ("JJA", "wetter_than_year_x"): 2.5, ("MAM", "warmer_than_year_x"): 1.7, ("SON", "warmer_than_year_x"): 1.6,
+    ("ANN", "temp_mean_max_c"): 1.6, ("ANN", "rainy_days_ge_1mm"): 1.6, ("ANN", "hot_days_ge_30c"): 1.5,
+    ("JF", "temp_mean_c"): 1.35, ("MAM", "wetter_than_year_x"): 1.3, ("ANN", "temp_mean_min_c"): 1.3,
+    ("SON", "temp_mean_c"): 1.25, ("MAM", "temp_mean_c"): 1.2, ("SON", "wetter_than_year_x"): 1.2,
+    ("ANN", "wind_max_kmh"): 1.05, ("ANN", "temp_max_c"): 1.05, ("ANN", "temp_min_c"): 1.0,
+    ("ANN", "precip_max_day_mm"): 1.0, ("MAM", "hottest_month"): 0.9, ("ANN", "frost_days_lt_0c"): 0.85,
+    ("SON", "hottest_month"): 0.85, ("M07", "temp_mean_c"): 0.8, ("M01", "temp_mean_c"): 0.8,
+    ("JF", "warmer_than_year_x"): 0.75, ("JFM", "warmer_than_year_x"): 0.7, ("ANN", "hottest_month"): 0.65,
+    ("OND", "warmer_than_year_x"): 0.65, ("JJA", "precip_sum_mm"): 0.65, ("M07", "warmer_than_year_x"): 0.55,
+    ("M01", "warmer_than_year_x"): 0.55, ("OND", "wetter_than_year_x"): 0.55, ("JFM", "wetter_than_year_x"): 0.5,
+    ("AMJ", "warmer_than_year_x"): 0.5, ("JAS", "warmer_than_year_x"): 0.45, ("M04", "warmer_than_year_x"): 0.4,
+    ("JJA", "temp_max_c"): 0.4, ("JJA", "temp_min_c"): 0.4, ("M06", "warmer_than_year_x"): 0.35,
+    ("M05", "warmer_than_year_x"): 0.35, ("M08", "warmer_than_year_x"): 0.35, ("JAS", "wetter_than_year_x"): 0.35,
+    ("ANN", "wettest_month"): 0.3, ("JJA", "hottest_month"): 0.3,
+}
+# Continuous models needed: every popular continuous target plus the bases of the booleans.
+PAIRS = sorted({(w, v) for w, v in POP if v in CONT_VARS} | {(w, BOOL_BASE[v]) for w, v in POP if v in BOOL_BASE})
+
 # Trend priors (per year) in transformed units: warming for temperature, none otherwise.
 TREND_PRIOR = {"temp": (0.03, 0.015), "other": (0.0, None)}
 
@@ -223,8 +248,8 @@ def build(X, daily, nino):
 
     models = {}
     for wkey, var in PAIRS:
-        start_md, end_md, _ = WINDOWS[wkey]
-        col, agg, tf, _, _ = CONT_VARS[var]
+        start_md, end_md = WINDOWS[wkey]
+        col, agg, tf, _ = CONT_VARS[var]
         per_loc = {}
         for loc in locs:
             ser = {}
@@ -299,43 +324,54 @@ def build(X, daily, nino):
 # ---------------------------------------------------------------- claims
 
 
-def round_out(lo, hi, step, is_count):
-    if is_count:
-        return float(math.floor(lo)), float(math.ceil(hi))
-    lo = math.floor(lo / step + 1e-9) * step
-    hi = math.ceil(hi / step - 1e-9) * step
-    nd = 0 if step >= 1 else 2
-    return round(lo, nd), round(hi, nd)
+def contest_weight(p):
+    """Expected net score per rival claim on a target: a disjoint rival claim costs us when we
+    are wrong (margin 2p-1), and well-informed rivals disagree with us less often as p -> 1."""
+    return max(0.0, (2 * p - 1) * 2 * (1 - p))
 
 
-def prob_interval(m, lo, hi):
-    tf = m["tf"]
-    dist = statistics.NormalDist(m["mu"], m["sigma"])
-    # In sqrt space, mass below zero maps to a value of 0, which lies inside [0, hi].
-    plo = 0.0 if tf == "sqrt" and lo <= 0 else dist.cdf(transform(tf, lo))
-    return dist.cdf(transform(tf, hi)) - plo
-
-
-def edge(p):
-    """Ranking weight: expected margin over a disjoint rival (2p-1), saturating so that
-    near-certain but trivial claims do not crowd out contested, popular targets."""
-    return min(1.0, (2 * p - 1) / 0.3)
-
-
-def month_frequency(daily, loc, years, col, agg):
-    counts = defaultdict(int)
+def window_month_winner(daily, loc, years, wkey, col, agg):
+    """{year: "MM"} of the month with the highest monthly aggregate inside the window."""
+    s_md, e_md = WINDOWS[wkey]
+    months = range(int(s_md[:2]), int(e_md[:2]) + 1)
+    out = {}
     for y in years:
-        vals = []
-        for mth in range(1, 13):
+        vals = {}
+        for mth in months:
             last = (dt.date(y + (mth == 12), mth % 12 + 1, 1) - dt.timedelta(days=1)).day
             v = window_values(daily[loc], y, f"{mth:02d}-01", f"{mth:02d}-{last:02d}", col)
             if not v:
-                vals = None
                 break
-            vals.append(aggregate(v, agg))
-        if vals:
-            counts[f"{vals.index(max(vals)) + 1:02d}"] += 1
-    return counts
+            vals[f"{mth:02d}"] = aggregate(v, agg)
+        else:
+            out[y] = max(sorted(vals), key=lambda k: vals[k])
+    return out
+
+
+def threshold_claim(m, var):
+    """Directional threshold between climatology and our forecast median.
+
+    Rivals anchor on the trailing climatology (or on year X); a threshold on our side of the
+    climatology, a fraction LAMBDA of the way to our median, is disjoint from every rival claim
+    that sits on the other side of it, while still holding with probability > 0.5 for us."""
+    _, _, tf, step = CONT_VARS[var]
+    is_count = var in COUNT_VARS
+    clim = sum(m["raw"].values()) / len(m["raw"])
+    med = inverse(tf, m["mu"])
+    thr = clim + LAMBDA * (med - clim)
+    dist = statistics.NormalDist(m["mu"], m["sigma"])
+    if med >= clim:
+        op = "gt"
+        thr = math.floor(thr) if is_count else math.floor(thr / step + 1e-9) * step
+        p = 1 - dist.cdf(transform(tf, thr + (0.5 if is_count else 0.0)))
+    else:
+        op = "lt"
+        thr = math.ceil(thr) if is_count else math.ceil(thr / step - 1e-9) * step
+        if thr <= 0:
+            return None
+        p = dist.cdf(transform(tf, thr - (0.5 if is_count else 0.0)))
+    thr = int(thr) if is_count or step >= 1 else round(thr, 2)
+    return {"kind": "threshold", "op": op, "value": thr}, p, clim, med
 
 
 def make_claims(X, daily, meta, models):
@@ -343,72 +379,55 @@ def make_claims(X, daily, meta, models):
     cands = []
 
     def target(loc, wkey, var):
-        s, e = window_dates(T, *WINDOWS[wkey][:2])
+        s, e = window_dates(T, *WINDOWS[wkey])
         lat, lon = meta[loc]
         return {"location_id": loc, "lat": lat, "lon": lon, "window_start": s.isoformat(),
                 "window_end": e.isoformat(), "variable": var}
 
-    for (loc, wkey, var), m in models.items():
-        col, agg, tf, vpop, step = CONT_VARS[var]
-        is_count = var in COUNT_VARS
-        z = ND.inv_cdf(0.5 + COVERAGE / 2)
-        lo = inverse(tf, m["mu"] - z * m["sigma"])
-        hi = inverse(tf, m["mu"] + z * m["sigma"])
-        if tf == "sqrt" and m["mu"] - z * m["sigma"] <= 0:
-            lo = 0.0
-        lo, hi = round_out(lo, hi, step, is_count)
-        if is_count:
-            lo = max(lo, 0.0)
-        p = prob_interval(m, lo - 0.5, hi + 0.5) if is_count else prob_interval(m, lo, hi)
-        if is_count and hi <= 0:
-            continue  # trivial "zero days" claim
-        pop = WINDOWS[wkey][2] * vpop
-        # Counts with tiny climatological values are rarely claimed by others.
-        if is_count and max(m["raw"].values()) < 3:
-            continue
-        ann = f"trend {m['trend']:+.3f}/yr" + (f", persistence phi={m['phi']:.2f}" if m["phi"] else "") + (
-            f", ENSO gamma={m['gamma']:+.2f} (OND Nino3.4 {m['nino_x']:+.2f})" if m["gamma"] and m["nino_x"] is not None else "")
-        cands.append({
-            "priority": pop * edge(p), "loc": loc,
-            "claim": {"target": target(loc, wkey, var),
-                      "assertion": {"kind": "interval", "low": lo, "high": hi},
-                      "confidence": round(min(max(p, 0.5), 0.95), 3),
-                      "rationale": f"{len(m['raw'])}-yr ERA5 window stats, {ann}; central {COVERAGE:.0%} predictive interval"},
-        })
-        # Year-over-year booleans.
-        if var in ("temp_mean_c", "precip_sum_mm"):
-            bvar = "warmer_than_year_x" if var == "temp_mean_c" else "wetter_than_year_x"
+    def add(priority, loc, wkey, var, assertion, p, why):
+        cands.append({"priority": priority, "loc": loc, "claim": {
+            "target": target(loc, wkey, var), "assertion": assertion,
+            "confidence": round(min(max(p, 0.5), 0.97), 3), "rationale": why}})
+
+    for (loc, wkey, var), m in sorted(models.items()):
+        ann = f"trend {m['trend']:+.3f}/yr" + (f", Sep-Dec persistence phi={m['phi']:.2f}" if m["phi"] else "") + (
+            f", ENSO gamma={m['gamma']:+.2f} x OND Nino3.4 {m['nino_x']:+.2f}" if m["gamma"] and m["nino_x"] is not None else "")
+        pop = POP.get((wkey, var), 0.0)
+        if pop:
+            r = threshold_claim(m, var)
+            if r and r[1] >= THR_MIN_CONF and not (var in COUNT_VARS and max(m["raw"].values()) < 3):
+                assertion, p, clim, med = r
+                add(pop * (THRESHOLD_WEIGHT + contest_weight(p)), loc, wkey, var, assertion, p,
+                    f"forecast median {med:.2f} vs {len(m['raw'])}-yr climatology {clim:.2f} ({ann})")
+        for bvar, base in BOOL_BASE.items():
+            bpop = POP.get((wkey, bvar), 0.0)
+            if base != var or not bpop:
+                continue
             pt = 1 - statistics.NormalDist(m["mu"], m["sigma"]).cdf(m["z_x"])
             conf = max(pt, 1 - pt)
-            if conf >= BOOL_MIN_CONF:
-                bpop = WINDOWS[wkey][2] * (0.7 if var == "temp_mean_c" else 0.5)
-                cands.append({
-                    "priority": bpop * edge(conf), "loc": loc,
-                    "claim": {"target": target(loc, wkey, bvar),
-                              "assertion": {"kind": "boolean", "value": pt > 0.5},
-                              "confidence": round(min(conf, 0.95), 3),
-                              "rationale": f"Year X value {inverse(tf, m['z_x']):.1f} vs forecast {inverse(tf, m['mu']):.1f} ({ann}): regression to trend"},
-                })
+            if conf >= (BOOL_MIN_CONF if bvar == "warmer_than_year_x" else WET_BOOL_MIN_CONF):
+                add(bpop * contest_weight(conf), loc, wkey, bvar, {"kind": "boolean", "value": pt > 0.5}, conf,
+                    f"year X {inverse(m['tf'], m['z_x']):.1f} vs forecast {inverse(m['tf'], m['mu']):.1f} ({ann})")
 
-    # Categorical hottest / wettest month over the full year.
+    # Categorical hottest / wettest month inside popular windows (empirical frequency, smoothed).
     for loc in sorted(daily):
         years = sorted({int(d[:4]) for d in daily[loc]})
-        for var, col, agg, pop in (("hottest_month", "temperature_2m_mean", "mean", 0.5),
-                                   ("wettest_month", "precipitation_sum", "sum", 0.4)):
-            counts = month_frequency(daily, loc, years, col, agg)
-            n = sum(counts.values())
-            if n < 6:
+        for (wkey, var), pop in POP.items():
+            if var not in ("hottest_month", "wettest_month"):
                 continue
-            best, c = max(sorted(counts.items()), key=lambda kv: kv[1])
-            p = (c + 0.5) / (n + 3.0)
+            col, agg = ("temperature_2m_mean", "mean") if var == "hottest_month" else ("precipitation_sum", "sum")
+            wins = window_month_winner(daily, loc, years, wkey, col, agg)
+            if len(wins) < 6:
+                continue
+            counts = defaultdict(int)
+            for y, mm in wins.items():
+                counts[mm] += 1 + (y >= X - 4)  # recent years count double (warming shifts the seasonal peak)
+            n = sum(counts.values())
+            best = max(sorted(counts), key=lambda k: counts[k])
+            p = (counts[best] + 0.5) / (n + 3.0)
             if p >= CAT_MIN_CONF:
-                cands.append({
-                    "priority": pop * edge(p), "loc": loc,
-                    "claim": {"target": target(loc, "ANN", var),
-                              "assertion": {"kind": "categorical", "value": best},
-                              "confidence": round(min(p, 0.95), 3),
-                              "rationale": f"Month {best} was the {var.split('_')[0]} month in {c}/{n} years of record"},
-                })
+                add(pop * contest_weight(p), loc, wkey, var, {"kind": "categorical", "value": best}, p,
+                    f"month {best} won {counts[best]}/{n} (recency-weighted) years in this window")
 
     cands.sort(key=lambda c: (-c["priority"], c["loc"], c["claim"]["target"]["variable"], c["claim"]["target"]["window_start"]))
     per_loc = defaultdict(int)
@@ -424,9 +443,7 @@ def make_claims(X, daily, meta, models):
         out.append(c["claim"])
         if len(out) >= MAX_CLAIMS:
             break
-    for i, c in enumerate(out, 1):
-        c["claim_id"] = f"p3_{i:03d}"
-    return [{"claim_id": c["claim_id"], **{k: c[k] for k in ("target", "assertion", "confidence", "rationale")}} for c in out]
+    return [{"claim_id": f"p3_{i:03d}", **c} for i, c in enumerate(out, 1)]
 
 
 def main():

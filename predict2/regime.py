@@ -53,9 +53,27 @@ def fmt(s):
     return " ".join("%s%+.1f" % (k, v) for k, v in s.items() if k != "P%") + " P%+.0f%%" % s["P%"]
 
 
-def prompt_for(locs, target, year_x, stations, summaries=None):
+def index_line(index, year_x):
+    """Seasonal means of climate indices in year X; `index` = {name: {'YYYY-MM': value}} with months <= X."""
+    parts = []
+    for name, label in (("nino34_anom", "Nino3.4"), ("nao", "NAO"), ("ao", "AO"), ("pdo", "PDO")):
+        ser = index.get(name) or {}
+        seas = []
+        for tag, ms in (("JFM", (1, 2, 3)), ("AMJ", (4, 5, 6)), ("JAS", (7, 8, 9)), ("OND", (10, 11, 12))):
+            v = [ser.get("%d-%02d" % (year_x, m)) for m in ms]
+            if all(x is not None for x in v):
+                seas.append("%s%+.1f" % (tag, sum(v) / 3))
+        if seas:
+            parts.append("%s %s" % (label, " ".join(seas)))
+    return "; ".join(parts)
+
+
+def prompt_for(locs, target, year_x, stations, summaries=None, index=None):
     summaries = summaries or {lid: station_summary(locs[lid], year_x) for lid in stations if lid in locs}
-    lines = ["Synoptic summary of year X (temperature anomalies in C vs prior years by season; precip anomaly %):"]
+    lines = []
+    if index:
+        lines.append("Climate indices in year X: " + index_line(index, year_x))
+    lines.append("Synoptic summary of year X (temperature anomalies in C vs prior years by season; precip anomaly %):")
     for lid in stations:
         if summaries.get(lid):
             lines.append("%s: %s" % (lid, fmt(summaries[lid])))
@@ -70,10 +88,12 @@ def label(residual):
     return "A" if residual < -NEAR_BAND else ("C" if residual > NEAR_BAND else "B")
 
 
-def regime_shifts(locs, year_x, timeout=120):
+def regime_shifts(locs, year_x, index=None, timeout=120):
     """Return ({location_id: shift_degC}, note). Raises if the model is unavailable."""
     with open(MODEL_FILE) as fh:
         cfg = json.load(fh)
+    if not cfg.get("scale"):
+        return {}, "regime model %s has no validated skill (scale 0); skipped" % cfg["sampler_path"].split("/")[-1]
     import tinker
     from transformers import AutoTokenizer
 
@@ -86,7 +106,7 @@ def regime_shifts(locs, year_x, timeout=120):
     targets = [lid for lid in stations if summaries.get(lid)]
 
     async def score(lid):
-        ptoks = tok.encode(prompt_for(locs, lid, year_x, stations, summaries), add_special_tokens=False)
+        ptoks = tok.encode(prompt_for(locs, lid, year_x, stations, summaries, index if cfg.get("uses_indices") else None), add_special_tokens=False)
         lps = await asyncio.gather(*[
             samp.compute_logprobs_async(tinker.ModelInput.from_ints(ptoks + [a]), prompt_logprobs_last_n=1)
             for a in ans])

@@ -4,18 +4,20 @@
 Treats each (location, calendar window, variable) as a yearly sequence and
 forecasts its year-X+1 value as a predictive distribution:
 
-  1. Build monthly aggregates from `daily_history.csv` (years <= X) plus the
-     bundled ERA5 monthly archive for 1964..1979 (`data/era5_monthly_pre1980.csv`,
-     strictly older than any allowed X >= 1980).
-  2. Fit, at runtime and only on years <= X, a convex ensemble of sequence
-     forecasters (all-years mean, last-10 mean, OLS trend) by walk-forward
-     backtesting, and pool its standardized residuals into empirical quantiles.
-  3. Optionally blend in a Tinker-hosted LoRA sequence model (see tinker_model.py,
-     trained by tinker_train.py on GHCN station data with target years <= 1969)
-     that reads anonymized anomaly sequences only (no years, no place names).
-  4. Emit up to 150 claims: thresholds placed at the naive 15-year climatology
-     whenever our distribution disagrees with it, booleans vs year X, and modal
-     hottest/wettest months.
+  1. Monthly aggregates from `daily_history.csv` (years <= X) plus the bundled
+     ERA5 monthly archive for 1964..1979 (`data/era5_monthly_pre1980.csv`).
+  2. A per-variable convex ensemble of (all-years mean, last-10 mean, OLS trend,
+     last-20 OLS trend), fitted at runtime by walk-forward backtest on years <= X;
+     recent standardized backtest residuals give the predictive quantiles.
+     Tie-heavy count/rain series use a rank-based empirical distribution instead.
+  3. A Tinker-hosted Qwen3-8B LoRA (tinker_model.py; trained by tinker_train.py
+     on anonymized GHCN sequences with target years <= 1969) is blended in.
+  4. Claim selection (`build_claims`) uses `opponents.json`, a summary of where
+     rival predictors place claims (built by build_opponents.py from their
+     outputs; it holds no weather outcomes). Offensive claims contradict a
+     typical rival assertion only when our probability is >= MIN_P; otherwise we
+     place ~70%-likely "honeypot" claims on the targets rivals claim most, leaning
+     the way our forecast departs from the naive 15-year mean.
 
 Never reads anything dated after X.
 """
@@ -32,6 +34,9 @@ from collections import defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRE1980 = os.path.join(HERE, "data", "era5_monthly_pre1980.csv")
 MAX_CLAIMS = 150
+MIN_P = 0.7  # offensive bets only with a real edge: backtests vs. rivals' claims lose below ~0.7
+DEF_W = 0.5  # weight of "honeypot" value: a likely-true claim on a target rivals often claim
+WIN_PRIOR = {"year": 0.3, "jja": 0.2, "mam": 0.1, "son": 0.1, "jf": 0.05}
 
 AGG_FIELDS = ["n_t", "st", "stx", "stn", "txmax", "tnmin", "n_p", "psum", "pmax",
               "n_w", "wmax", "hot", "frost", "rainy"]
@@ -40,26 +45,16 @@ NUM_VARS = ["temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "temp_max_c",
             "temp_min_c", "precip_sum_mm", "precip_max_day_mm", "wind_max_kmh",
             "hot_days_ge_30c", "frost_days_lt_0c", "rainy_days_ge_1mm"]
 COUNT_VARS = {"hot_days_ge_30c", "frost_days_lt_0c", "rainy_days_ge_1mm"}
-VAR_GROUP = {
-    "temp_mean_c": "temp", "temp_mean_max_c": "temp", "temp_mean_min_c": "temp",
-    "temp_max_c": "temp_ext", "temp_min_c": "temp_ext",
-    "precip_sum_mm": "precip", "precip_max_day_mm": "precip_ext", "rainy_days_ge_1mm": "precip",
-    "wind_max_kmh": "wind", "hot_days_ge_30c": "count", "frost_days_lt_0c": "count",
-}
-# How likely other predictors are to target this variable / window (collision prior).
-VAR_W = {"temp_mean_c": 1.0, "precip_sum_mm": 0.9, "temp_max_c": 0.6, "temp_min_c": 0.6,
-         "temp_mean_max_c": 0.55, "temp_mean_min_c": 0.55, "hot_days_ge_30c": 0.6,
-         "frost_days_lt_0c": 0.6, "rainy_days_ge_1mm": 0.6, "precip_max_day_mm": 0.45,
-         "wind_max_kmh": 0.45, "warmer_than_year_x": 0.7, "wetter_than_year_x": 0.6,
-         "hottest_month": 0.7, "wettest_month": 0.7}
-
-
 def windows():
-    w = [("year", 1, 12, 1.0), ("mam", 3, 5, 0.55), ("jja", 6, 8, 0.8), ("son", 9, 11, 0.55),
-         ("jf", 1, 2, 0.3)]
-    for m in range(1, 13):
-        w.append((f"m{m:02d}", m, m, 0.5 if m in (1, 7) else 0.35))
+    """(name, first month, last month) of every window predict1 can claim on."""
+    w = [("year", 1, 12), ("mam", 3, 5), ("jja", 6, 8), ("son", 9, 11), ("jf", 1, 2),
+         ("q1", 1, 3), ("q2", 4, 6), ("q3", 7, 9), ("q4", 10, 12)]
+    w += [(f"m{m:02d}", m, m) for m in range(1, 13)]
     return w
+
+
+def wkind(wname):
+    return "year" if wname == "year" else ("month" if wname.startswith("m") and wname != "mam" else "season")
 
 
 def fnum(s):
@@ -185,7 +180,8 @@ def ols_predict(ys, vs, t):
 
 
 def base_forecasts(series, t):
-    """Component forecasts for year t from strictly earlier years of `series`."""
+    """Component forecasts for year t from strictly earlier years of `series`:
+    (all-years mean, last-10 mean, all-years OLS trend, last-20 OLS trend)."""
     ys = sorted(y for y in series if y < t)
     if len(ys) < 1:
         return None
@@ -194,7 +190,8 @@ def base_forecasts(series, t):
     last = vs[-10:]
     last10 = sum(last) / len(last)
     trend = ols_predict(ys, vs, t) if len(ys) >= 8 else last10
-    return (clim, last10, trend)
+    trend20 = ols_predict(ys[-20:], vs[-20:], t) if len(ys) >= 8 else last10
+    return (clim, last10, trend, trend20)
 
 
 def scale_of(series):
@@ -205,42 +202,48 @@ def scale_of(series):
     return math.sqrt(sum((v - mu) ** 2 for v in vs) / (len(vs) - 1))
 
 
-WEIGHT_GRID = [(a / 10, b / 10, (10 - a - b) / 10) for a in range(11) for b in range(11 - a)]
+NC = 4
+WEIGHT_GRID = [(a / 10, b / 10, c / 10, (10 - a - b - c) / 10)
+               for a in range(11) for b in range(11 - a) for c in range(11 - a - b)]
 
 
 def fit_ensemble(all_series, year_x):
-    """Walk-forward backtest on years <= X: per variable group choose convex
-    weights over (clim, last10, trend) and collect standardized residuals."""
-    rows = defaultdict(list)  # group -> [(comps, target, scale, wkind)]
+    """Walk-forward backtest on years <= X: per variable choose convex weights
+    over the base forecasts (minimizing standardized squared error, with
+    target years >= 1980 counted double) and collect standardized residuals."""
+    rows = defaultdict(list)  # var -> [(comps, target, scale, var, wname)]
+    gram = defaultdict(lambda: ([[0.0] * NC for _ in range(NC)], [0.0] * NC))
     for (loc, wname, var), series in all_series.items():
         s = scale_of(series)
         if not s or s < 1e-6:
             continue
+        A, bv = gram[var]
         for t in sorted(series):
-            if t > year_x:
-                continue
-            if sum(1 for y in series if y < t) < 8:
+            if t > year_x or sum(1 for y in series if y < t) < 8:
                 continue
             comps = base_forecasts(series, t)
-            rows[VAR_GROUP[var]].append((comps, series[t], s, var, wname))
+            rows[var].append((comps, series[t], s, var, wname, t))
+            wt = 2.0 if t >= 1980 else 1.0
+            for i in range(NC):
+                bv[i] += wt * comps[i] * series[t] / s / s
+                for j in range(NC):
+                    A[i][j] += wt * comps[i] * comps[j] / s / s
     model = {}
-    for g, rs in rows.items():
-        best, bw = None, (1.0, 0.0, 0.0)
+    for var, (A, bv) in gram.items():
+        best, bw = None, (1.0, 0.0, 0.0, 0.0)
         for w in WEIGHT_GRID:
-            err = 0.0
-            for comps, tgt, s, _, _ in rs:
-                f = w[0] * comps[0] + w[1] * comps[1] + w[2] * comps[2]
-                err += ((tgt - f) / s) ** 2
+            err = sum(w[i] * w[j] * A[i][j] for i in range(NC) for j in range(NC)) - 2 * sum(w[i] * bv[i] for i in range(NC))
             if best is None or err < best:
                 best, bw = err, w
-        model[g] = {"w": bw, "n": len(rs)}
+        model[var] = {"w": bw, "n": len(rows[var])}
     resid = defaultdict(list)  # (var, wkind) -> standardized residuals
     for g, rs in rows.items():
         w = model[g]["w"]
-        for comps, tgt, s, var, wname in rs:
-            f = w[0] * comps[0] + w[1] * comps[1] + w[2] * comps[2]
+        recent = [r for r in rs if r[5] >= year_x - 30]
+        for comps, tgt, s, var, wname, _ in (recent if len(recent) >= 200 else rs):
+            f = sum(wi * ci for wi, ci in zip(w, comps))
             e = (tgt - f) / s
-            wk = wname if wname in ("year",) else ("season" if wname in ("mam", "jja", "son", "jf") else "month")
+            wk = wkind(wname)
             resid[(var, wk)].append(e)
             resid[(var, "*")].append(e)
     for k in resid:
@@ -266,13 +269,327 @@ class Predictive:
         return max(v, self.lo) if self.lo is not None else v
 
 
-# --------------------------------------------------------------------- claims
+class Empirical(Predictive):
+    """Rank-based distribution of recent historical values, for tie-heavy series
+    (dry-season rainfall, rare hot or frost days) where a location-scale model
+    misprices the point mass at the minimum."""
+
+    def __init__(self, vals):
+        self.vals = sorted(vals)
+        n = len(vals)
+        self.m = sum(vals) / n
+        self.s = max(1e-3, math.sqrt(sum((v - self.m) ** 2 for v in vals) / max(1, n - 1)))
+        self.lo = None
+
+    def cdf(self, v):
+        return (bisect.bisect_right(self.vals, v) + 0.5) / (len(self.vals) + 1)
+
+    def q(self, p):
+        i = min(len(self.vals) - 1, max(0, int(round(p * (len(self.vals) - 1)))))
+        return self.vals[i]
+
+
+# ----------------------------------------------------------------- forecaster
 def month_window(y, m1, m2):
     return f"{y}-{m1:02d}-01", f"{y}-{m2:02d}-{calendar.monthrange(y, m2)[1]:02d}"
 
 
+def window_name(ws, we):
+    """Inverse of month_window on month-day strings, or None."""
+    for wname, m1, m2 in windows():
+        a, b = month_window(2001, m1, m2)
+        a2, b2 = month_window(2000, m1, m2)
+        if (ws[5:], we[5:]) in ((a[5:], b[5:]), (a2[5:], b2[5:])):
+            return wname
+    return None
+
+
+class Forecaster:
+    """Predictive distributions for year X+1 built only from data dated <= X."""
+
+    def __init__(self, year_x, data_dir, use_tinker=False):
+        X = self.X = year_x
+        aggs, self.locs = {}, {}
+        load_pre1980(aggs, {})
+        for name in ("daily_history.csv", "daily_year_x.csv"):
+            p = os.path.join(data_dir, name)
+            if os.path.exists(p):
+                aggregate_daily(p, X, aggs, self.locs)
+        if not self.locs:
+            raise SystemExit("no daily data found in --data-dir")
+        years = sorted({y for (_, y, _) in aggs if y <= X})
+        self.series, self.monthly = {}, {}
+        for loc in self.locs:
+            for wname, m1, m2 in windows():
+                ser, monthly = build_series(aggs, loc, m1, m2, years)
+                for v, sr in ser.items():
+                    self.series[(loc, wname, v)] = sr
+                self.monthly[(loc, wname)] = monthly
+        self.model, self.resid = fit_ensemble(self.series, X)
+        self.tinker_pred, self.blend = {}, 0.0
+        if use_tinker and os.environ.get("TINKER_API_KEY"):
+            try:
+                import tinker_model  # noqa: local module
+                self.blend = json.load(open(tinker_model.META)).get("blend_weight", 0.0)
+                if self.blend > 0:
+                    self.tinker_pred = tinker_model.predictions(self.series, X, self.locs)
+            except Exception as e:  # never let the remote component break a run
+                self.blend = 0.0
+                print(f"[predict1] tinker component skipped: {e!r}", file=sys.stderr)
+        self._cache = {}
+
+    def dist(self, loc, wname, var):
+        key = (loc, wname, var)
+        if key in self._cache:
+            return self._cache[key]
+        d = None
+        series = self.series.get(key)
+        if series and self.X in series and len(series) >= 3:
+            recent = [v for y, v in sorted(series.items())][-30:]
+            if ((var in COUNT_VARS or var.startswith("precip")) and len(recent) >= 10
+                    and sum(v <= min(recent) + 1e-9 for v in recent) >= 0.5 * len(recent)):
+                d = Empirical(recent)
+                self._cache[key] = d
+                return d
+            s = scale_of(series)
+            eps = self.resid.get((var, wkind(wname))) or self.resid.get((var, "*"))
+            if s and s > 1e-6 and eps and len(eps) >= 30:
+                w = self.model.get(var, {"w": (1, 0, 0, 0)})["w"]
+                m = sum(wi * ci for wi, ci in zip(w, base_forecasts(series, self.X + 1)))
+                tp = self.tinker_pred.get(key)
+                if tp is not None:
+                    m = (1 - self.blend) * m + self.blend * tp
+                lo = 0.0 if (var in COUNT_VARS or var.startswith("precip")) else None
+                d = Predictive(m, s, eps, lo)
+        self._cache[key] = d
+        return d
+
+    def p_bool(self, loc, wname, bvar):
+        """P(warmer/wetter than year X) and the year-X value."""
+        var = "temp_mean_c" if bvar == "warmer_than_year_x" else "precip_sum_mm"
+        d = self.dist(loc, wname, var)
+        if d is None:
+            return None, None
+        xv = self.series[(loc, wname, var)][self.X]
+        return 1 - d.cdf(xv), xv
+
+    def cat_probs(self, loc, wname, cvar):
+        idx = 0 if cvar == "hottest_month" else 1
+        m1, m2 = [(a, b) for n, a, b in windows() if n == wname][0]
+        counts, tot = defaultdict(float), 0.0
+        for y, mm in self.monthly.get((loc, wname), {}).items():
+            vals = {k: v for k, v in mm[idx].items() if v is not None}
+            if len(vals) != m2 - m1 + 1:
+                continue
+            wy = 1.0 + (y >= self.X - 14)  # weight recent decades more
+            counts[max(vals, key=vals.get)] += wy
+            tot += wy
+        if tot < 5:
+            return None
+        n = m2 - m1 + 1
+        return {f"{m:02d}": (counts[m] + 0.5) / (tot + 0.5 * n) for m in range(m1, m2 + 1)}
+
+
+# ------------------------------------------------------------- set algebra
+INF = float("inf")
+
+
+def as_set(var, a):
+    """(lo, lo_closed, hi, hi_closed), mirroring verify's integer handling for counts."""
+    if a["kind"] == "interval":
+        lo, lc, hi, hc = a["low"], True, a["high"], True
+    else:
+        v = a["value"]
+        lo, lc, hi, hc = {"gt": (v, False, INF, False), "ge": (v, True, INF, False),
+                          "lt": (-INF, False, v, False), "le": (-INF, False, v, True)}[a["op"]]
+    if var in COUNT_VARS:
+        if lo != -INF:
+            lo = math.ceil(lo) if lc else math.floor(lo) + 1
+            lc = True
+        if hi != INF:
+            hi = math.floor(hi) if hc else math.ceil(hi) - 1
+            hc = True
+    return lo, lc, hi, hc
+
+
+def disjoint(var, a, b):
+    alo, alc, ahi, ahc = as_set(var, a)
+    blo, blc, bhi, bhc = as_set(var, b)
+    lo, lc = (alo, alc) if (alo > blo or (alo == blo and not alc)) else (blo, blc)
+    hi, hc = (ahi, ahc) if (ahi < bhi or (ahi == bhi and not ahc)) else (bhi, bhc)
+    return lo > hi or (lo == hi and not (lc and hc))
+
+
+def prob(var, d, a):
+    lo, _, hi, _ = as_set(var, a)
+    if var in COUNT_VARS:
+        return max(0.0, d.cdfc(hi + 0.5) - d.cdfc(lo - 0.5))
+    return max(0.0, d.cdfc(hi) - d.cdfc(lo))
+
+
+def _cdfc(self, v):
+    if v == INF:
+        return 1.0
+    if v == -INF:
+        return 0.0
+    if self.lo is not None and v < self.lo:
+        return 0.0
+    return self.cdf(v)
+
+
+Predictive.cdfc = _cdfc
+
+
+# ---------------------------------------------------------- opponent model
+OPP_PATH = os.path.join(HERE, "opponents.json")
+
+
+def load_opponents():
+    if not os.path.exists(OPP_PATH):
+        return None
+    opp = json.load(open(OPP_PATH))
+    locs = {k.rsplit("|", 1)[1] for k in opp.get("rate_loc", {})}
+    opp["sample_locs_has"] = locs.__contains__
+    return opp
+
+
+def rival_numeric(opp, var, wname, d, loc):
+    """Expected rival assertions on this target: [(weight, assertion)]. The
+    expected number of rival claims is location-specific where the location was
+    in the opponent sample, else the per-(variable, window) average."""
+    rate = opp["rate_loc"].get(f"{var}|{wname}|{loc}", 0.0 if opp["sample_locs_has"](loc)
+                               else opp["rate"].get(f"{var}|{wname}", 0.0))
+    samples = opp["numeric"].get(f"{var}|{wkind(wname)}") or []
+    if rate <= 0 or not samples:
+        return []
+    step = max(1, len(samples) // 60)
+    samples = samples[::step]
+    w = rate / len(samples)
+    out = []
+    for k, op, z1, z2 in samples:
+        if k == "threshold":
+            out.append((w, {"kind": "threshold", "op": op, "value": round(d.m + z1 * d.s, 2)}))
+        else:
+            out.append((w, {"kind": "interval", "low": round(d.m + z1 * d.s, 2), "high": round(d.m + z2 * d.s, 2)}))
+    return out
+
+
+def best_numeric(var, d, rivals):
+    """Assertion maximizing sum_r w_r * disjoint * (P(mine) - P(rival))."""
+    pr = [(w, a, prob(var, d, a)) for w, a in rivals]
+    menu = []
+    bounds = {round(d.q(q), 2) for q in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)}
+    for _, a, _ in pr:
+        if a["kind"] == "threshold":
+            bounds.add(a["value"])
+        else:
+            bounds.update((a["low"], a["high"]))
+    for b in bounds:
+        menu += [{"kind": "threshold", "op": "le", "value": b}, {"kind": "threshold", "op": "ge", "value": b}]
+    for ql, qh in ((0.25, 0.75), (0.15, 0.85), (0.3, 0.7)):
+        lo, hi = round(d.q(ql), 2), round(d.q(qh), 2)
+        if hi > lo:
+            menu.append({"kind": "interval", "low": lo, "high": hi})
+    best = None
+    for a in menu:
+        p = prob(var, d, a)
+        if p < MIN_P:
+            continue
+        ev = sum(w * (p - q) for w, ra, q in pr if disjoint(var, a, ra))
+        if best is None or (ev, p) > (best[0], best[2]):
+            best = (ev, a, p)
+    return best or (0.0, {"kind": "threshold", "op": "ge", "value": round(d.q(0.2), 2)}, 0.8)
+
+
+def popularity(opp, var, wname, loc):
+    """Expected number of rival claims on this target (plus a small window prior)."""
+    prior = WIN_PRIOR.get(wname, 0.02)
+    if not opp:
+        return prior
+    if opp["sample_locs_has"](loc):
+        return prior + opp["rate_loc"].get(f"{var}|{wname}|{loc}", 0.0)
+    return prior + opp["rate"].get(f"{var}|{wname}", 0.0)
+
+
+# --------------------------------------------------------------------- claims
 def fmt(v):
     return round(float(v), 2)
+
+
+def build_claims(F, opp):
+    X, Y = F.X, F.X + 1
+    cands = []
+    for loc, (lat, lon) in sorted(F.locs.items()):
+        for wname, m1, m2 in windows():
+            ws, we = month_window(Y, m1, m2)
+            tgt = {"location_id": loc, "lat": lat, "lon": lon, "window_start": ws, "window_end": we}
+            for var in NUM_VARS:
+                d = F.dist(loc, wname, var)
+                if d is None:
+                    continue
+                riv = rival_numeric(opp, var, wname, d, loc) if opp else []
+                ev, a, p = best_numeric(var, d, riv) if riv else (0.0, None, 0.0)
+                # defensive claim: ~70% likely, leaning the way our forecast departs from the
+                # naive 15-year mean, so sharper opposite bets by rivals are disjoint from it
+                ser = F.series[(loc, wname, var)]
+                rv = [v for y, v in ser.items() if y > X - 15]
+                up = d.q(0.5) >= sum(rv) / len(rv)
+                da = ({"kind": "threshold", "op": "ge", "value": fmt(d.q(0.3))} if up
+                      else {"kind": "threshold", "op": "le", "value": fmt(d.q(0.7))})
+                dp = prob(var, d, da)
+                dev = DEF_W * popularity(opp, var, wname, loc) * (2 * dp - 1)
+                if a is None or dev > ev:
+                    ev, a, p = dev, da, dp
+                cands.append((ev, p, dict(tgt, variable=var), a,
+                              f"mean {d.m:.2f} sd {d.s:.2f}; P={p:.2f}; exp. contradiction gain {ev:.3f}"))
+            for bvar in ("warmer_than_year_x", "wetter_than_year_x"):
+                p, xv = F.p_bool(loc, wname, bvar)
+                if p is None:
+                    continue
+                if not opp:
+                    rt = rf = 0.0
+                elif opp["sample_locs_has"](loc):
+                    rt, rf = opp["bool_loc"].get(f"{bvar}|{wname}|{loc}", [0.0, 0.0])
+                else:
+                    rt, rf = opp["bool"].get(f"{bvar}|{wname}", [0.0] * 20)[min(9, int(p * 10)) * 2:][:2] or (0.0, 0.0)
+                ev_t = rf * (2 * p - 1) if p >= MIN_P else 0.0
+                ev_f = rt * (1 - 2 * p) if 1 - p >= MIN_P else 0.0
+                val, ev, pc = (True, ev_t, p) if (ev_t, p) >= (ev_f, 1 - p) else (False, ev_f, 1 - p)
+                if pc >= MIN_P:
+                    ev = max(ev, DEF_W * (rt + rf + WIN_PRIOR.get(wname, 0.02)) * (2 * pc - 1))
+                cands.append((ev, pc, dict(tgt, variable=bvar), {"kind": "boolean", "value": val},
+                              f"P(true)={p:.2f} vs year-X value {xv:.2f}; exp. gain {ev:.3f}"))
+            if m2 > m1:
+                for cvar in ("hottest_month", "wettest_month"):
+                    cp = F.cat_probs(loc, wname, cvar)
+                    if not cp:
+                        continue
+                    ranked = sorted(cp, key=cp.get, reverse=True)
+                    rates = opp["cat"].get(f"{cvar}|{wkind(wname)}", []) if opp else []
+                    best = None
+                    for c in ranked:
+                        if cp[c] < 0.5:
+                            continue
+                        ev = sum(r * (cp[c] - cp[o]) for r, o in zip(rates, ranked) if o != c)
+                        if best is None or ev > best[0]:
+                            best = (ev, c)
+                    if best is None:
+                        continue
+                    best = (max(best[0], DEF_W * (sum(rates) + WIN_PRIOR.get(wname, 0.02)) * (2 * cp[best[1]] - 1)), best[1])
+                    cands.append((best[0], cp[best[1]], dict(tgt, variable=cvar),
+                                  {"kind": "categorical", "value": best[1]},
+                                  f"P={cp[best[1]]:.2f} ({cvar}); exp. gain {best[0]:.3f}"))
+    # rank by expected contradiction gain, then by probability of being right
+    cands.sort(key=lambda c: (-round(c[0], 4), -c[1]))
+    claims = []
+    for ev, p, tgt, a, why in cands:
+        if ev <= 1e-4 and p < 0.75:
+            continue
+        claims.append({"claim_id": f"p1_{len(claims) + 1:03d}", "target": tgt, "assertion": a,
+                       "confidence": round(min(0.99, max(0.01, p)), 3), "rationale": why[:300]})
+        if len(claims) >= MAX_CLAIMS:
+            break
+    return claims, cands
 
 
 def main():
@@ -281,150 +598,18 @@ def main():
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-tinker", action="store_true", help="skip the Tinker LoRA component")
+    ap.add_argument("--no-opponents", action="store_true", help="ignore the opponent model")
     args = ap.parse_args()
-    X, Y = args.year_x, args.year_x + 1
-
-    aggs, locs, xdaily = {}, {}, {}
-    load_pre1980(aggs, locs)
-    hist = os.path.join(args.data_dir, "daily_history.csv")
-    yx = os.path.join(args.data_dir, "daily_year_x.csv")
-    data_locs = {}
-    for p in (hist, yx):
-        if os.path.exists(p):
-            aggregate_daily(p, X, aggs, data_locs, xdaily, X)
-    if not data_locs:
-        sys.exit("no daily data found in --data-dir")
-    years = sorted({y for (_, y, _) in aggs if y <= X})
-    recent = [y for y in years if y >= max(1980, X - 14)]  # what a naive 15-y climatology sees
-
-    all_series, monthly_by = {}, {}
-    for loc in data_locs:
-        for wname, m1, m2, _ in windows():
-            ser, monthly = build_series(aggs, loc, m1, m2, years)
-            for v, s in ser.items():
-                all_series[(loc, wname, v)] = s
-            monthly_by[(loc, wname)] = monthly
-    model, resid = fit_ensemble(all_series, X)
-
-    tinker_pred, blend = {}, 0.0
-    if not args.no_tinker and os.environ.get("TINKER_API_KEY"):
-        try:
-            import tinker_model  # noqa: local module
-            blend = json.load(open(tinker_model.META)).get("blend_weight", 0.0)
-            if blend > 0:
-                tinker_pred = tinker_model.predictions(all_series, X, data_locs)
-        except Exception as e:  # never let the remote component break a run
-            print(f"[predict1] tinker component skipped: {e!r}", file=sys.stderr)
-
-    def blended(loc, wname, var, m):
-        p = tinker_pred.get((loc, wname, var))
-        return m if p is None else (1 - blend) * m + blend * p
-
-    cands = []
-    for loc, (lat, lon) in sorted(data_locs.items()):
-        for wname, m1, m2, ww in windows():
-            ws, we = month_window(Y, m1, m2)
-            base_t = {"location_id": loc, "lat": lat, "lon": lon, "window_start": ws, "window_end": we}
-            for var in NUM_VARS:
-                series = all_series.get((loc, wname, var))
-                if not series or X not in series or len(series) < 3:
-                    continue
-                comps = base_forecasts(series, Y)
-                w = model.get(VAR_GROUP[var], {"w": (1, 0, 0)})["w"]
-                m = sum(wi * ci for wi, ci in zip(w, comps))
-                s = scale_of(series)
-                wk = "year" if wname == "year" else ("season" if wname in ("mam", "jja", "son", "jf") else "month")
-                eps = resid.get((var, wk)) or resid.get((var, "*"))
-                lo = 0.0 if (var in COUNT_VARS or var.startswith("precip")) else None
-                if s is None or s < 1e-6 or not eps or len(eps) < 30:
-                    vals = set(series.values())
-                    if var in COUNT_VARS and vals == {0.0} and len(series) >= 10:
-                        cands.append((0.15 * ww * VAR_W[var], dict(base_t, variable=var),
-                                      {"kind": "threshold", "op": "lt", "value": 0.5}, 0.95,
-                                      f"zero in all {len(series)} years on record"))
-                    continue
-                m = blended(loc, wname, var, m)  # LoRA sequence-model blend
-                dist = Predictive(m, s, eps, lo)
-                rv = [series[y] for y in recent if y in series]
-                naive = sum(rv) / len(rv)
-                p_up = 1 - dist.cdf(naive)
-                why = (f"ensemble w={w} mean {m:.2f}, sigma {s:.2f}; naive {len(rv)}-yr clim {naive:.2f}")
-                if p_up >= 0.6:
-                    a, p = {"kind": "threshold", "op": "gt", "value": fmt(naive)}, p_up
-                elif p_up <= 0.4:
-                    a, p = {"kind": "threshold", "op": "lt", "value": fmt(naive)}, 1 - p_up
-                else:
-                    lo_q, hi_q = dist.q(0.12), dist.q(0.88)
-                    if hi_q - lo_q < 1e-6:
-                        continue
-                    a = {"kind": "interval", "low": fmt(lo_q), "high": fmt(hi_q)}
-                    p = dist.cdf(hi_q) - dist.cdf(lo_q)
-                    cands.append((0.35 * ww * VAR_W[var] * (2 * p - 1), dict(base_t, variable=var), a, p,
-                                  "central interval; " + why))
-                    continue
-                cands.append((ww * VAR_W[var] * (2 * p - 1) * 1.6, dict(base_t, variable=var), a, p, why))
-
-            # booleans vs. year X (same window), using the known year-X value
-            for var, bvar in (("temp_mean_c", "warmer_than_year_x"), ("precip_sum_mm", "wetter_than_year_x")):
-                series = all_series.get((loc, wname, var))
-                if not series or X not in series or len(series) < 3:
-                    continue
-                comps = base_forecasts(series, Y)
-                w = model.get(VAR_GROUP[var], {"w": (1, 0, 0)})["w"]
-                s = scale_of(series)
-                wk = "year" if wname == "year" else ("season" if wname in ("mam", "jja", "son", "jf") else "month")
-                eps = resid.get((var, wk)) or resid.get((var, "*"))
-                if not s or s < 1e-6 or not eps or len(eps) < 30:
-                    continue
-                m = sum(wi * ci for wi, ci in zip(w, comps))
-                m = blended(loc, wname, var, m)
-                p_true = 1 - Predictive(m, s, eps).cdf(series[X])
-                val, p = (True, p_true) if p_true >= 0.5 else (False, 1 - p_true)
-                if p < 0.6:
-                    continue
-                cands.append((ww * VAR_W[bvar] * (2 * p - 1) * 1.6, dict(base_t, variable=bvar),
-                              {"kind": "boolean", "value": val}, p,
-                              f"year-X value {series[X]:.2f} vs forecast {m:.2f} (sigma {s:.2f})"))
-
-            # modal hottest / wettest month (multi-month windows only)
-            if m2 > m1:
-                monthly = monthly_by.get((loc, wname), {})
-                for idx, cvar in ((0, "hottest_month"), (1, "wettest_month")):
-                    counts, tot = defaultdict(float), 0.0
-                    for y, mm in monthly.items():
-                        vals = {k: v for k, v in mm[idx].items() if v is not None}
-                        if len(vals) != m2 - m1 + 1:
-                            continue
-                        wy = 1.0 + 1.0 * (y >= X - 14)  # weight recent decades more
-                        counts[max(vals, key=vals.get)] += wy
-                        tot += wy
-                    if tot < 5:
-                        continue
-                    nmon = m2 - m1 + 1
-                    best = max(counts, key=counts.get)
-                    p = (counts[best] + 0.5) / (tot + 0.5 * nmon)
-                    if p < 0.45:
-                        continue
-                    cands.append((ww * VAR_W[cvar] * (2 * p - 1) * 1.6, dict(base_t, variable=cvar),
-                                  {"kind": "categorical", "value": f"{best:02d}"}, p,
-                                  f"modal {cvar.split('_')[0]} month in {int(round(tot))} weighted yrs"))
-
-    cands.sort(key=lambda c: -c[0])
-    seen, claims = set(), []
-    for _, tgt, a, p, why in cands:
-        key = (tgt["location_id"], tgt["window_start"], tgt["window_end"], tgt["variable"])
-        if key in seen:
-            continue
-        seen.add(key)
-        claims.append({"claim_id": f"p1_{len(claims) + 1:03d}", "target": tgt, "assertion": a,
-                       "confidence": round(min(0.99, max(0.5, p)), 3), "rationale": why[:300]})
-        if len(claims) >= MAX_CLAIMS:
-            break
+    F = Forecaster(args.year_x, args.data_dir, use_tinker=not args.no_tinker)
+    opp = None if args.no_opponents else load_opponents()
+    claims, cands = build_claims(F, opp)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(claims, f, indent=1)
-    print(f"[predict1] X={X}: {len(claims)} claims from {len(cands)} candidates; "
-          f"ensemble={ {g: v['w'] for g, v in model.items()} }; tinker_pred={len(tinker_pred)} blend={blend}", file=sys.stderr)
+    gain = sum(c[0] for c in cands[:len(claims)])
+    print(f"[predict1] X={F.X}: {len(claims)} claims from {len(cands)} candidates; selection score {gain:.2f}; "
+          f"ensemble={ {g: v['w'] for g, v in F.model.items()} }; tinker_pred={len(F.tinker_pred)} "
+          f"blend={F.blend}; opponents={'yes' if opp else 'no'}", file=sys.stderr)
 
 
 if __name__ == "__main__":

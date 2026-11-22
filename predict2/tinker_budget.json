@@ -16,10 +16,17 @@
    "train_tokens": 219723,
    "usd_est": 0.1229,
    "sampler_path": "tinker://8e3fb968-9e13-5383-b27e-e78200038767:train:0/sampler_weights/p2-regime-r1"
+  },
+  {
+   "name": "p2-regime-r2",
+   "base_model": "Qwen/Qwen3-8B",
+   "train_tokens": 289688,
+   "usd_est": 0.1537,
+   "sampler_path": "tinker://3aafd4e3-a1f7-5390-922c-c5b0146eed45:train:0/sampler_weights/p2-regime-r2"
   }
  ],
- "training_usd_est": 0.1239,
+ "training_usd_est": 0.2776,
  "inference_runs": 5,
  "inference_usd_est": 0.0079,
- "total_usd_est": 0.1318
+ "total_usd_est": 0.2855
 }
