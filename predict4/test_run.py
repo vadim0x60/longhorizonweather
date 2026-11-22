@@ -160,6 +160,30 @@ class Predict4Tests(unittest.TestCase):
         gappy = {y: v for y, v in full.items() if y != 1970}  # gap: no long-mean blend
         self.assertEqual(P4.point_forecast(gappy, 1990, "temp_mean_c", "year", sond)[0], plain)
 
+    def test_enso_term_tracks_lagged_nino(self):
+        # Annual temperature = 10 + 0.5 x the previous year's Oct-Dec Nino3.4: the term should
+        # recover 0.5, damped by the ridge factor 1 / (1 + 6/16), times (Nino[X] - its mean).
+        rng = random.Random(3)
+        enso = {y: rng.gauss(0, 1) for y in range(2004, 2020)}
+        enso[2020] = 2.0
+        s = {y: 10 + 0.5 * enso[y - 1] for y in range(2005, 2021)}
+        nb = statistics.mean(enso[y - 1] for y in s)
+        saved = dict(P4.ENSO)
+        try:
+            P4.ENSO.clear()
+            without = P4.point_forecast(s, 2020, "temp_mean_c", "year")[0]
+            P4.ENSO.update(enso)
+            shift = P4.enso_shift(s, 2020, 0.03, 40.0)
+            self.assertAlmostEqual(shift, 0.5 / (1 + 6 / 16) * (2.0 - nb), delta=0.1)
+            with_enso = P4.point_forecast(s, 2020, "temp_mean_c", "year")[0]
+            self.assertAlmostEqual(with_enso - without, P4.ENSO_WEIGHT * shift, places=1)
+            # Seasonal windows and precipitation do not use it.
+            self.assertEqual(P4.point_forecast(s, 2020, "temp_mean_c", "jja")[0],
+                             (P4.ENSO.clear(), P4.point_forecast(s, 2020, "temp_mean_c", "jja")[0])[1])
+        finally:
+            P4.ENSO.clear()
+            P4.ENSO.update(saved)
+
     def test_ignores_rows_after_year_x(self):
         a = self.run_p4(leak_value=99.0)
         b = self.run_p4(leak_value=-50.0)

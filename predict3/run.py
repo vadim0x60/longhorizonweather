@@ -17,7 +17,7 @@ Offline, stdlib-only statistical forecaster for year X+1:
   * Claims (contract: >= 60 points, <= 12 per location, <= 150 total):
       - 80 `point` claims for ANN/MAM temp_mean_c and ANN temp_mean_max_c,
         temp_mean_min_c at all 20 locations. Point = clim + lambda*(median - clim),
-        lambda = 1.2 with >= 16 post-1980 years of record (the shrunk trend under-forecasts,
+        lambda = 1.3 (1.4 for temp_mean_max_c) with >= 16 post-1980 years of record (the shrunk trend under-forecasts,
         as predict5's walk-forward lambdas of 1.25..1.5 also find), 0.6 when the 16-year
         window reaches back before 1980, and 0.67*n/16 times that for shorter records. Those years come from the bundled
         predict3/data/era5_daily_pre1980.csv.gz (ERA5 via Open-Meteo, 1964..1979, copied
@@ -29,14 +29,13 @@ Offline, stdlib-only statistical forecaster for year X+1:
     Non-point claims are ranked by how many rival claims a target attracts (POP,
     measured offline on past years) times the expected net margin.
 
-Dev-time evaluation (rivals' Round 9 code run offline with Tinker off, full 1980..2024
-history, scored by verify/run.py on local truth, X=1985..2023):
-  Round 9 settings                         total +124 (1985-95 -26, 1998-2023 +152)
-  lambda 1.2 for post-1980 windows         total +211
-  + no JJA points (80 points)              total +228 (1985-95 -35, 1998-2023 +252, odd +181, even +47)
-  rejected: lambda 0.8 (+53) / 0.6 (-131) toward clim16 as predict2 does; ANN precip points
-  (precip -206); lambda 1.1 (+176). Gains concentrate in strongly warm years (X=2014 +75, 2023 +107).
-The simulation reproduces live Round 9 (X=1986: -4 simulated and live).
+Dev-time evaluation (rivals' Round 11 code run offline with Tinker off, full 1980..2024
+history, scored by verify/run.py on local truth, X=1985..2023; total = odd + even years):
+  Round 10/11 settings (lambda 1.2)        total +136 (odd +108, even +28)
+  lambda 1.3                               total +170 (odd +134, even +36)
+  lambda 1.3, temp_mean_max_c 1.4          total +184 (odd +128, even +56; 1985-95 -75, 1998-2023 +248)
+  rejected: lambda 1.4 for all (+139), re-adding JJA points (+98), ANN hot-day points (-33).
+  1985-95 is about -70 in every variant, almost all from X=1995 (-76).
 Model ablations: Sep-Dec persistence clearly helps; per-location ENSO fits hurt;
 pooled ENSO is neutral-to-slightly-positive for temperature.
 
@@ -66,6 +65,7 @@ PHI_MIN = 0.1            # floor on the Sep-Dec carry-over (fitted ~0.1 is biase
 PHI_MAX = 0.7            # cap on pooled persistence coefficient
 USE_PRE1980 = True       # fill X-15..1979 from predict3/data/era5_daily_pre1980.csv.gz
 PRE1980_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "era5_daily_pre1980.csv.gz")
+POINT_LAMBDA_VAR = {("ANN", "temp_mean_max_c"): 1.4}  # daily maxima warm fastest (as predict2 found); Round 12 arena +14
 PRE1980_LAMBDA = 0.6     # extra point shrink when the window uses pre-1980 years (early era +32 vs -49 at 1.0)
 SOND_OWN = True          # carry over the variable's own Sep-Dec column (vs Sep-Dec mean temperature): +98 in the arena
 PRECIP_RECENT_W = 0.3    # precip point = clim + w * (last-3-year mean - clim), as in predict6: +54 vs model median
@@ -81,7 +81,7 @@ BOOL_MIN_CONF = 0.65
 POINT_PAIRS = [("ANN", "temp_mean_c"), ("ANN", "temp_mean_max_c"), ("ANN", "temp_mean_min_c"), ("MAM", "temp_mean_c")]
 # ANN precip_sum_mm points were dropped in Round 7 (-34 net); SON temp_mean_c -> MAM in Round 9 (SON -6, MAM +17); JJA dropped in Round 10 (-3, and +17 total without it).
 MIN_POINTS = 60
-POINT_LAMBDA = {"temp": (1.2, 0.67, 16), "other": (1.0, 0.67, 16)}  # (lambda for post-1980 windows, short-record scale, full-record years)
+POINT_LAMBDA = {"temp": (1.3, 0.67, 16), "other": (1.0, 0.67, 16)}  # (lambda for post-1980 windows, short-record scale, full-record years)
 POINT_PRIORITY = 100.0   # points are placed before any other claim
 POINT_CONF = 0.59        # backtest share of point duels won vs naive climatology/trend/persistence points
 THR_MIN_CONF = 0.65
@@ -464,7 +464,7 @@ def make_claims(X, daily, meta, models):
             lam = 1.0 if n >= n_full else short_scale * n / n_full  # short records: trust trends less
             # Pre-satellite ERA5 years make the trend less trustworthy; elsewhere extrapolate
             # `full` times the model's departure from climatology (the shrunk trend under-forecasts).
-            lam *= PRE1980_LAMBDA if min(m["raw"]) < 1980 else full
+            lam *= PRE1980_LAMBDA if min(m["raw"]) < 1980 else POINT_LAMBDA_VAR.get((wkey, var), full)
             pv = clim + lam * (med - clim)
             if var == "precip_sum_mm" and PRECIP_RECENT_W is not None:
                 # ERA5 rainfall drifts over a few years; the last 3 years beat the sqrt-space model here.

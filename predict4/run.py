@@ -19,14 +19,16 @@ The model behind every probability (per location, window, variable; all inputs d
 Calibration was checked by a walk-forward backtest (X=1988..1994 against the real next year):
 boolean probabilities match observed frequencies per decile, so they are stated as is; line
 probabilities were overconfident (selection on noise), so they are shrunk halfway to 0.5.
-A Nino3.4 regression term made forecasts worse at <= 16 years of history and is not used.
+A Nino3.4 regression term made these forecasts worse at <= 16 years of history and is not used.
 Stated confidence is capped at 0.90.
 
 Point forecasts (CONTRACTS.md point duels, scored by absolute error), for the trailing 16 years:
   point = mean + b * (X+1 - mean year) + a * (year X's residual from that trend line),
   b = w * OLS slope + (1 - w) * prior, w = n / (n + k).
 Temperatures use prior 0.03 C/yr and k = 40, a = 0.1 (annual: 0.2 until Round 10), plus
-0.2 x year X's Sep-Dec residual (late-year anomalies persist into the next year).
+0.2 x year X's Sep-Dec residual (late-year anomalies persist into the next year). Annual
+temperature points also add ENSO_WEIGHT x a lagged-ENSO term (Round 12): the 16 residuals,
+ridge-regressed per location on the previous year's Oct-Dec Nino3.4, evaluated at year X's.
 Precipitation uses prior 0, k = 40, a = 0.2. These come from a Round 5 arena: the ten current
 predictors run offline for X = 1985..1995 and 2003..2023 with a full 16-year history, and each
 candidate formula scored by verify's duel rule against their actual point values and the real
@@ -131,6 +133,14 @@ LONG_MEAN_WEIGHT = 0.6
 # Round 10: precip points pull less toward the 1964..X mean. X=1985..1995 precip duels:
 # vs Round 9 rivals -35 -> -2, vs Round 8 rivals -19 -> -1; annual MAE 127.1 -> 125.5 mm.
 LONG_MEAN_WEIGHT_PRECIP = 0.15
+# Round 12: lagged-ENSO term on annual temperature points (rivals predict2/5/6/8 use one too).
+# Arena vs Round 11 rivals, X=1985..2023, net by weight: 0 -4, 0.3 +53, 0.4 +56, 0.5 +52
+# (0.3 beat 0 in each of 1985-95/97/2000/14/23, 1996-2006, 2007-15, 2013/16-22); vs Round 10
+# rivals 0 +35 -> 0.5 +90. Earlier pooled (all-location) ENSO fits lost; this one is per location.
+ENSO_WEIGHT = 0.4
+ENSO_VARS = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c")
+ENSO_RIDGE = 6.0   # ridge on the ENSO coefficient, in pseudo-years (beta / (1 + ridge / n))
+ENSO = {}          # {year: Oct-Dec mean Nino3.4 anomaly}, filled by load_daily from the data dir
 LONG_FIRST_YEAR = 1964
 PRECIP_POINT_PARAMS = (0.0, 40.0, 0.2)
 POINT_DECIMALS = {"precip_sum_mm": 1}        # others: 2
@@ -147,6 +157,16 @@ def load_daily(data_dir: Path, year_x: int):
     """{location_id: {date: {field: float|None}}} and {location_id: (lat, lon)}, dates <= X."""
     daily, coords = defaultdict(dict), {}
     cutoff = f"{year_x}-12-31"
+    ENSO.clear()
+    ip = data_dir / "indices_monthly.json"
+    if ip.exists():
+        nino = {}
+        for r in json.loads(ip.read_text()).get("series", {}).get("nino34_anom", []):
+            y, m = int(r["date"][:4]), int(r["date"][5:7])
+            if y <= year_x and r.get("value") is not None:
+                nino[y, m] = r["value"]
+        ENSO.update({y: sum(nino[y, m] for m in (10, 11, 12)) / 3 for y, _ in nino
+                     if all((y, m) in nino for m in (10, 11, 12))})
     for name in ("daily_history.csv", "daily_year_x.csv"):
         p = data_dir / name
         if not p.exists():
@@ -350,6 +370,27 @@ def trend_residual(series: dict, year_x: int, prior: float, k: float):
     return ybar + b * (year_x + 1 - tbar), s[year_x] - (ybar + b * (year_x - tbar))
 
 
+def enso_shift(series: dict, year_x: int, prior: float, k: float) -> float:
+    """Lagged ENSO term: residuals of the last 16 years from the shrunk trend line, ridge-
+    regressed on the previous year's Oct-Dec Nino3.4, evaluated at year X's Oct-Dec value."""
+    s = {y: v for y, v in series.items() if y >= year_x - 15}
+    ys = sorted(s)
+    n = len(ys)
+    tbar, ybar = sum(ys) / n, sum(s.values()) / n
+    sxx = sum((y - tbar) ** 2 for y in ys)
+    b_ols = sum((y - tbar) * (s[y] - ybar) for y in ys) / sxx if sxx else 0.0
+    b = n / (n + k) * b_ols + k / (n + k) * prior
+    pts = [(ENSO[y - 1], s[y] - (ybar + b * (y - tbar))) for y in ys if y - 1 in ENSO]
+    if len(pts) < 8:
+        return 0.0
+    nb = sum(e for e, _ in pts) / len(pts)
+    snn = sum((e - nb) ** 2 for e, _ in pts)
+    if not snn:
+        return 0.0
+    beta = sum((e - nb) * r for e, r in pts) / (snn * (1 + ENSO_RIDGE / len(pts)))
+    return beta * (ENSO[year_x] - nb)
+
+
 def point_forecast(series: dict, year_x: int, variable: str, wname: str, sond: dict | None = None):
     """Point forecast (value, model mean, sd) for X+1, or None. See the module docstring.
     `sond` is the same variable's Sep-Dec series, whose year-X residual is carried over."""
@@ -364,6 +405,8 @@ def point_forecast(series: dict, year_x: int, variable: str, wname: str, sond: d
     value = line + a * resid_x
     if variable in TEMP_VARS and sond and year_x in sond and len(sond) >= MIN_YEARS:
         value += SOND_CARRY * trend_residual(sond, year_x, prior, k)[1]
+    if variable in ENSO_VARS and wname == "year" and year_x in ENSO:
+        value += ENSO_WEIGHT * enso_shift(series, year_x, prior, k)
     if all(y in series for y in range(LONG_FIRST_YEAR, year_x + 1)):
         long_mean = sum(series[y] for y in range(LONG_FIRST_YEAR, year_x + 1)) / (year_x + 1 - LONG_FIRST_YEAR)
         lw = LONG_MEAN_WEIGHT if variable in TEMP_VARS else LONG_MEAN_WEIGHT_PRECIP

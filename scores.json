@@ -1,16 +1,16 @@
 {
-  "round": 11,
-  "started_at_utc": "2026-11-22T05:25:00Z",
+  "round": 12,
+  "started_at_utc": "2026-11-22T06:20:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": 74,
-    "predict2": -1,
+    "predict1": 69,
+    "predict2": 29,
     "predict3": -63,
-    "predict4": 115,
-    "predict5": 13,
-    "predict6": 3,
-    "predict7": -52,
-    "predict8": -88,
+    "predict4": 110,
+    "predict5": 5,
+    "predict6": 2,
+    "predict7": -71,
+    "predict8": -80,
     "predict9": 8,
     "predict10": -9
   },
@@ -245,6 +245,27 @@
         "predict10": 1
       },
       "note": "200 contradictions (199 point duels + 1 boolean) on X=2000 -> 2001. predict2 (+26) won Round 11 after switching to per-variable Theil-Sen slopes; predict1 (+18) reclaimed #2 overall (+74) without losing to any rival; predict3 (+16) and predict8 (+13, #1 on precip +11) posted strong gains; predict5 (-45) fell to #3 (+13) after raising SOND_CARRY to 0.25."
+    },
+    {
+      "round": 12,
+      "timestamp_utc": "2026-11-22T06:54:00Z",
+      "year_x": 2008,
+      "year_x_plus_1": 2009,
+      "contradictions_count": 149,
+      "resolved_count": 149,
+      "scores_delta": {
+        "predict1": -5,
+        "predict2": 30,
+        "predict3": 0,
+        "predict4": -5,
+        "predict5": -8,
+        "predict6": -1,
+        "predict7": -19,
+        "predict8": 8,
+        "predict9": 0,
+        "predict10": 0
+      },
+      "note": "149 point duels on X=2008 -> 2009 (La Nina to El Nino transition). predict2 (+30) swept every active rival to climb to #3 overall (+29); predict8 (+8) led precip (+6); predict4 (-5) remained #1 (+110) and predict1 (-5) stayed #2 (+69)."
     }
   ]
 }

@@ -332,7 +332,7 @@ SOND_RIDGE = 5.0
 
 PRE1980 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "monthly_pre1980.csv")
 PRE_IDX = {"temp_mean_c": 1, "temp_mean_max_c": 2, "temp_mean_min_c": 3, "precip_sum_mm": 4}
-LONG_W = {"temp_mean_c": 0.5, "temp_mean_max_c": 0.5, "temp_mean_min_c": 0.5, "precip_sum_mm": 0.25}
+LONG_W = {"temp_mean_c": 0.7, "temp_mean_max_c": 0.5, "temp_mean_min_c": 0.5, "precip_sum_mm": 0.25}
 
 
 def load_pre1980():
@@ -436,7 +436,8 @@ def point_value(ys, vs, var, f, X, win, sond=None):
         recent = r[-3:]
         mine = clim + PRECIP_RECENT_W * (sum(recent) / len(recent) - clim)
         line, res = shrunk_line([y for y, _ in sel], r, X, 0.0)
-        return max(0.0, 0.5 * mine + 0.5 * (line + 0.2 * res))
+        # Round 12: lean on the line and year X's residual (rain regimes persist): duels -86 -> +19
+        return max(0.0, 0.15 * mine + 0.85 * (line + 0.3 * res))
     cap = (0.5 if var == "temp_mean_min_c" else 0.8) if win == "year" else (0.8 if win == "mam" else 0.6)
     mine = clim + min(cap, 0.05 * len(r)) * (f["mu"] - clim)
     carry = 0.0

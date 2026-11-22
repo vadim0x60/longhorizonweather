@@ -44,12 +44,12 @@ CATALOG = {  # CONTRACTS.md shared benchmark coordinates (verify checks lat/lon 
     "seoul_kr": (37.5665, 126.9780), "toronto_ca": (43.6532, -79.3832)}
 MAX_PER_LOC = 12
 MIN_POINTS = 70     # contract requires >= 60 point claims; keep a margin
-POINTS_PER_LOC = 6  # round 8: annual temp_mean_min_c points lost from 1995 on, dropped
+POINTS_PER_LOC = 7  # round 12: 7th point (SON) replaces idle non-point slots (+2 over 23 years); round 8: annual temp_mean_min_c points lost from 1995 on, dropped
 # Point targets in priority order: the targets rivals' round-3 code points at, ordered by
 # backtested net duel wins per claim against those rivals (14 held-out years).
 POINT_TARGETS = [("year", "temp_mean_max_c"), ("year", "temp_mean_c"), ("year", "hot_days_ge_30c"),
                  ("year", "precip_sum_mm"), ("jf", "temp_mean_c"), ("jja", "temp_mean_c"),
-                 ("m07", "temp_mean_c"), ("son", "temp_mean_c"), ("year", "temp_max_c"),
+                 ("son", "temp_mean_c"), ("m07", "temp_mean_c"), ("year", "temp_max_c"),
                  ("q4", "temp_mean_c"), ("year", "temp_mean_min_c"), ("jja", "precip_sum_mm")]
 # Point forecast = (1 - a - b) * ensemble median + a * 15-yr mean/trend blend
 #                 + b * damped 16-yr trend line (see Forecaster.damped_trend).
@@ -60,7 +60,8 @@ POINT_TARGETS = [("year", "temp_mean_max_c"), ("year", "temp_mean_c"), ("year", 
 POINT_MIX_DEFAULT = (0.25, 0.0)
 POINT_MIX = {"temp_mean_max_c": (0.0, 0.25), "temp_max_c": (0.0, 0.0),
              ("temp_mean_c", "year"): (0.0, 0.0), ("temp_mean_c", "jf"): (0.0, 0.25),
-             ("temp_mean_c", "jja"): (0.0, 0.0), "temp_mean_c": (0.0, 0.0),
+             ("temp_mean_c", "jja"): (0.0, 0.0), ("temp_mean_c", "son"): (0.5, 0.25),
+             "temp_mean_c": (0.0, 0.0),
              "temp_mean_min_c": (0.0, 0.5),
              "hot_days_ge_30c": (0.0, 0.0), ("precip_sum_mm", "year"): (0.5, 0.5),
              "precip_sum_mm": (0.5, 0.5), "precip_max_day_mm": (0.5, 0.0)}
@@ -69,12 +70,13 @@ POINT_MIX = {"temp_mean_max_c": (0.0, 0.25), "temp_max_c": (0.0, 0.0),
 #   year temp_mean_c  (0,.5,c.1) +12 -> (0,0,c.15) +35   jf temp_mean_c (0,.5) +38 -> (0,.25) +73
 #   year temp_mean_max_c (0,0,c.1) -3 -> (0,.25,c.2) +24  year precip (.25,.75,c.1) +36 -> (.5,.5,c.15) +51
 #   jja temp_mean_c (0,.25,c0) +5 -> (0,0,c.1) +39, so JJA replaces the m07 point (+2).
+# Round 12: son temp_mean_c (0,0,c.1) -> (.5,.25,c.05): vs round-10 rivals -5 -> +5, round-11 -4 -> +8.
 # Carry-over of year X's own value into the point: v += c * (value_X - v). Against rivals'
 # round-7 points over 20 years, c = 0.1 raised the total from +103 to +170 (years >= 1995:
 # +41 -> +127; earlier years: +62 -> +43, still positive). Hot days and JJA lost, so c = 0.
 POINT_CARRY_DEFAULT = 0.1
 POINT_CARRY = {"hot_days_ge_30c": 0.0, ("temp_mean_c", "year"): 0.15, "temp_mean_max_c": 0.2,
-               ("precip_sum_mm", "year"): 0.15}
+               ("precip_sum_mm", "year"): 0.15, ("temp_mean_c", "son"): 0.05}
 MIN_P = 0.7  # offensive bets only with a real edge: backtests vs. rivals' claims lose below ~0.7
 DEF_W = 0.5  # weight of "honeypot" value: a likely-true claim on a target rivals often claim
 WIN_PRIOR = {"year": 0.3, "jja": 0.2, "mam": 0.1, "son": 0.1, "jf": 0.05}

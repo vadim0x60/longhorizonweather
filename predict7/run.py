@@ -135,6 +135,13 @@ ENSO_W = 0.4
 # chosen as the safer side of the 1.4 -> 1.6 cliff (like predict3's 1.2 lambda).
 ENSO_W_MAX = 0.4  # temp_mean_max_c
 MAX_LAM = 1.2     # temp_mean_max_c: point = clim16 + MAX_LAM * (point - clim16)
+# Round 12, full verify vs the round-11 field, X = 1985..2023 (total / variable net):
+#   MAX_LAM 1.0 / 1.1 / 1.2 / 1.3 / 1.4 -> +29/-54, +49/-34, +71/-12, +92/+9, +51/-32
+#   MEAN_LAM (MAX 1.2) 1.0 / 1.1 / 1.2 / 1.3 -> +71/+33, +121/+83, +75/+37, +73/+35
+#   (MAX 1.3) 1.05 / 1.1 -> +117/+58, +142/+83;  MIN_LAM 1.1 -> +69/+48 (vs +50 at 1.0)
+# MAX stays 1.2 (1.4 falls off a cliff in both the round-10 and round-11 fields).
+MEAN_LAM = 1.1    # same for temp_mean_c
+MIN_LAM = 1.0     # same for temp_mean_min_c
 ENSO_RIDGE = 6.0
 LONG_FIRST = 1964
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -721,10 +728,12 @@ def build_claims(year_x, data_dir):
                                 pv = round((1 - LONG_WEIGHT) * pv + LONG_WEIGHT * lm, 2)
                                 pwhy += f"; then {LONG_WEIGHT:.2f} x {LONG_FIRST}..{year_x} mean {lm:.2f}"
                             ew = ENSO_W_MAX if var == "temp_mean_max_c" else ENSO_W
-                            if var == "temp_mean_max_c" and MAX_LAM != 1.0:
+                            lam = {"temp_mean_max_c": MAX_LAM, "temp_mean_c": MEAN_LAM,
+                                   "temp_mean_min_c": MIN_LAM}[var]
+                            if lam != 1.0:
                                 c16 = sum(vals) / len(vals)
-                                pv = round(c16 + MAX_LAM * (pv - c16), 2)
-                                pwhy += f"; departure from 16-yr mean x {MAX_LAM:.2f}"
+                                pv = round(c16 + lam * (pv - c16), 2)
+                                pwhy += f"; departure from 16-yr mean x {lam:.2f}"
                             if ew:
                                 es = ew * enso_shift(yrs, vals, enso, year_x)
                                 pv = round(pv + es, 2)

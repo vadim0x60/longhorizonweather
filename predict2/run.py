@@ -174,6 +174,28 @@ def own_slope(loc, X, w, var, fallback):
     return (core.theil_sen(ys, vs) * len(ys) + fallback * OWN_SLOPE_K) / (len(ys) + OWN_SLOPE_K)
 
 
+# Round 12 (predict1-style): half of the annual hot-day point is the shifted-daily-highs count.
+# Replay vs Round 11 rivals, X=1982..2024 (13 years): hot days -27 -> -16, total -15 -> -4.
+# Rejected for precip: + carry of year X 0.15/0.3 (+5 -> -10/-34), drift 0.15 (-22), line weight 0.7 (-4).
+HOT_SHIFT_W = float(os.environ.get("P2_HSW", "0.5"))
+
+
+def hot_shift(loc, X, tmax_point):
+    """Median count of days >= 30 C over years X-15..X after shifting each year's daily highs so
+    their mean equals our annual temp_mean_max_c point (keeps each year's day-to-day shape)."""
+    counts = []
+    for y in range(X - 15, X + 1):
+        tx = [r[3] for r in loc["days"].get(y, []) if r[3] is not None]
+        if len(tx) >= 360:
+            sh = tmax_point - sum(tx) / len(tx)
+            counts.append(sum(1 for t in tx if t + sh >= 30.0))
+    if len(counts) < 8:
+        return None
+    counts.sort()
+    n = len(counts)
+    return counts[n // 2] if n % 2 else 0.5 * (counts[n // 2 - 1] + counts[n // 2])
+
+
 def seq_history(loc, X, w, var):
     """The 16 yearly values X-15..X of a window stat (input of the sequence LoRA), or None."""
     md = core.window_md(*w)
@@ -240,6 +262,7 @@ def main():
                 "rationale": "%s; %s" % (why, tag)}))
 
         wmap = {wname: (s, e) for wname, s, e in W}
+        pts = {}
         for rank, (wname, var, val) in enumerate(POINTS):
             w = wmap[wname]
             pairs = [(st[var], wt) for wt, st in ens[w]
@@ -280,6 +303,11 @@ def main():
             hist = seq_history(loc, X, w, var)
             if hist:
                 seq_req.append((len(cands), hist, var, wname, loc["lat"]))
+            if var == "hot_days_ge_30c" and wname == "year" and HOT_SHIFT_W and ("year", "temp_mean_max_c") in pts:
+                hs = hot_shift(loc, X, pts[("year", "temp_mean_max_c")])
+                if hs is not None:
+                    med = (1 - HOT_SHIFT_W) * med + HOT_SHIFT_W * hs
+            pts[(wname, var)] = med
             v = round(med) if var in core.COUNT_VARS else round(med, 2)
             g = MIN_GAP[var]
             p = core.wprob(pairs, lambda x: abs(x - v) < g)

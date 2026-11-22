@@ -166,7 +166,13 @@ PT_PRECIP_PRE1980 = (0.6, 0.4, 0, 0.0, 30.0, 0.1, 0.0)
 PT_OVERRIDES = {("temp_mean_min_c", "ANN"): {"prior": 0.025, "E": 0.5},
                 ("temp_mean_c", "JJA"): {"W": 15},
                 ("temp_mean_max_c", "ANN"): {"W": 15, "E": 0.5},
-                ("precip_sum_mm", "ANN"): {"A": 0.3, "C": 0.6}}
+                ("precip_sum_mm", "ANN"): {"A": 0.3, "C": 0.6},
+                ("hot_days_ge_30c", "ANN"): {"A": 0.8, "C": 0.6, "W": 15}}
+# Round 12, held-out check on X=1996..2022 even (round-11 field): the round-11 overrides held up
+# for temp_mean_min ANN (-25 -> -10) and JJA (+8 -> +20); temp_mean_max ANN (0 -> -5) and precip
+# (+92 -> +78) lost a little there but stay ahead over both year sets (+12, +24). Hot days: the
+# count formula (A 1, C .3) gave +20 on odd / -5 on even years; A .8, C .6 on a 15-year base was
+# the only setting positive on both (+22 / +4); settings with less ridge won one set only.
 ENSO_RIDGE = 6.0           # ridge on the ENSO lag coefficient, in multiples of Nino3.4 variance
 PT_SOND_ANN = 0.2          # Sep-Nov carry for annual-window temperature points (see above)
 # Round 10: against the round-9 field over X=1981..1994 that setting lost (-24, -58 on 1981..87;
@@ -696,7 +702,7 @@ def make_claims(days, meta, years, X, indices, log):
         A, C, nlo, prior, k, carry, sond_w = params
         if params is PT_PARAMS["temp"] and win == "ANN":
             sond_w = PT_SOND_ANN
-        ov = PT_OVERRIDES.get((var, win), {}) if params is PT_PARAMS[fam] else {}
+        ov = PT_OVERRIDES.get((var, win), {}) if params is PT_PARAMS[fam] and min(ys) >= 1980 else {}
         A, C, prior = ov.get("A", A), ov.get("C", C), ov.get("prior", prior)
         sl = (sl * n_sl + prior * k) / (n_sl + k)
         A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
