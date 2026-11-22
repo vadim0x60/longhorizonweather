@@ -14,18 +14,21 @@ Offline, stdlib-only statistical forecaster for year X+1:
   * Predictive spread = residual spread with parameter-uncertainty inflation.
   * Mean model also carries a pooled lag-1 persistence of each variable's own
     detrended anomaly (helps precipitation and day counts).
-  * Claims (Round 3 contract: >= 60 points, <= 12 per location, <= 150 total):
-      - 80 `point` claims = predictive median for ANN/JJA temp_mean_c, ANN
-        precip_sum_mm and ANN temp_mean_max_c at all 20 locations;
+  * Claims (contract: >= 60 points, <= 12 per location, <= 150 total):
+      - 100 `point` claims = predictive median (no shrink toward climatology) for
+        ANN/JJA temp_mean_c and ANN precip_sum_mm, temp_mean_max_c, temp_mean_min_c
+        at all 20 locations;
       - directional thresholds halfway between the trailing climatology and our
         median, only when P >= 0.65;
       - warmer/wetter-than-year-X booleans when P >= 0.65; hottest/wettest month.
     Non-point claims are ranked by how many rival claims a target attracts (POP,
     measured offline on past years) times the expected net margin.
 
-Dev-time evaluation, X=1998..2023 (rivals' Round 2 code run offline, local truth):
-point medians beat naive climatology/trend/persistence/damped points in 59.6% of
-duels with gap >= min_gap; non-point claims net +8 over 37 contradictions.
+Dev-time evaluation, X=1998..2023 (rivals' Round 3 code run offline with Tinker off,
+scored by verify/run.py on locally collected truth): net +476 over 2727 contradictions,
+the top simulated total. Tuning found: shrinking points toward climatology loses here
+(lambda 0.5 for temps: -98), temperature trend prior sd 0.03 beats 0.015/0.06, adding the
+temp_mean_min_c point adds ~+120, own-variable persistence adds ~+100.
 Model ablations: Sep-Dec persistence clearly helps; per-location ENSO fits hurt;
 pooled ENSO is neutral-to-slightly-positive for temperature.
 
@@ -59,8 +62,9 @@ OTHER_TREND_SHRINK = 0.5  # extra shrink of EB-weighted trends for non-temperatu
 BOOL_MIN_CONF = 0.65
 # Round 3: point duels (closer to truth wins once two points differ by min_gap). Point claims go on the
 # most contested numeric targets for every location; >= 60 are required by the contract.
-POINT_PAIRS = [("ANN", "temp_mean_c"), ("JJA", "temp_mean_c"), ("ANN", "precip_sum_mm"), ("ANN", "temp_mean_max_c")]
+POINT_PAIRS = [("ANN", "temp_mean_c"), ("JJA", "temp_mean_c"), ("ANN", "precip_sum_mm"), ("ANN", "temp_mean_max_c"), ("ANN", "temp_mean_min_c")]
 MIN_POINTS = 60
+POINT_LAMBDA = {"temp": 1.0, "other": 1.0}  # shrink of the point from model median toward trailing climatology
 POINT_PRIORITY = 100.0   # points are placed before any other claim
 POINT_CONF = 0.59        # backtest share of point duels won vs naive climatology/trend/persistence points
 THR_MIN_CONF = 0.65
@@ -119,7 +123,7 @@ POP = {
 PAIRS = sorted({(w, v) for w, v in POP if v in CONT_VARS} | {(w, BOOL_BASE[v]) for w, v in POP if v in BOOL_BASE})
 
 # Trend priors (per year) in transformed units: warming for temperature, none otherwise.
-TREND_PRIOR = {"temp": (0.03, 0.015), "other": (0.0, None)}
+TREND_PRIOR = {"temp": (0.03, 0.03), "other": (0.0, None)}  # sd 0.03 maximised point-duel score vs Round 3 rivals (0.015: +424, 0.03: +476, 0.06: +401)
 
 
 def transform(kind, x):
@@ -418,8 +422,11 @@ def make_claims(X, daily, meta, models):
         if (wkey, var) in POINT_PAIRS:
             # Predictive median: minimises expected absolute error, which decides point duels.
             med = inverse(m["tf"], m["mu"])
-            add(POINT_PRIORITY + pop, loc, wkey, var, {"kind": "point", "value": round(med, 2)}, POINT_CONF,
-                f"point = predictive median ({len(m['raw'])}-yr ERA5 series; {ann})")
+            clim = sum(m["raw"].values()) / len(m["raw"])
+            lam = POINT_LAMBDA["temp" if var in TEMP_VARS else "other"]
+            pv = clim + lam * (med - clim)
+            add(POINT_PRIORITY + pop, loc, wkey, var, {"kind": "point", "value": round(pv, 2)}, POINT_CONF,
+                f"point = climatology {clim:.2f} + {lam:.2f} x (median {med:.2f} - climatology) ({ann})")
         elif pop:
             r = threshold_claim(m, var)
             if r and r[1] >= THR_MIN_CONF and not (var in COUNT_VARS and max(m["raw"].values()) < 3):

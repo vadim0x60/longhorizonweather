@@ -22,8 +22,9 @@ years <= X; the one with the lowest CV MSE is the forecast, and its CV residuals
 (empirical, per window group) give the predictive distribution.
 
 Claims (one per target, <= 150 total, <= 12 per location_id):
-  * point forecasts (4 per city, >= 60 overall): ridge median blended with the
-    series' shrunk own trend, on annual/JJA/JF temperature and annual precip/counts.
+  * point forecasts (up to 6 per city, >= 60 overall): ridge median blended with the
+    series' trend shrunk toward a warming prior, on annual precip/temperatures/hot days
+    and JJA precip/temperature.
   * warmer/wetter_than_year_x booleans where P(side) >= BOOL_MIN, confidence
     capped by the CV hit rate of such calls.
   * thresholds anchored at the trailing-history baseline, only on sides that were
@@ -115,17 +116,21 @@ if os.environ.get("P8_TMIN"):  # analysis hook: every side at this probability
 MIN_PAST = 5              # years of past data needed to standardize a target year
 MAX_CLAIMS = 150
 MAX_PER_LOC = 12          # CONTRACTS.md round 3: at most 12 claims per location_id
-# Point values blend the ridge median with the series' own trend shrunk toward the warming
-# prior. In point duels against naive point forecasters (climatology, persistence, OLS trend,
-# shrunk trend) over X=1996..2022, the blend beat the pure ridge median against every baseline;
-# temperatures did best at 0.75, precipitation and day counts at 0.5.
-PT_BLEND = {"temp": float(os.environ.get("P8_PT_BLEND", "0.75")), "other": float(os.environ.get("P8_PT_BLEND", "0.5"))}
-POINTS_PER_LOC = 4        # point claims per city (>= 60 point claims required overall)
+# Point value = (1 - PT_BLEND) * ridge median + PT_BLEND * (climatology + slope * years ahead),
+# where slope is the series' own OLS trend shrunk toward PT_PRIOR (temperatures; 0 otherwise)
+# with the weight of PT_K prior years. Chosen by duels against all rivals' point claims (their
+# round-3 code run locally, scored like verify) over X=1988..2003; plateau around B=.25-.6, k>=30.
+PT_BLEND = float(os.environ.get("P8_PT_BLEND", "0.4"))
+PT_K = float(os.environ.get("P8_PT_K", "30"))
+POINTS_PER_LOC = 6        # point claims per city (>= 60 point claims required overall)
 # point-forecast targets and their priority (how much we trust the model there x popularity)
-POINT_TARGETS = {("temp_mean_c", "ANN"): 1.0, ("temp_mean_max_c", "ANN"): 0.9,
-                 ("temp_mean_min_c", "ANN"): 0.9, ("temp_mean_c", "JJA"): 0.85,
-                 ("precip_sum_mm", "ANN"): 0.8, ("temp_mean_c", "JF"): 0.6,
-                 ("hot_days_ge_30c", "ANN"): 0.5, ("rainy_days_ge_1mm", "ANN"): 0.5}
+# priority = net duel score per target vs rivals' points, summed over X=1988..2003 and 2004..2018
+# (precip ANN +149, temp_mean_min ANN +42, hot days +30, JJA temp +20, max-temp ANN +19,
+#  JJA precip +14, temp_mean_c ANN +13; JF/MAM/M07 temps and temp_max_c were net negative)
+POINT_TARGETS = {("precip_sum_mm", "ANN"): 1.0, ("temp_mean_min_c", "ANN"): 0.9,
+                 ("hot_days_ge_30c", "ANN"): 0.85, ("temp_mean_c", "JJA"): 0.8,
+                 ("temp_mean_max_c", "ANN"): 0.75, ("precip_sum_mm", "JJA"): 0.7,
+                 ("temp_mean_c", "ANN"): 0.65}
 MODELS = ["clim", "trend", "full", "tele", "tele2"]
 LAMBDA = {"trend": 0.05, "full": 0.2, "tele": 0.4, "tele2": 0.8}
 LAMBDA = {k: v * float(os.environ.get("P8_LSCALE", "1")) for k, v in LAMBDA.items()}
@@ -561,30 +566,32 @@ def make_claims(days, meta, years, X, indices, log):
     for (var, win), ww in POINT_TARGETS.items():
         for loc in fz.locs:
             f = fc.get(var, loc, win)
-            if f is None:
+            s = series[var].get((loc, win), {})
+            ys = sorted(s)
+            if f is None and len(ys) < 8:
                 continue
-            fit = f[4]
-            med = fc.value_quantile(f, 0.5)
-            blend = PT_BLEND["temp" if var in TEMPS else "other"]
-            if blend:
-                s = series[var].get((loc, win), {})
-                ys = sorted(s)
-                if len(ys) >= 8:
-                    m = mean([s[y] for y in ys])
-                    ym = mean(ys)
-                    sl = sum((y - ym) * (s[y] - m) for y in ys) / sum((y - ym) ** 2 for y in ys)
-                    prior = WARMING_C_PER_YR if var in TEMPS else 0.0
-                    sl = (sl * len(ys) + prior * 8.0) / (len(ys) + 8.0)
-                    med = (1 - blend) * med + blend * (m + sl * (T - ym))
+            if var in COUNTS and sum(1 for y in ys if s[y] == 0) > 0.3 * len(ys):
+                continue
+            # too little history for the CV-fitted ridge (X <= ~1990): trend line alone
+            med = fc.value_quantile(f, 0.5) if f else None
+            skill = f[4]["skill"] if f else 0.0
+            if len(ys) >= 8:
+                m = mean([s[y] for y in ys])
+                ym = mean(ys)
+                sl = sum((y - ym) * (s[y] - m) for y in ys) / sum((y - ym) ** 2 for y in ys)
+                prior = WARMING_C_PER_YR if var in TEMPS else 0.0
+                sl = (sl * len(ys) + prior * PT_K) / (len(ys) + PT_K)
+                trend = m + sl * (T - ym)
+                med = trend if med is None else (1 - PT_BLEND) * med + PT_BLEND * trend
             if var in NONNEG:
                 med = max(0.0, med)
-            point_cands.append((ww * (1 + max(0.0, fit["skill"])), loc, {
+            how = ("ridge-ensemble median blended with shrunk trend, CV skill %+.0f%% vs climatology"
+                   % (100 * skill)) if f else "trend line shrunk toward the warming prior (history too short for CV)"
+            point_cands.append((ww, loc, {
                 "target": target(loc, win, var),
                 "assertion": {"kind": "point", "value": round(med, 2)},
                 "confidence": 0.5,
-                "rationale": "Ridge-ensemble median blended with shrunk own trend (clim %.2f, CV skill %+.0f%% vs climatology); "
-                             "central 50%% band %.2f..%.2f" % (f[1], 100 * fit["skill"],
-                                                             fc.value_quantile(f, 0.25), fc.value_quantile(f, 0.75))}))
+                "rationale": "Point forecast: %s; %d-yr mean %.2f" % (how, len(ys), mean([s[y] for y in ys]))}))
 
     # 1. warmer/wetter than year X
     for bvar, var in (("warmer_than_year_x", "temp_mean_c"), ("wetter_than_year_x", "precip_sum_mm")):
@@ -738,7 +745,7 @@ def main():
     days, meta = load(a.data_dir, X)
     indices = load_indices(a.data_dir, X)
     years = sorted({y for l in days for y in days[l]})
-    claims = make_claims(days, meta, years, X, indices, log) if len(years) >= MIN_PAST + 4 else []
+    claims = make_claims(days, meta, years, X, indices, log) if len(years) >= 8 else []
     claims = claims[:MAX_CLAIMS]
     for i, c in enumerate(claims, 1):
         c["claim_id"] = "p8_%03d" % i

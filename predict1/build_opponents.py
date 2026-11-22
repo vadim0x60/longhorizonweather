@@ -68,7 +68,7 @@ def main():
                 wname = run.window_name(t["window_start"], t["window_end"])
                 if loc not in F.locs or wname is None or not t["window_start"].startswith(str(X + 1)):
                     continue
-                if var in run.NUM_VARS:
+                if var in run.NUM_VARS and asr["kind"] in ("threshold", "interval"):
                     d = F.dist(loc, wname, var)
                     if d is None:
                         continue

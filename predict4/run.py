@@ -24,10 +24,12 @@ Stated confidence is capped at 0.90.
 
 Point forecasts (CONTRACTS.md point duels, scored by absolute error): the full model mean
 over-reacts to noisy trends and anomalies, so the point is the trailing 16-year climatology
-moved part of the way toward it, clim16 + lambda * (model - clim16), with lambda = 0.5 for
-temperatures and 0.25 for precipitation and day counts (hot days use the trailing median).
-In the walk-forward backtest (X = 1988..1994 and 2003..2012) this beat pure climatology, the
-full model, persistence, OLS extrapolation and the 10-year mean in head-to-head duels.
+moved part of the way toward it, clim16 + lambda * (model - clim16). lambda was tuned in a
+Round 4 arena: all ten current predictors run offline for X = 1988..1994 and 2003..2012 and
+scored by verify against the real X+1. Over those 16 years predict4 netted +210 at lambda=0.5
+for temperatures, +257 at 0.25 and +312 at 0 (best in both eras), so temperature points are the
+plain 16-year mean: rivals that extrapolate trends lose point duels to it. Precipitation keeps
+lambda = 0.25 (better than 0 or 0.5); hot days use the trailing median.
 
 Each location gets up to POINTS_PER_LOCATION point claims on the most commonly shared targets,
 then calibrated threshold/boolean claims fill up to 12 per location and 150 in total.
@@ -63,7 +65,7 @@ FIELDS = ["temperature_2m_mean", "temperature_2m_max", "temperature_2m_min",
           "precipitation_sum", "wind_speed_10m_max"]
 MAX_CLAIMS = 150
 MAX_PER_LOCATION = 12
-POINTS_PER_LOCATION = 5
+POINTS_PER_LOCATION = 6
 MIN_YEARS = 6
 
 TEMP_VARS = {"temp_mean_c", "temp_mean_max_c", "temp_mean_min_c"}
@@ -101,11 +103,12 @@ BOOLEAN_JOBS = [
     ("wetter_than_year_x", "precip_sum_mm", list(WINDOWS)),
 ]
 # Point targets in priority order (the targets rivals are most likely to share).
+# Jan-Feb and July temperature points lost duels in the arena (-32, -7), so they are not used.
 POINT_JOBS = [("temp_mean_c", "year"), ("temp_mean_c", "jja"), ("precip_sum_mm", "year"),
-              ("temp_mean_max_c", "year"), ("temp_mean_min_c", "year"), ("temp_mean_c", "mam"),
-              ("temp_mean_c", "son"), ("rainy_days_ge_1mm", "year"), ("hot_days_ge_30c", "year"),
-              ("frost_days_lt_0c", "year"), ("precip_sum_mm", "jja"), ("temp_mean_c", "jf")]
-POINT_LAMBDA = {v: 0.5 for v in TEMP_VARS}   # others: 0.25
+              ("temp_mean_max_c", "year"), ("temp_mean_min_c", "year"), ("precip_sum_mm", "jja"),
+              ("temp_mean_c", "mam"), ("temp_mean_c", "son"), ("rainy_days_ge_1mm", "year"),
+              ("frost_days_lt_0c", "year")]
+POINT_LAMBDA = {v: 0.0 for v in TEMP_VARS}   # others: 0.25
 POINT_DECIMALS = {"precip_sum_mm": 1}        # others: 2
 VAR_WEIGHT = {"temp_mean_c": 1.0, "temp_mean_max_c": 0.7, "temp_mean_min_c": 0.7,
               "hot_days_ge_30c": 0.6, "frost_days_lt_0c": 0.6,

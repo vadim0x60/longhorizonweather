@@ -5,8 +5,10 @@ Builds a trend-adjusted analog ensemble for year X+1 from data dated <= X-12-31
 (core.py), optionally nudged by a Tinker LoRA "regime" model (regime.py), and
 emits <=150 claims (see CONTRACTS.md).
 
-Points are only scored when another predictor claims the same target with a
-disjoint assertion, so claims sit on "focal" targets: standard calendar windows
+Point claims (Round 3+) come first: up to 6 per location on the annual and seasonal
+targets rivals duel on, valued clim16 + lambda * (ensemble median - clim16), optionally
+blended with the Tinker anomaly-sequence LoRA (seqmodel.py). Other points are only
+scored when another predictor claims the same target with a disjoint assertion, so claims sit on "focal" targets: standard calendar windows
 and thresholds at the naive 15/16-year climatological mean, the value most
 climatology-anchored predictors also use. The side of each threshold (and each
 boolean) is whichever the ensemble finds more likely; candidates are ranked by
@@ -30,13 +32,17 @@ POINTS_FIRST = 6  # point claims reserved per location before the shared ranking
 MIN_GAP = {"temp_mean_c": 0.25, "temp_mean_max_c": 0.25, "temp_mean_min_c": 0.25, "temp_max_c": 0.5,
            "temp_min_c": 0.5, "precip_sum_mm": 20.0, "precip_max_day_mm": 3.0, "wind_max_kmh": 2.0,
            "hot_days_ge_30c": 2.0, "frost_days_lt_0c": 2.0, "rainy_days_ge_1mm": 2.0}
-# Point targets in priority order: (window, variable, duel value). Point duels go to whoever is
-# closer to truth; the analog-ensemble median won ~60% of duels against climatology/trend point
-# rules in 1981-2012 replays (all 20 stations), most clearly for JF, July and annual hot days.
-POINTS = [("year", "temp_mean_c", 1.0), ("jf", "temp_mean_c", 1.0), ("jja", "temp_mean_c", 0.9),
-          ("year", "precip_sum_mm", 0.9), ("m07", "temp_mean_c", 0.85), ("year", "hot_days_ge_30c", 0.85),
-          ("m01", "temp_mean_c", 0.8), ("mam", "temp_mean_c", 0.75), ("son", "temp_mean_c", 0.7),
-          ("jf", "temp_mean_max_c", 0.7), ("year", "frost_days_lt_0c", 0.65), ("jja", "precip_sum_mm", 0.5)]
+# Point targets in priority order: (window, variable, duel value). Rivals' point claims sit
+# mostly on annual windows; in a replay of X=1981..1994 against the Round 3 rival code these
+# targets were net positive (annual temp mean/max/min, precip, hot days).
+POINTS = [("year", "temp_mean_c", 1.0), ("year", "precip_sum_mm", 1.0), ("year", "temp_mean_min_c", 0.95),
+          ("year", "temp_mean_max_c", 0.95), ("year", "hot_days_ge_30c", 0.9), ("jja", "temp_mean_c", 0.8),
+          ("jja", "precip_sum_mm", 0.7), ("mam", "temp_mean_c", 0.6), ("son", "temp_mean_c", 0.6),
+          ("jf", "temp_mean_c", 0.5)]
+# Point value = clim16 + LAMBDA * (ensemble median - clim16). Rivals shrink toward the trailing
+# 16-year mean too; in point duels against them these weights beat both the raw median and clim16.
+LAMBDA = {"precip_sum_mm": 0.5, "hot_days_ge_30c": 1.0}
+LAMBDA_TEMP = 0.25
 EPS = 0.01  # threshold margin so "le m" / "gt m" stay disjoint from rivals' gt/le at m
 TEMP3 = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c")
 # relative value of a claim type: how likely it is to be contested and won
@@ -97,6 +103,32 @@ def focal_means(loc, X, w, var):
     return out
 
 
+def seq_history(loc, X, w, var):
+    """The 16 yearly values X-15..X of a window stat (input of the sequence LoRA), or None."""
+    md = core.window_md(*w)
+    out = []
+    for y in range(X - 15, X + 1):
+        st = core.window_stats(loc["days"][y], *md, 0.0) if y in loc["days"] else None
+        if not st or st.get(var) is None:
+            return None
+        out.append(st[var])
+    return out
+
+
+def _log_seq_inference(n_points):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tinker_budget.json")
+    try:
+        with open(path) as fh:
+            b = json.load(fh)
+        b["inference_runs"] = b.get("inference_runs", 0) + 1
+        b["inference_usd_est"] = round(b.get("inference_usd_est", 0.0) + n_points * 9 * 170 * 0.195 / 1e6, 4)
+        b["total_usd_est"] = round(b["training_usd_est"] + b["inference_usd_est"], 4)
+        with open(path, "w") as fh:
+            json.dump(b, fh, indent=1)
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--year-x", type=int, required=True)
@@ -122,7 +154,7 @@ def main():
         except Exception as e:  # never fail the run on the optional LLM step
             print("regime model skipped: %r" % (e,), file=sys.stderr)
 
-    cands = []
+    cands, seq_req = [], []
     for lid, loc in sorted(locs.items()):
         if X not in core.complete_years(loc["days"]):
             continue
@@ -144,14 +176,20 @@ def main():
                 continue
             if var in core.COUNT_VARS and core.wquantile(pairs, 0.8) < MIN_GAP[var]:
                 continue  # near-zero count: no rival can be 2 days away on the right side
+            fm = focal_means(loc, X, (wname,) + w, var)
             med = core.wquantile(pairs, 0.5)
+            if fm:
+                med = fm[0] + LAMBDA.get(var, LAMBDA_TEMP) * (med - fm[0])
+            hist = seq_history(loc, X, w, var)
+            if hist:
+                seq_req.append((len(cands), hist, var, wname, loc["lat"]))
             v = round(med) if var in core.COUNT_VARS else round(med, 2)
             g = MIN_GAP[var]
             p = core.wprob(pairs, lambda x: abs(x - v) < g)
             cands.append((None, rank, val, {
                 "target": dict(base, window_start=w[0], window_end=w[1], variable=var),
                 "assertion": {"kind": "point", "value": v}, "confidence": round(min(0.97, max(0.05, p)), 3),
-                "rationale": "analog-ensemble median; P(|err|<%g)=%.2f; %s" % (g, p, tag)}))
+                "rationale": "clim16 shrunk toward analog-ensemble median; P(|err|<%g)=%.2f; %s" % (g, p, tag)}))
 
         for wname, s, e in W:
             w = (s, e)
@@ -201,6 +239,21 @@ def main():
 
     # 1) the first POINTS_FIRST point claims of every location; 2) everything else by score
     # (points valued at 0.35 * priority weight, comparable to a p~0.75 boolean), under the caps.
+    if seq_req and not a.no_tinker and os.environ.get("TINKER_API_KEY"):
+        try:
+            import seqmodel
+            preds, cfg = seqmodel.expected_points(seq_req)
+            b = cfg.get("blend", 0.0) if cfg.get("use") else 0.0
+            for i, pv in preds.items():
+                asr = cands[i][3]["assertion"]
+                var = cands[i][3]["target"]["variable"]
+                v = (1 - b) * asr["value"] + b * pv
+                asr["value"] = round(v) if var in core.COUNT_VARS else round(v, 2)
+            if preds:
+                regime_note += "; seq LoRA blend %.2f on %d points" % (b, len(preds))
+                _log_seq_inference(len(preds))
+        except Exception as e:  # never fail the run on the optional LLM step
+            print("seq model skipped: %r" % (e,), file=sys.stderr)
     points = [c for c in cands if c[0] is None]
     first = [c for c in points if c[1] < POINTS_FIRST]
     rest = [(0.35 * c[2], c[3]) for c in points if c[1] >= POINTS_FIRST]

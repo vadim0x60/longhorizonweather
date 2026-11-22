@@ -103,9 +103,8 @@ class Predict4Tests(unittest.TestCase):
         self.assertLessEqual(len(claims), P4.MAX_PER_LOCATION)
         acc, rej = VERIFY.filter_claims("predict4", claims, X)
         self.assertEqual(rej, [])
-        # Annual temp_mean_c point = mean16 + 0.5 * (model - mean16), computed independently here:
-        # with a steady 0.15/yr warming the model extrapolates above the 16-year mean, so the
-        # point must sit strictly between the 16-year mean and the year-X value.
+        # Temperature points are the plain 16-year mean (lambda = 0), computed independently here.
+        # With a steady 0.15/yr warming that is well below year X: the point does not chase the trend.
         by_year = {}
         for r in rows:
             by_year.setdefault(int(r["date"][:4]), []).append(float(r["temperature_2m_mean"]))
@@ -113,9 +112,8 @@ class Predict4Tests(unittest.TestCase):
         mean16 = sum(yearly[y] for y in range(X - 15, X + 1)) / 16
         annual = next(c for c in points if c["target"]["variable"] == "temp_mean_c"
                       and c["target"]["window_end"] == f"{X + 1}-12-31")
-        self.assertTrue(mean16 < annual["assertion"]["value"] < yearly[X] + 0.15, (mean16, annual))
-        model = P4.forecast(yearly, X, "temp_mean_c")[0]
-        self.assertAlmostEqual(annual["assertion"]["value"], mean16 + 0.5 * (model - mean16), places=2)
+        self.assertAlmostEqual(annual["assertion"]["value"], mean16, places=2)
+        self.assertLess(annual["assertion"]["value"], yearly[X] - 0.5)
 
     def test_ignores_rows_after_year_x(self):
         a = self.run_p4(leak_value=99.0)

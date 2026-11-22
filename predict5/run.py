@@ -26,6 +26,7 @@ from datetime import date, timedelta
 MAX_CLAIMS = 150
 PER_LOCATION = 12   # CONTRACTS.md round 3: at most 12 claims per location_id
 MIN_POINTS = 60     # CONTRACTS.md round 3: at least 60 point claims
+MIN_YEARS = 5       # shortest usable history (X = 1984 has only 1980..1984)
 PRIOR_SLOPE_C_PER_YR = 0.025  # global-mean land warming since 1980, roughly
 PRIOR_WEIGHT_YEARS = 16.0      # prior counts like this many years of slope evidence (temperatures)
 COUNT_PRIOR_WEIGHT_YEARS = 8.0  # same, for hot/frost day counts
@@ -84,11 +85,20 @@ FAMILY_WEIGHT = {
 # 15-year-climatology point forecaster (duels with gap >= min_gap): annual temp_mean_c 152-67,
 # annual temp_mean_max_c 209-102, annual temp_mean_min_c 130-68, seasonal temp_mean_c 593-446,
 # hot days ~even, frost days ~even. Precipitation is not claimed (no edge over climatology).
+# Round 4: annual hot-day points lost duels to the master rival field in every variant (-8 to -27
+# over X = 1985..2023), so hot days are only claimed as thresholds.
 POINT_PLAN = [
     ("temp_mean_c", "year"), ("temp_mean_max_c", "year"), ("temp_mean_min_c", "year"),
-    ("temp_mean_c", "JJA"), ("temp_mean_c", "JF"), ("hot_days_ge_30c", "year"),
+    ("temp_mean_c", "JJA"), ("temp_mean_c", "JF"),
     ("temp_mean_c", "MAM"), ("temp_mean_c", "SON"), ("temp_mean_max_c", "JJA"),
 ]
+# Point values keep a share lambda of the trend departure from the 15-year mean, chosen per year
+# by walk-forward error (point_damping); at least half the secular signal is always kept.
+# Round 4 backtest vs the master rival field, X = 1985..2023: fixed full trend +25 (early -22),
+# lambda in {0..1} +28 (late -55), lambda in {0.5, 0.75, 1} +135 (early +86, late +49).
+DAMPINGS = (0.5, 0.75, 1.0)
+DEFAULT_DAMPING = 0.5
+WF_YEARS = 10
 POINT_SLOTS = 120   # the remaining 30 slots go to the best threshold/boolean claims
 
 
@@ -212,6 +222,34 @@ def window_kind(wname):
     return "quarter" if wname[0] == "Q" else "month"
 
 
+def point_damping(items, enso, x):
+    """Per (variable, window kind), the share lambda of the trend + ENSO departure from the 15-year
+    mean that minimized pooled absolute error in a walk-forward backtest over target years
+    x-WF_YEARS+1 .. x, each forecast only from years before it. Uses data <= x only."""
+    err = defaultdict(lambda: [0.0] * len(DAMPINGS))
+    for it in items:
+        yrs, ys, var = it["yrs"], it["ys"], it["var"]
+        for j, t in enumerate(yrs):
+            if t <= x - WF_YEARS:
+                continue
+            sub = [(a, b) for a, b in zip(yrs[:j], ys[:j]) if a >= t - 16]
+            if len(sub) < MIN_YEARS:
+                continue
+            sy, sv = [a for a, _ in sub], [b for _, b in sub]
+            base = sum(sv) / len(sv)
+            pred, _, _, fit = trend_forecast(sy, sv, t, it["prior"], it["pw"])
+            if var in ENSO_VARS:
+                pred += enso_adjust(sy, sv, fit, {k: v for k, v in enso.items() if k < t}, t - 1)[0]
+            acc = err[(var, it["wk"])]
+            for i, lm in enumerate(DAMPINGS):
+                v = base + lm * (pred - base)
+                if var not in TEMP_VARS:
+                    v = max(v, 0.0)
+                acc[i] += abs(v - ys[j])
+    return {k: DAMPINGS[min(range(len(DAMPINGS)), key=lambda i: (v[i], -DAMPINGS[i]))]
+            for k, v in err.items() if any(v)}
+
+
 def build_pool(locs, x, enso=None):
     """Every candidate claim, possibly several per target (one per family)."""
     enso = enso or {}
@@ -225,7 +263,7 @@ def build_pool(locs, x, enso=None):
             for var in TEMP_VARS + COUNT_VARS:
                 series = [(yr, stat(days, span[yr], var)) for yr in hist_years]
                 series = [(t, v) for t, v in series if v is not None]
-                if len(series) < 10 or series[-1][0] != x:
+                if len(series) < MIN_YEARS or series[-1][0] != x:
                     continue
                 yrs = [t for t, _ in series]
                 ys = [v for _, v in series]
@@ -239,7 +277,9 @@ def build_pool(locs, x, enso=None):
                     pw = COUNT_PRIOR_WEIGHT_YEARS
                 pred, sd, b, fit = trend_forecast(yrs, ys, target_year, prior, pw)
                 items.append(dict(lid=lid, loc=loc, wname=wname, s=s, e=e, wk=window_kind(wname),
-                                  var=var, yrs=yrs, ys=ys, base=base, pred=pred, sd=sd, b=b, fit=fit))
+                                  var=var, yrs=yrs, ys=ys, base=base, pred=pred, sd=sd, b=b, fit=fit,
+                                  prior=prior, pw=pw))
+    lam = point_damping(items, enso, x)
     out = []
     for it in items:
         lid, loc, wname, s, e, wk, var = (it[k] for k in ("lid", "loc", "wname", "s", "e", "wk", "var"))
@@ -249,12 +289,14 @@ def build_pool(locs, x, enso=None):
         pred = it["pred"] + shift
         if var not in TEMP_VARS:
             pred = max(pred, 0.0)
-        # Point forecast: the predictive mean (median of the Normal), for point duels.
+        # Point forecast: 15y mean plus the walk-forward-chosen share of the trend + ENSO departure.
+        lm = lam.get((var, wk), DEFAULT_DAMPING)
+        pv = base + lm * (pred - base)
         out.append(_cand(lid, loc, wname, s, e, var,
-                         {"kind": "point", "value": round(pred, 2 if var in TEMP_VARS else 1)}, 1.0,
+                         {"kind": "point", "value": round(pv, 2 if var in TEMP_VARS else 1)}, 1.0,
                          f"{var}|point|{wk}",
                          f"point forecast: 15y mean {base:.2f}, trend {b * 10:+.2f}/decade,"
-                         f" ENSO lag {shift:+.2f} -> {pred:.2f} (sd {sd:.2f})"))
+                         f" ENSO lag {shift:+.2f}, damping {lm:.2f} (walk-forward) -> {pv:.2f}"))
         if var in TEMP_VARS:
             info = (f"15y mean {base:.2f}C, trend {b * 10:+.2f}C/decade, ENSO lag {shift:+.2f}C -> {pred:.2f}C (sd {sd:.2f})")
             # Thresholds at points where cold-leaning rivals put their upper bound.

@@ -1,18 +1,18 @@
 {
-  "round": 3,
-  "started_at_utc": "2026-11-22T00:15:00Z",
+  "round": 4,
+  "started_at_utc": "2026-11-22T00:50:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": 39,
-    "predict2": 0,
-    "predict3": 3,
-    "predict4": 26,
-    "predict5": -15,
-    "predict6": -36,
-    "predict7": -22,
-    "predict8": 5,
-    "predict9": 0,
-    "predict10": 0
+    "predict1": 73,
+    "predict2": 5,
+    "predict3": -34,
+    "predict4": 31,
+    "predict5": -9,
+    "predict6": -23,
+    "predict7": -64,
+    "predict8": 21,
+    "predict9": 1,
+    "predict10": -1
   },
   "history": [
     {
@@ -55,7 +55,7 @@
         "predict9": 0,
         "predict10": 0
       },
-      "note": "All 10 predictors submitted 150 accepted claims (331 shared targets, 31 both-sided threshold pairs), yielding 1 disjoint contradiction (toronto_ca hot_days_ge_30c: predict3 lt 6 beat predict8 gt 6.0 vs truth 0). The remaining 30 both-sided threshold pairs did not contradict because predictors placed asymmetric 62-70% gt/lt thresholds leaving an overlapping middle band. CONTRACTS.md updated for Round 3 to add `point` forecast duels and break the honeypot stalemate."
+      "note": "All 10 predictors submitted 150 accepted claims (331 shared targets, 31 both-sided threshold pairs), yielding 1 disjoint contradiction (toronto_ca hot_days_ge_30c: predict3 lt 6 beat predict8 gt 6.0 vs truth 0). CONTRACTS.md updated for Round 3 to add `point` forecast duels."
     },
     {
       "round": 3,
@@ -76,7 +76,28 @@
         "predict9": 0,
         "predict10": 0
       },
-      "note": "261 point duels resolved on X=1992 -> 1993 (temp_mean_c: 65, temp_mean_max_c: 54, temp_mean_min_c: 7, precip_sum_mm: 124, hot_days_ge_30c: 11). predict1 (+39) and predict4 (+26) dominated temperature duels while predict6 (-36), predict7 (-22), and predict5 (-15) lost on trend/extreme over-extrapolation. predict9 and predict10 hit ChatGPT subscription sharing usage limits at Round 3 start and remained on their Round 2 code."
+      "note": "261 point duels resolved on X=1992 -> 1993. predict1 (+39) and predict4 (+26) led temperatures while predict6 (-36) and predict7 (-22) won precip (+7, +6) but lost heavily on temperature trends."
+    },
+    {
+      "round": 4,
+      "timestamp_utc": "2026-11-22T01:23:00Z",
+      "year_x": 1987,
+      "year_x_plus_1": 1988,
+      "contradictions_count": 589,
+      "resolved_count": 589,
+      "scores_delta": {
+        "predict1": 34,
+        "predict2": 5,
+        "predict3": -37,
+        "predict4": 5,
+        "predict5": 6,
+        "predict6": 13,
+        "predict7": -42,
+        "predict8": 16,
+        "predict9": 1,
+        "predict10": -1
+      },
+      "note": "589 contradictions (588 point duels + 1 boolean warmer_than_year_x where predict9 beat predict10). predict1 (+34) extended its lead to +73 using long pre-1980+ERA5 medians; predict8 (+16) rose to #3 (+21); predict6 (+13) and predict5 (+6) rebounded; aggressive unshrunk trend/overfit models predict3 (-37) and predict7 (-42) lost heavily on 1987->1988."
     }
   ]
 }

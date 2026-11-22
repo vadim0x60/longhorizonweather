@@ -16,8 +16,14 @@ Models each yearly target series y_t (one value per trailing year <= X) as
   A late-X El Nino makes us call a warmer X+1 where mean-reversion models call
   cooling; a La Nina makes us call "le baseline" against warming extrapolators.
 
-Round 3: 100 `point` claims (5 per location: annual temp_mean/max/min, annual
-precip_sum, JJA temp_mean) carrying the model median, then the best-ranked
+* Sep-Dec persistence (Round 4): one coefficient per (window, temperature
+  variable), pooled across all locations and ridge-shrunk, on the detrended
+  Sep-Dec anomaly of the preceding year.
+
+Point claims: 100 (5 per location: annual temp_mean/max/min, annual precip_sum,
+JJA temp_mean). Value = 16-y climatology + lam * (model - climatology), with
+lam = 0.05 * n_years (<= 0.8) for temperatures and 0.5 for precipitation, tuned
+in duels against the real Round 3 rivals (X=1985..2023). Then the best-ranked
 thresholds/booleans below, capped at 12 claims per location_id.
 
 Other claims are thresholds at the naive 15/16-year climatologies that trend and
@@ -266,6 +272,74 @@ def wclass(win):
     return "year" if win == "year" else ("month" if win.startswith("m") else "season")
 
 
+MIN_YEARS = 1   # X can be as early as 1980; short series still get shrunk point forecasts
+SOND_MAX = 0.6  # cap on the pooled Sep-Dec persistence coefficient
+
+
+def sond_anomalies(rows, X):
+    """{loc: {year: detrended Sep-Dec mean temperature anomaly}} for years <= X."""
+    out = {}
+    for loc, lr in rows.items():
+        years = sorted(y for y in {int(d[:4]) for d in lr} if y <= X)
+        ys, vs = yearly_series(lr, years, (9, 1, 12, 31), "temp_mean_c")
+        if len(ys) < 6:
+            continue
+        b = theil_sen(ys, vs)
+        a = median([v - b * y for y, v in zip(ys, vs)])
+        out[loc] = {y: v - (a + b * y) for y, v in zip(ys, vs)}
+    return out
+
+
+def fit_all(rows, meta, X, enso):
+    """{(loc, win, var): (years, values, forecast)}. Temperatures get one Sep-Dec persistence
+    coefficient per (window, variable), pooled across all locations (per-location fits on
+    <= 16 years are noise) and shrunk toward 0, so a warm autumn in X carries into X+1."""
+    F = {}
+    for loc in sorted(rows):
+        lr = rows[loc]
+        years = sorted(y for y in {int(d[:4]) for d in lr} if y <= X)
+        for win in WINDOWS:
+            for var in ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "precip_sum_mm"):
+                ys, vs = yearly_series(lr, years, WINDOWS[win], var)
+                if len(vs) < MIN_YEARS or ys[-1] != X:
+                    continue
+                use_enso = var in TEMP_VARS and abs(meta[loc][0]) < ENSO_MAX_LAT
+                F[(loc, win, var)] = (ys, vs, forecast(ys, vs, var, X + 1, enso if use_enso else None))
+    sond = sond_anomalies(rows, X)
+    for win in WINDOWS:
+        for var in TEMP_VARS & {"temp_mean_c", "temp_mean_max_c", "temp_mean_min_c"}:
+            num = den = 0.0
+            keys = [k for k in F if k[1] == win and k[2] == var and k[0] in sond]
+            for k in keys:
+                ys, _, f = F[k]
+                for y, r in zip(ys, f["resid"]):
+                    a = sond[k[0]].get(y - 1)
+                    if a is not None:
+                        num += a * r
+                        den += a * a
+            phi = max(0.0, min(SOND_MAX, num / (den + SOND_RIDGE))) if den > 0 else 0.0
+            for k in keys:
+                f = F[k][2]
+                f["sond"] = phi * sond[k[0]].get(X, 0.0)
+                f["mu"] += f["sond"]
+    return F
+
+
+SOND_RIDGE = 5.0
+
+
+def point_value(ys, vs, var, f, X):
+    """Point = 16-y climatology + lam * (model - climatology). Duel backtest against the real
+    Round 3 rivals (X=1985..2023): the full model loses on short histories, so lam grows with
+    the number of trailing years n: lam = 0.05 n, 0.3 at n = 6 up to 0.8 at n = 16 (temperatures);
+    precipitation stays at 0.5, where the trend/cycle terms add noise."""
+    r = [v for y, v in zip(ys, vs) if y >= X - 15]
+    clim = sum(r) / len(r)
+    lam = 0.5 if var == "precip_sum_mm" else min(0.8, 0.05 * len(r))
+    pv = clim + lam * (f["mu"] - clim)
+    return max(pv, 0.0) if var == "precip_sum_mm" else pv  # ridge pseudo-sum of squared anomalies (degC^2)
+
+
 def candidates(rows, meta, X, enso):
     Y1 = X + 1
     out = []
@@ -278,35 +352,31 @@ def candidates(rows, meta, X, enso):
                 "window_start": f"{Y1}-{ms:02d}-{ds:02d}", "window_end": f"{Y1}-{me:02d}-{de:02d}",
                 "variable": var}
 
+    F = fit_all(rows, meta, X, enso)
     for loc in sorted(rows):
-        lr = rows[loc]
-        years = sorted(y for y in {int(d[:4]) for d in lr} if y <= X)
         for win in WINDOWS:
             for var in ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "precip_sum_mm"):
-                ys, vs = yearly_series(lr, years, WINDOWS[win], var)
-                if len(vs) < 8 or ys[-1] != X:
+                if (loc, win, var) not in F:
                     continue
-                use_enso = var in TEMP_VARS and abs(meta[loc][0]) < ENSO_MAX_LAT
-                f = forecast(ys, vs, var, Y1, enso if use_enso else None)
-                if f["sigma"] <= 0:
-                    continue
+                ys, vs, f = F[(loc, win, var)]
                 if var == "precip_sum_mm" and f["clim"] < 10:
                     continue  # dry-season totals: skewed, ties near zero
                 cyc = f" cycle P={f['period']:.1f}y {f['cyc']:+.2f};" if f["period"] else ""
+                if f.get("sond"):
+                    cyc += f" Sep-Dec persistence {f['sond']:+.2f};"
                 if f["enso"]:
                     cyc += f" ENSO(Nino3.4 OND {X}={enso[X]:+.2f}) {f['enso']:+.2f};"
                 model = (f"trend {f['trend']:+.3f}/y, AR phi={f['phi']:.2f},{cyc} fcst {f['mu']:.2f}"
                          f"±{f['sigma']:.2f}")
-                cdf = lambda v: ND.cdf((v - f["mu"]) / f["sigma"])
                 if (win, var) in POINT_SPECS:
-                    pv = f["mu"]
-                    if win != "year" and var in TEMP_VARS:
-                        pv = 0.5 * pv + 0.5 * sum(vs[-10:]) / len(vs[-10:])
-                    pv = max(pv, 0.0) if var == "precip_sum_mm" else pv
+                    pv = point_value(ys, vs, var, f, X)
                     out.append((1.0, ("point", var, wclass(win)), {
                         "target": target(loc, win, var),
                         "assertion": {"kind": "point", "value": round(pv, 1 if var == "precip_sum_mm" else 2)},
-                        "confidence": 0.5, "rationale": "Point forecast (model median); " + model + "."}))
+                        "confidence": 0.5, "rationale": "Point = 16-y climatology shrunk toward model; " + model + "."}))
+                if f["sigma"] <= 0 or len(vs) < 8:
+                    continue  # probabilistic claims need a spread estimate from >= 8 years
+                cdf = lambda v: ND.cdf((v - f["mu"]) / f["sigma"])
                 # thresholds at the naive climatologies a trend/climatology rival anchors on
                 b16 = sum(vs) / len(vs)
                 r15 = [v for y, v in zip(ys, vs) if y >= X - 14]

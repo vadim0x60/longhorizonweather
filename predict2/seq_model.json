@@ -1,0 +1,46 @@
+{
+ "base_model": "Qwen/Qwen3-8B",
+ "sampler_path": "tinker://6234fe4a-a584-5ca1-b145-13abf1fdbe5f:train:0/sampler_weights/p2-seq-r4",
+ "train_years": [
+  1956,
+  1975
+ ],
+ "val_years": [
+  1976,
+  1979
+ ],
+ "validation": {
+  "temp_mean_c": {
+   "n": 112,
+   "mae_clim16": 0.6576,
+   "mae_lora": 0.6605,
+   "mae_half": 0.6586
+  },
+  "temp_mean_max_c": {
+   "n": 112,
+   "mae_clim16": 0.7791,
+   "mae_lora": 0.7812,
+   "mae_half": 0.7786
+  },
+  "temp_mean_min_c": {
+   "n": 112,
+   "mae_clim16": 0.5916,
+   "mae_lora": 0.6034,
+   "mae_half": 0.5962
+  },
+  "precip_sum_mm": {
+   "n": 112,
+   "mae_clim16": 88.8758,
+   "mae_lora": 88.327,
+   "mae_half": 88.5827
+  },
+  "hot_days_ge_30c": {
+   "n": 76,
+   "mae_clim16": 6.0288,
+   "mae_lora": 5.8658,
+   "mae_half": 5.9473
+  }
+ },
+ "use": false,
+ "blend": 0.0
+}

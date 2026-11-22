@@ -44,13 +44,18 @@ CATALOG = {  # CONTRACTS.md shared benchmark coordinates (verify checks lat/lon 
     "seoul_kr": (37.5665, 126.9780), "toronto_ca": (43.6532, -79.3832)}
 MAX_PER_LOC = 12
 MIN_POINTS = 70     # contract requires >= 60 point claims; keep a margin
-POINTS_PER_LOC = 5
-# Point targets in priority order: canonical windows rivals are told to use, ordered by
-# backtested duel edge vs. 15-year climatology/trend points (temperatures strongest).
-POINT_TARGETS = [("year", "temp_mean_c"), ("year", "temp_mean_max_c"), ("jja", "temp_mean_c"),
-                 ("year", "temp_max_c"), ("year", "precip_sum_mm"), ("jf", "temp_mean_c"),
-                 ("year", "temp_mean_min_c"), ("son", "temp_mean_c"), ("q4", "temp_mean_c"),
-                 ("q1", "temp_mean_c"), ("mam", "temp_mean_c"), ("m07", "temp_mean_c")]
+POINTS_PER_LOC = 7
+# Point targets in priority order: the targets rivals' round-3 code points at, ordered by
+# backtested net duel wins per claim against those rivals (14 held-out years).
+POINT_TARGETS = [("year", "temp_mean_max_c"), ("year", "temp_mean_c"), ("year", "hot_days_ge_30c"),
+                 ("year", "precip_sum_mm"), ("year", "temp_mean_min_c"), ("jf", "temp_mean_c"),
+                 ("jja", "temp_mean_c"), ("jja", "precip_sum_mm"), ("m07", "temp_mean_c"),
+                 ("year", "temp_max_c"), ("son", "temp_mean_c"), ("q4", "temp_mean_c")]
+# Weight on the 15-year mean/trend blend in point forecasts, tuned against rivals'
+# round-3 point claims over 14 held-out years: temperatures do best at the long-history
+# median; precipitation totals at the recent-window blend (ERA5 rain drifts over decades).
+POINT_SHRINK = {"temp_mean_c": 0.0, "temp_mean_max_c": 0.0, "temp_max_c": 0.0,
+                "precip_sum_mm": 1.0, "precip_max_day_mm": 0.5}
 MIN_P = 0.7  # offensive bets only with a real edge: backtests vs. rivals' claims lose below ~0.7
 DEF_W = 0.5  # weight of "honeypot" value: a likely-true claim on a target rivals often claim
 WIN_PRIOR = {"year": 0.3, "jja": 0.2, "mam": 0.1, "son": 0.1, "jf": 0.05}
@@ -485,8 +490,7 @@ class Forecaster:
             if s and s > 1e-6 and eps and len(eps) >= 30:
                 w = self.model.get(var, {"w": (1, 0, 0, 0)})["w"]
                 m = sum(wi * ci for wi, ci in zip(w, base_forecasts(series, self.X + 1)))
-                if not os.environ.get("P1_NOCORR"):
-                    m += s * self.corr.shift(loc, wname, var, self.X + 1)
+                m += s * self.corr.shift(loc, wname, var, self.X + 1)
                 tp = self.tinker_pred.get(key)
                 if tp is not None:
                     m = (1 - self.blend) * m + self.blend * tp
@@ -505,7 +509,7 @@ class Forecaster:
         ys = [y for y in sorted(ser) if self.X - 15 <= y <= self.X]
         vs = [ser[y] for y in ys]
         half = 0.5 * sum(vs) / len(vs) + 0.5 * ols_predict(ys, vs, self.X + 1)
-        a = 0.5 if var.startswith("precip") else 0.25
+        a = POINT_SHRINK.get(var, 0.25)
         v = (1 - a) * d.q(0.5) + a * half
         return max(0.0, v) if (var in COUNT_VARS or var.startswith("precip")) else v
 
@@ -740,7 +744,7 @@ def build_claims(F, opp):
             ws, we = month_window(Y, m1, m2)
             tgt = {"location_id": loc, "lat": lat, "lon": lon, "window_start": ws, "window_end": we, "variable": var}
             by_loc[loc].append((tgt, {"kind": "point", "value": round(pv, 2)}, 0.5,
-                                f"point: 0.75*median + 0.25*15-yr blend (precip 0.5); sd {d.s:.2f}"))
+                                f"point forecast (median / 15-yr blend per POINT_SHRINK); sd {d.s:.2f}"))
             point_keys.add((loc, wname, var))
     # 2) remaining slots: honeypot / offensive claims, ranked by expected contradiction gain
     cands.sort(key=lambda c: (-round(c[0], 4), -c[1]))

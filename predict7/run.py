@@ -54,28 +54,44 @@ CFG = {
     },
 }
 
-# Point forecasts (round 3 duels: the value closer to the truth wins).
-# point = w * (distribution mean or median) + (1 - w) * (climatology+OLS)/2.
-# The median is used where the tail is heavy (daily rain maxima, day counts of
-# rare events): it minimises absolute error, so it wins closest-to-truth duels
-# against mean forecasts that the right tail drags upward. Weights from a
-# 2010-2023 hindcast against climatology, OLS, persistence and blend rivals.
+# Point forecasts (closest-to-truth duels). With clim = 16-yr mean of the
+# window statistic, base = clim or its median, mean = mean of our predictive
+# distribution, ols = OLS trend extrapolation and anom = year X's Sep-Dec
+# temperature_2m_mean anomaly against the earlier years' Sep-Dec mean:
+#     point = base + a * (mean - clim) + b * (ols - clim) + c * anom
+# (a, b, c, base) were fitted on duels against the Round 3 field over
+# X = 1985..2023 and kept only when both 1985-2003 and 2004-2023 net positive.
+# The median base on skewed day counts is the tail-aware part: it sits below the
+# mean the way the skewed count distribution does.
 POINT = {
-    "temp_mean_c": (0.75, "mean"), "temp_mean_max_c": (0.75, "mean"),
-    "temp_mean_min_c": (0.25, "mean"), "temp_max_c": (0.75, "mean"),
-    "temp_min_c": (0.75, "mean"), "precip_sum_mm": (0.5, "mean"),
-    "precip_max_day_mm": (0.75, "median"), "wind_max_kmh": (0.5, "mean"),
-    "hot_days_ge_30c": (0.75, "mean"), "frost_days_lt_0c": (0.75, "median"),
-    "rainy_days_ge_1mm": (0.75, "median"),
+    "temp_mean_c": (0.75, 0.0, 0.30, "clim"),        # seasons and months
+    "temp_mean_c/FY": (0.5, 0.0, 0.15, "climmed"),   # full year: persistence diluted
+    "temp_mean_max_c": (0.75, 0.0, 0.15, "clim"),
+    "temp_mean_min_c": (0.75, 0.0, 0.30, "clim"),
+    "precip_sum_mm": (0.0, 0.25, 0.0, "clim"),
+    "hot_days_ge_30c": (0.75, 0.0, 0.0, "climmed"),
+    "temp_max_c": (0.5, 0.25, 0.0, "climmed"),
+    "temp_min_c": (0.5, 0.0, 0.0, "climmed"),
+    "precip_max_day_mm": (0.5, 0.0, 0.0, "climmed"),
+    "wind_max_kmh": (0.5, 0.0, 0.0, "climmed"),
+    "frost_days_lt_0c": (0.5, 0.0, 0.0, "climmed"),
+    "rainy_days_ge_1mm": (0.5, 0.0, 0.0, "climmed"),
 }
-# Point-duel priority per variable (how often rivals target it x hindcast edge).
+# Point priority per variable: rival point coverage x hindcast net per duel.
 POINT_PRIO = {
-    "temp_mean_c": 1.0, "precip_sum_mm": 0.9, "temp_mean_max_c": 0.75,
-    "temp_mean_min_c": 0.65, "hot_days_ge_30c": 0.6, "frost_days_lt_0c": 0.55,
-    "temp_max_c": 0.5, "rainy_days_ge_1mm": 0.45, "precip_max_day_mm": 0.45,
-    "temp_min_c": 0.4, "wind_max_kmh": 0.2,
+    "temp_mean_c": 1.0, "temp_mean_min_c": 0.9, "precip_sum_mm": 0.8,
+    "temp_mean_max_c": 0.7, "hot_days_ge_30c": 0.6, "temp_max_c": 0.1,
+    "frost_days_lt_0c": 0.1, "rainy_days_ge_1mm": 0.1, "precip_max_day_mm": 0.1,
+    "temp_min_c": 0.05, "wind_max_kmh": 0.05,
 }
-POINTS_PER_LOC = 6
+# Point priority per window: where rival point forecasts actually sit.
+POINT_WIN = {"FY": 3.0, "JJA": 2.5, "JF": 2.0, "JUL": 1.6, "MAM": 0.6, "SON": 0.6,
+             "Q1": 0.3, "Q4": 0.3, "JAN": 0.3}
+# Variables whose points only go on full-year windows (rivals duel there).
+POINT_FY_ONLY = {"temp_mean_min_c", "temp_mean_max_c", "precip_sum_mm", "hot_days_ge_30c",
+                 "temp_max_c", "temp_min_c", "precip_max_day_mm", "wind_max_kmh",
+                 "frost_days_lt_0c", "rainy_days_ge_1mm"}
+POINTS_PER_LOC = 8
 GAP_HINT = {"temp_mean_c": 0.25, "temp_mean_max_c": 0.25, "temp_mean_min_c": 0.25,
             "temp_max_c": 0.5, "temp_min_c": 0.5, "precip_sum_mm": 20.0,
             "precip_max_day_mm": 3.0, "wind_max_kmh": 2.0, "hot_days_ge_30c": 2.0,
@@ -387,7 +403,7 @@ def distribution(var, ser, target_year):
     fam = VARS[var][1]
     yr = yearly(var, ser)
     years = sorted(yr)
-    if len(years) < 8:
+    if len(years) < 5:
         return None
     n = len(years)
     n_target = max(n_exp for _, n_exp in yr.values())
@@ -454,22 +470,34 @@ def distribution(var, ser, target_year):
 
 
 # --------------------------------------------------------------------- claims
-def point_value(var, dist, years, vals, target_year, n_target):
+def point_value(var, tag, dist, years, vals, target_year, n_target, anom):
     n = len(vals)
     mt = sum(years) / n
-    my = sum(vals) / n
+    clim = sum(vals) / n
     sxx = sum((t - mt) ** 2 for t in years)
-    b = sum((t - mt) * (v - my) for t, v in zip(years, vals)) / sxx if sxx else 0.0
-    anchor = 0.5 * (my + my + b * (target_year - mt))
-    w, base = POINT[var]
-    centre = dist.q(0.5) if base == "median" else sum(dist.qs) / len(dist.qs)
-    v = w * centre + (1 - w) * anchor
+    slope = sum((t - mt) * (v - clim) for t, v in zip(years, vals)) / sxx if sxx else 0.0
+    ols = clim + slope * (target_year - mt)
+    a, b, c, base = POINT.get(f"{var}/{tag}", POINT[var])
+    mean = sum(dist.qs) / len(dist.qs)
+    v = (median(vals) if base == "climmed" else clim) + a * (mean - clim) + b * (ols - clim)
+    if var.startswith("temp_mean"):
+        v += c * anom
     if VARS[var][1] in ("count", "total", "dailymax"):
         v = max(0.0, v)
     if VARS[var][1] == "count":
         v = min(float(n_target), v)
-    return round(v, POINT_DECIMALS.get(var, 1 if VARS[var][1] == "count" else 2)), centre, anchor
+    why = (f"{base} {median(vals) if base == 'climmed' else clim:.2f} + {a:.2f} x (model mean "
+           f"{mean:.2f} - clim) + {b:.2f} x (OLS {ols:.2f} - clim)"
+           + (f" + {c:.2f} x Sep-Dec anomaly {anom:+.2f}" if var.startswith("temp_mean") else ""))
+    return round(v, POINT_DECIMALS.get(var, 1 if VARS[var][1] == "count" else 2)), why
 
+
+def sep_dec_anomaly(days, hist_years, year_x):
+    ser = window_series(days, "09-01", "12-31", hist_years)
+    yr = yearly("temp_mean_c", ser)
+    sv = {y: stat("temp_mean_c", yr[y][0]) for y in yr}
+    prev = [sv[y] for y in sv if y < year_x]
+    return sv[year_x] - sum(prev) / len(prev) if year_x in sv and len(prev) >= 3 else 0.0
 
 
 def fmt(v, var):
@@ -503,6 +531,7 @@ def build_claims(year_x, data_dir):
     for lid in sorted(rows):
         days = {d: v for d, v in rows[lid].items() if d <= f"{year_x}-12-31"}
         lat, lon = meta[lid]
+        anom = sep_dec_anomaly(days, hist_years, year_x)
         for tag, s_md, e_md, wprio in WINDOWS:
             if e_md == "02-28" and is_leap(target):
                 e_md = "02-29"
@@ -533,18 +562,16 @@ def build_claims(year_x, data_dir):
                     yrs = sorted(yr)
                     vals = [stat(var, yr[y][0]) for y in yrs]
                     clim = median(vals)
-                    if var in POINT:
+                    if var in POINT and not (var in POINT_FY_ONLY and tag != "FY"):
                         n_target = max(n for _, n in yr.values())
-                        pv, centre, anchor = point_value(var, dist, yrs, vals, target, n_target)
-                        points.append((wprio * POINT_PRIO[var], {
+                        pv, pwhy = point_value(var, tag, dist, yrs, vals, target, n_target, anom)
+                        points.append((POINT_WIN[tag] * POINT_PRIO[var], {
                             "target": {"location_id": lid, "lat": lat, "lon": lon,
                                        "window_start": ws, "window_end": we, "variable": var},
                             "assertion": {"kind": "point", "value": pv},
                             "confidence": round(dist.cdf(pv + 0.5 * GAP_HINT[var])
                                                 - dist.cdf(pv - 0.5 * GAP_HINT[var]), 3),
-                            "rationale": f"EVT/tail-risk point: {POINT[var][0]:.2f} x "
-                                         f"{POINT[var][1]} {centre:.2f} of {dist.why} + rest x "
-                                         f"clim/OLS anchor {anchor:.2f}; window {tag}.",
+                            "rationale": f"point = {pwhy}; model: {dist.why}; window {tag}.",
                         }))
                     assertion, prob = numeric_claim(var, dist, clim)
                     if prob > CFG["P_SIDE"] + 0.2 or assertion["value"] < 0:
