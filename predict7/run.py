@@ -79,8 +79,10 @@ POINT = {
 }
 # Point priority per variable: rival point coverage x hindcast net per duel.
 POINT_PRIO = {
-    "temp_mean_c": 1.0, "temp_mean_min_c": 0.9, "precip_sum_mm": 0.8,
-    "temp_mean_max_c": 0.7, "hot_days_ge_30c": 0.6, "temp_max_c": 0.1,
+    # Round 5: precip_sum_mm and hot_days_ge_30c points netted -19 and -43 against
+    # the round-4 field over X=1985..2023 (no edge), so they are no longer emitted.
+    "temp_mean_c": 1.0, "temp_mean_min_c": 0.9, "precip_sum_mm": 0.0,
+    "temp_mean_max_c": 0.7, "hot_days_ge_30c": 0.0, "temp_max_c": 0.1,
     "frost_days_lt_0c": 0.1, "rainy_days_ge_1mm": 0.1, "precip_max_day_mm": 0.1,
     "temp_min_c": 0.05, "wind_max_kmh": 0.05,
 }
@@ -92,6 +94,20 @@ POINT_FY_ONLY = {"temp_mean_min_c", "temp_mean_max_c", "precip_sum_mm", "hot_day
                  "temp_max_c", "temp_min_c", "precip_max_day_mm", "wind_max_kmh",
                  "frost_days_lt_0c", "rainy_days_ge_1mm"}
 POINTS_PER_LOC = 8
+# Round 5: temperature-mean points are regularised toward a trend-corrected
+# climatology, tc = clim16 + slope * (X+1 - mid-year of the 16) + c * anom, where
+# slope is OLS over 1950-1979 (bundled pre1980_monthly.csv) plus the 16 data-dir
+# years, shrunk toward TEMP_TREND_PRIOR by span^3 / (span^3 + K^3).
+# point = w * (round-4 rule) + (1 - w) * tc.  One shared (w, K, c) for all three
+# variables (fewer knobs): it won both 1985-2003 and 2004-2023 against the round-4
+# field on every temperature target; per-variable optima were not much better.
+TC = {
+    "temp_mean_c": (0.5, 60.0, 0.15),
+    "temp_mean_max_c": (0.5, 60.0, 0.15),
+    "temp_mean_min_c": (0.5, 60.0, 0.15),
+}
+HERE = os.path.dirname(os.path.abspath(__file__))
+PRE1980 = os.path.join(HERE, "pre1980_monthly.csv")
 GAP_HINT = {"temp_mean_c": 0.25, "temp_mean_max_c": 0.25, "temp_mean_min_c": 0.25,
             "temp_max_c": 0.5, "temp_min_c": 0.5, "precip_sum_mm": 20.0,
             "precip_max_day_mm": 3.0, "wind_max_kmh": 2.0, "hot_days_ge_30c": 2.0,
@@ -492,6 +508,55 @@ def point_value(var, tag, dist, years, vals, target_year, n_target, anom):
     return round(v, POINT_DECIMALS.get(var, 1 if VARS[var][1] == "count" else 2)), why
 
 
+def load_pre1980():
+    """{location_id: {(year, month): (n, sum_tmean, sum_tmax, sum_tmin, sum_precip, hot)}}."""
+    out = defaultdict(dict)
+    if not os.path.exists(PRE1980):
+        return out
+    with open(PRE1980, newline="") as f:
+        for r in csv.DictReader(f):
+            y = int(r["year"])
+            if y > 1979:
+                continue
+            out[r["location_id"]][(y, int(r["month"]))] = (
+                int(r["n"]), float(r["sum_tmean"]), float(r["sum_tmax"]), float(r["sum_tmin"]),
+                float(r["sum_precip"]), int(r["hot_days"]))
+    return out
+
+
+def pre1980_series(mon, s_md, e_md, var):
+    """Yearly window statistic for complete pre-1980 years (month-aligned windows only)."""
+    col = {"temp_mean_c": 1, "temp_mean_max_c": 2, "temp_mean_min_c": 3}.get(var)
+    if col is None or s_md[3:] != "01":
+        return {}
+    m0, m1 = int(s_md[:2]), int(e_md[:2])
+    out = {}
+    for y in sorted({k[0] for k in mon}):
+        rows = [mon.get((y, m)) for m in range(m0, m1 + 1)]
+        full = [r is not None and r[0] == (29 if (m == 2 and is_leap(y)) else
+                                           [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1])
+                for r, m in zip(rows, range(m0, m1 + 1))]
+        if all(full):
+            out[y] = sum(r[col] for r in rows) / sum(r[0] for r in rows)
+    return out
+
+
+def tc_point(var, years, vals, pre, target_year, anom):
+    """Trend-corrected 16-year climatology with a long-record slope (see TC)."""
+    _, K, c = TC[var]
+    ly = sorted(pre) + list(years)
+    lv = [pre[y] for y in sorted(pre)] + list(vals)
+    n = len(ly)
+    mt, mv = sum(ly) / n, sum(lv) / n
+    sxx = sum((t - mt) ** 2 for t in ly)
+    slope = sum((t - mt) * (v - mv) for t, v in zip(ly, lv)) / sxx if sxx else 0.0
+    span = ly[-1] - ly[0]
+    w = span ** 3 / (span ** 3 + K ** 3)
+    s = w * slope + (1 - w) * TEMP_TREND_PRIOR
+    clim = sum(vals) / len(vals)
+    return clim + s * (target_year - sum(years) / len(years)) + c * anom, s
+
+
 def sep_dec_anomaly(days, hist_years, year_x):
     ser = window_series(days, "09-01", "12-31", hist_years)
     yr = yearly("temp_mean_c", ser)
@@ -528,6 +593,7 @@ def build_claims(year_x, data_dir):
     target = year_x + 1
     hist_years = list(range(max(1980, year_x - 15), year_x + 1))
     cands, points = [], []
+    pre_all = load_pre1980()
     for lid in sorted(rows):
         days = {d: v for d, v in rows[lid].items() if d <= f"{year_x}-12-31"}
         lat, lon = meta[lid]
@@ -562,9 +628,18 @@ def build_claims(year_x, data_dir):
                     yrs = sorted(yr)
                     vals = [stat(var, yr[y][0]) for y in yrs]
                     clim = median(vals)
-                    if var in POINT and not (var in POINT_FY_ONLY and tag != "FY"):
+                    if (var in POINT and POINT_PRIO[var] > 0
+                            and not (var in POINT_FY_ONLY and tag != "FY")):
                         n_target = max(n for _, n in yr.values())
                         pv, pwhy = point_value(var, tag, dist, yrs, vals, target, n_target, anom)
+                        if var in TC:
+                            pre = pre1980_series(pre_all.get(lid, {}), s_md, e_md, var)
+                            tcv, slope = tc_point(var, yrs, vals, pre, target, anom)
+                            w = TC[var][0]
+                            pv = round(w * pv + (1 - w) * tcv, 2)
+                            pwhy = (f"{w:.2f} x [{pwhy}] + {1 - w:.2f} x trend-corrected clim "
+                                    f"{tcv:.2f} (slope {slope:+.3f}/yr over {len(pre)} pre-1980 + "
+                                    f"{len(yrs)} recent yrs)")
                         points.append((POINT_WIN[tag] * POINT_PRIO[var], {
                             "target": {"location_id": lid, "lat": lat, "lon": lon,
                                        "window_start": ws, "window_end": we, "variable": var},

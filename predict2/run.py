@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import core  # noqa: E402
 
 MAX_CLAIMS = 150
+PRE1980 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "daily_pre1980.csv.gz")
 MAX_PER_LOC = 12
 POINTS_FIRST = 6  # point claims reserved per location before the shared ranking (>= 60 overall)
 MIN_GAP = {"temp_mean_c": 0.25, "temp_mean_max_c": 0.25, "temp_mean_min_c": 0.25, "temp_max_c": 0.5,
@@ -42,7 +43,8 @@ POINTS = [("year", "temp_mean_c", 1.0), ("year", "precip_sum_mm", 1.0), ("year",
 # Point value = clim16 + LAMBDA * (ensemble median - clim16). Rivals shrink toward the trailing
 # 16-year mean too; in point duels against them these weights beat both the raw median and clim16.
 LAMBDA = {"precip_sum_mm": 0.5, "hot_days_ge_30c": 1.0}
-LAMBDA_TEMP = 0.25
+LAMBDA_TEMP = float(os.environ.get("P2_LT", "0.25"))
+POINT_BASE = os.environ.get("P2_BASE", "focal")
 EPS = 0.01  # threshold margin so "le m" / "gt m" stay disjoint from rivals' gt/le at m
 TEMP3 = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c")
 # relative value of a claim type: how likely it is to be contested and won
@@ -68,7 +70,25 @@ def load(data_dir, year_x):
             srcs.append(core.load_csv(p, year_x))
     if not srcs:
         raise SystemExit("no daily_*.csv in %s" % data_dir)
-    return core.merge(*srcs)
+    locs = core.merge(*srcs)
+    if os.path.exists(PRE1980) and os.environ.get("P2_PRE1980", "1") == "1":
+        # bundled ERA5 daily archive, 1964..1979 only: before every scored X, so leak-free
+        pre = core.load_csv(PRE1980, 1979)
+        for lid, loc in locs.items():
+            for y, rows in pre.get(lid, {}).get("days", {}).items():
+                loc["days"].setdefault(y, rows)
+    return locs
+
+
+def clim16(loc, X, w, var):
+    """Mean of a window stat over X-15..X (uses the bundled pre-1980 years when X < 1995)."""
+    md = core.window_md(*w)
+    v = []
+    for y in range(X - 15, X + 1):
+        st = core.window_stats(loc["days"][y], *md, 0.0) if y in loc["days"] else None
+        if st and st.get(var) is not None:
+            v.append(st[var])
+    return sum(v) / len(v) if len(v) >= 5 else None
 
 
 def windows(Y):
@@ -178,8 +198,9 @@ def main():
                 continue  # near-zero count: no rival can be 2 days away on the right side
             fm = focal_means(loc, X, (wname,) + w, var)
             med = core.wquantile(pairs, 0.5)
-            if fm:
-                med = fm[0] + LAMBDA.get(var, LAMBDA_TEMP) * (med - fm[0])
+            base_v = clim16(loc, X, w, var) if POINT_BASE == "clim16" else (fm[0] if fm else None)
+            if base_v is not None:
+                med = base_v + LAMBDA.get(var, LAMBDA_TEMP) * (med - base_v)
             hist = seq_history(loc, X, w, var)
             if hist:
                 seq_req.append((len(cands), hist, var, wname, loc["lat"]))

@@ -96,8 +96,14 @@ POINT_PLAN = [
 # by walk-forward error (point_damping); at least half the secular signal is always kept.
 # Round 4 backtest vs the master rival field, X = 1985..2023: fixed full trend +25 (early -22),
 # lambda in {0..1} +28 (late -55), lambda in {0.5, 0.75, 1} +135 (early +86, late +49).
-DAMPINGS = (0.5, 0.75, 1.0)
+# Round 5 (round-4 rival field): {0.5..1} +266, adding 1.25 +330, adding 1.25 and 1.5 +373
+# (X <= 1995 +6, 1996+ +367); a 0.25 floor (+219) and carried-over persistence (+402 but
+# X <= 1995 -16) did not hold in both eras. lambda > 1 is only chosen when the shrunk trend has
+# been under-forecasting the last WF_YEARS years.
+DAMPINGS = (0.5, 0.75, 1.0, 1.25, 1.5)
 DEFAULT_DAMPING = 0.5
+PERSISTENCE = (0.0,)     # share of year X's departure from trend carried into X+1
+POINT_ONLY_VARS = ()     # variables claimed only as points
 WF_YEARS = 10
 POINT_SLOTS = 120   # the remaining 30 slots go to the best threshold/boolean claims
 
@@ -226,7 +232,8 @@ def point_damping(items, enso, x):
     """Per (variable, window kind), the share lambda of the trend + ENSO departure from the 15-year
     mean that minimized pooled absolute error in a walk-forward backtest over target years
     x-WF_YEARS+1 .. x, each forecast only from years before it. Uses data <= x only."""
-    err = defaultdict(lambda: [0.0] * len(DAMPINGS))
+    grid = [(lm, kp) for lm in DAMPINGS for kp in PERSISTENCE]
+    err = defaultdict(lambda: [0.0] * len(grid))
     for it in items:
         yrs, ys, var = it["yrs"], it["ys"], it["var"]
         for j, t in enumerate(yrs):
@@ -241,12 +248,14 @@ def point_damping(items, enso, x):
             if var in ENSO_VARS:
                 pred += enso_adjust(sy, sv, fit, {k: v for k, v in enso.items() if k < t}, t - 1)[0]
             acc = err[(var, it["wk"])]
-            for i, lm in enumerate(DAMPINGS):
-                v = base + lm * (pred - base)
+            last_resid = sv[-1] - fit(sy[-1]) if sy[-1] == t - 1 else 0.0
+            for i, (lm, kp) in enumerate(grid):
+                v = base + lm * (pred - base) + kp * last_resid
                 if var not in TEMP_VARS:
                     v = max(v, 0.0)
                 acc[i] += abs(v - ys[j])
-    return {k: DAMPINGS[min(range(len(DAMPINGS)), key=lambda i: (v[i], -DAMPINGS[i]))]
+    # ties: prefer more trend, then less persistence
+    return {k: grid[min(range(len(grid)), key=lambda i: (v[i], -grid[i][0], grid[i][1]))]
             for k, v in err.items() if any(v)}
 
 
@@ -260,7 +269,7 @@ def build_pool(locs, x, enso=None):
         days = loc["days"]
         for wname, s, e in WINDOWS:
             span = {yr: window_days(yr, s, e) for yr in hist_years}
-            for var in TEMP_VARS + COUNT_VARS:
+            for var in TEMP_VARS + COUNT_VARS + POINT_ONLY_VARS:
                 series = [(yr, stat(days, span[yr], var)) for yr in hist_years]
                 series = [(t, v) for t, v in series if v is not None]
                 if len(series) < MIN_YEARS or series[-1][0] != x:
@@ -270,6 +279,8 @@ def build_pool(locs, x, enso=None):
                 base = sum(ys) / len(ys)
                 if var in TEMP_VARS:
                     prior, pw = PRIOR_SLOPE_C_PER_YR * (1.3 if var == "temp_mean_min_c" else 1.0), None
+                elif var in POINT_ONLY_VARS:
+                    prior, pw = 0.0, PRIOR_WEIGHT_YEARS
                 else:
                     if base < 2.0 or base > 0.95 * len(span[x]):
                         continue
@@ -290,13 +301,17 @@ def build_pool(locs, x, enso=None):
         if var not in TEMP_VARS:
             pred = max(pred, 0.0)
         # Point forecast: 15y mean plus the walk-forward-chosen share of the trend + ENSO departure.
-        lm = lam.get((var, wk), DEFAULT_DAMPING)
-        pv = base + lm * (pred - base)
+        lm, kp = lam.get((var, wk), (DEFAULT_DAMPING, 0.0))
+        pv = base + lm * (pred - base) + kp * (ys[-1] - it["fit"](yrs[-1]))
+        if var not in TEMP_VARS:
+            pv = max(pv, 0.0)
         out.append(_cand(lid, loc, wname, s, e, var,
                          {"kind": "point", "value": round(pv, 2 if var in TEMP_VARS else 1)}, 1.0,
                          f"{var}|point|{wk}",
                          f"point forecast: 15y mean {base:.2f}, trend {b * 10:+.2f}/decade,"
-                         f" ENSO lag {shift:+.2f}, damping {lm:.2f} (walk-forward) -> {pv:.2f}"))
+                         f" ENSO lag {shift:+.2f}, damping {lm:.2f}, persistence {kp:.2f} (walk-forward) -> {pv:.2f}"))
+        if var in POINT_ONLY_VARS:
+            continue
         if var in TEMP_VARS:
             info = (f"15y mean {base:.2f}C, trend {b * 10:+.2f}C/decade, ENSO lag {shift:+.2f}C -> {pred:.2f}C (sd {sd:.2f})")
             # Thresholds at points where cold-leaning rivals put their upper bound.

@@ -22,9 +22,9 @@ years <= X; the one with the lowest CV MSE is the forecast, and its CV residuals
 (empirical, per window group) give the predictive distribution.
 
 Claims (one per target, <= 150 total, <= 12 per location_id):
-  * point forecasts (up to 6 per city, >= 60 overall): ridge median blended with the
-    series' trend shrunk toward a warming prior, on annual precip/temperatures/hot days
-    and JJA precip/temperature.
+  * point forecasts (up to 6 per city, >= 60 overall): history mean moved toward the
+    ridge median (more so with longer history) plus a damped trend term, on annual
+    precip/temperatures/hot days and JJA temperature (see PT_PARAMS).
   * warmer/wetter_than_year_x booleans where P(side) >= BOOL_MIN, confidence
     capped by the CV hit rate of such calls.
   * thresholds anchored at the trailing-history baseline, only on sides that were
@@ -116,21 +116,25 @@ if os.environ.get("P8_TMIN"):  # analysis hook: every side at this probability
 MIN_PAST = 5              # years of past data needed to standardize a target year
 MAX_CLAIMS = 150
 MAX_PER_LOC = 12          # CONTRACTS.md round 3: at most 12 claims per location_id
-# Point value = (1 - PT_BLEND) * ridge median + PT_BLEND * (climatology + slope * years ahead),
-# where slope is the series' own OLS trend shrunk toward PT_PRIOR (temperatures; 0 otherwise)
-# with the weight of PT_K prior years. Chosen by duels against all rivals' point claims (their
-# round-3 code run locally, scored like verify) over X=1988..2003; plateau around B=.25-.6, k>=30.
-PT_BLEND = float(os.environ.get("P8_PT_BLEND", "0.4"))
-PT_K = float(os.environ.get("P8_PT_K", "30"))
+# Point value = clim + A_eff * (ridge median - clim) + C * slope * (years ahead), where clim is
+# the history mean, slope the series' OLS trend shrunk toward PT_PRIOR (temperatures; 0 otherwise)
+# with the weight of PT_K prior years, and A_eff = A * clip((n - NLO) / (16 - NLO), 0, 1) for n
+# history years: the ridge is trusted only once it has a long history. Tuned by point duels
+# against all rivals' round-4 master code (odd X = 1987..2023 for tuning, even X as a check):
+#   temperatures A=.8 C=1 NLO=12: odd +117 / even +48 vs round-4 setting -31 / +57;
+#   precipitation keeps the round-4 setting A=.6 C=.4 (odd +105 / even +95, best on both halves);
+#   day counts A=1 C=.3 NLO=12 (odd +49 / even -2; round-4 setting +3 / -6).
+PT_PARAMS = {"temp": (0.8, 1.0, 12), "precip": (0.6, 0.4, 0), "count": (1.0, 0.3, 12)}
+PT_PRIOR = 0.0
+PT_K = 30.0
 POINTS_PER_LOC = 6        # point claims per city (>= 60 point claims required overall)
 # point-forecast targets and their priority (how much we trust the model there x popularity)
-# priority = net duel score per target vs rivals' points, summed over X=1988..2003 and 2004..2018
-# (precip ANN +149, temp_mean_min ANN +42, hot days +30, JJA temp +20, max-temp ANN +19,
-#  JJA precip +14, temp_mean_c ANN +13; JF/MAM/M07 temps and temp_max_c were net negative)
+# priority = net duel score per target vs rivals' round-4 points (odd X = 1987..2011):
+# precip ANN +58, mean-min ANN +43, mean ANN +30, JJA mean +29, hot days +4, mean-max -2
+# (kept: +6 in the real round 4); JF temps (-26) and JJA precip (-3) are not used.
 POINT_TARGETS = {("precip_sum_mm", "ANN"): 1.0, ("temp_mean_min_c", "ANN"): 0.9,
-                 ("hot_days_ge_30c", "ANN"): 0.85, ("temp_mean_c", "JJA"): 0.8,
-                 ("temp_mean_max_c", "ANN"): 0.75, ("precip_sum_mm", "JJA"): 0.7,
-                 ("temp_mean_c", "ANN"): 0.65}
+                 ("temp_mean_c", "ANN"): 0.85, ("temp_mean_c", "JJA"): 0.8,
+                 ("hot_days_ge_30c", "ANN"): 0.7, ("temp_mean_max_c", "ANN"): 0.65}
 MODELS = ["clim", "trend", "full", "tele", "tele2"]
 LAMBDA = {"trend": 0.05, "full": 0.2, "tele": 0.4, "tele2": 0.8}
 LAMBDA = {k: v * float(os.environ.get("P8_LSCALE", "1")) for k, v in LAMBDA.items()}
@@ -572,21 +576,22 @@ def make_claims(days, meta, years, X, indices, log):
                 continue
             if var in COUNTS and sum(1 for y in ys if s[y] == 0) > 0.3 * len(ys):
                 continue
-            # too little history for the CV-fitted ridge (X <= ~1990): trend line alone
+            # too little history for the CV-fitted ridge (X <= ~1990): climatology + trend term
             med = fc.value_quantile(f, 0.5) if f else None
             skill = f[4]["skill"] if f else 0.0
             if len(ys) >= 8:
                 m = mean([s[y] for y in ys])
                 ym = mean(ys)
                 sl = sum((y - ym) * (s[y] - m) for y in ys) / sum((y - ym) ** 2 for y in ys)
-                prior = WARMING_C_PER_YR if var in TEMPS else 0.0
+                prior = PT_PRIOR if var in TEMPS else 0.0
                 sl = (sl * len(ys) + prior * PT_K) / (len(ys) + PT_K)
-                trend = m + sl * (T - ym)
-                med = trend if med is None else (1 - PT_BLEND) * med + PT_BLEND * trend
+                A, C, nlo = PT_PARAMS["temp" if var in TEMPS else ("count" if var in COUNTS else "precip")]
+                A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
+                med = m + (A * (med - m) if med is not None else 0.0) + C * sl * (T - ym)
             if var in NONNEG:
                 med = max(0.0, med)
-            how = ("ridge-ensemble median blended with shrunk trend, CV skill %+.0f%% vs climatology"
-                   % (100 * skill)) if f else "trend line shrunk toward the warming prior (history too short for CV)"
+            how = ("history mean moved toward the ridge median (CV skill %+.0f%% vs climatology) plus damped trend"
+                   % (100 * skill)) if f else "history mean plus damped trend (history too short for CV)"
             point_cands.append((ww, loc, {
                 "target": target(loc, win, var),
                 "assertion": {"kind": "point", "value": round(med, 2)},

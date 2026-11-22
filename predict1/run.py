@@ -55,7 +55,8 @@ POINT_TARGETS = [("year", "temp_mean_max_c"), ("year", "temp_mean_c"), ("year", 
 # round-3 point claims over 14 held-out years: temperatures do best at the long-history
 # median; precipitation totals at the recent-window blend (ERA5 rain drifts over decades).
 POINT_SHRINK = {"temp_mean_c": 0.0, "temp_mean_max_c": 0.0, "temp_max_c": 0.0,
-                "precip_sum_mm": 1.0, "precip_max_day_mm": 0.5}
+                "precip_sum_mm": 1.0, "precip_max_day_mm": 0.5,
+                ("temp_mean_c", "jja"): 0.25}  # summer means: pure median lost (-8/474), 0.25 won in both eras
 MIN_P = 0.7  # offensive bets only with a real edge: backtests vs. rivals' claims lose below ~0.7
 DEF_W = 0.5  # weight of "honeypot" value: a likely-true claim on a target rivals often claim
 WIN_PRIOR = {"year": 0.3, "jja": 0.2, "mam": 0.1, "son": 0.1, "jf": 0.05}
@@ -312,20 +313,26 @@ class Empirical(Predictive):
 
 
 # ----------------------------------------------------------------- forecaster
-def load_enso(data_dir, X):
-    """{year: Oct-Dec mean Nino3.4 anomaly} for years <= X, from indices_monthly.json."""
+# Oct-Dec indices used by the corrector. Adding PDO/NAO/AO lowered backtested point-duel
+# wins (+269 -> +212 over 18 years): too many per-city coefficients for ~16 years of data.
+INDICES = ("nino34_anom",)
+
+
+def load_indices(data_dir, X):
+    """{year: (Oct-Dec mean of each index in INDICES)} for years <= X, from
+    indices_monthly.json; a missing index or month contributes 0 (no signal)."""
     p = os.path.join(data_dir, "indices_monthly.json")
-    out = {}
     try:
-        rows = json.load(open(p))["series"]["nino34_anom"]
+        series = json.load(open(p))["series"]
     except Exception:
-        return out
-    acc = defaultdict(list)
-    for r in rows:
-        y, m = int(r["date"][:4]), int(r["date"][5:7])
-        if y <= X and m >= 10 and r["value"] is not None:
-            acc[y].append(r["value"])
-    return {y: sum(v) / len(v) for y, v in acc.items() if len(v) == 3}
+        return {}
+    acc = defaultdict(lambda: defaultdict(list))
+    for name in INDICES:
+        for r in series.get(name, []):
+            y, m = int(r["date"][:4]), int(r["date"][5:7])
+            if y <= X and m >= 10 and r["value"] is not None:
+                acc[y][name].append(r["value"])
+    return {y: tuple(sum(d[n]) / 3 if len(d[n]) == 3 else 0.0 for n in INDICES) for y, d in acc.items()}
 
 
 def _solve(A, b):
@@ -382,12 +389,8 @@ class Corrector:
         for k, rs in rows.items():
             self.coef[k] = self._ridge([x[:2] for x, _ in rs], [e for _, e in rs], self.RIDGE)
         for k, rs in erows.items():
-            (var, wname) = k[1], None
-            # ENSO effect on what the first two features leave unexplained
-            out = []
-            for x, e in rs:
-                out.append(([x[2]], e))
-            self.ecoef[k] = self._ridge([x for x, _ in out], [e for _, e in out], self.RIDGE_ENSO)[0]
+            # per-location teleconnection effects (Oct-Dec indices of year t-1)
+            self.ecoef[k] = self._ridge([list(x[2]) for x, _ in rs], [e for _, e in rs], self.RIDGE_ENSO)
 
     def _res(self, ser, t, var):
         if sum(1 for y in ser if y < t) < 8:
@@ -402,7 +405,7 @@ class Corrector:
         a, n = self.q4.get((loc, t - 1)), self.net.get(t - 1)
         if a is None or n is None:
             return None
-        return (a, n, self.enso.get(t - 1, 0.0))
+        return (a, n, self.enso.get(t - 1, (0.0,) * len(INDICES)))
 
     @staticmethod
     def _ridge(X, y, lam):
@@ -418,7 +421,8 @@ class Corrector:
         if x is None:
             return 0.0
         c = self.coef.get((var, wname), [0.0, 0.0])
-        return c[0] * x[0] + c[1] * x[1] + self.ecoef.get((loc, var, wkind(wname)), 0.0) * x[2]
+        e = self.ecoef.get((loc, var, wkind(wname)), ())
+        return c[0] * x[0] + c[1] * x[1] + sum(ci * xi for ci, xi in zip(e, x[2]))
 
 
 def month_window(y, m1, m2):
@@ -459,7 +463,7 @@ class Forecaster:
                     self.series[(loc, wname, v)] = sr
                 self.monthly[(loc, wname)] = monthly
         self.model, self.resid = fit_ensemble(self.series, X)
-        self.corr = Corrector(self, load_enso(data_dir, X))
+        self.corr = Corrector(self, load_indices(data_dir, X))
         self.tinker_pred, self.blend = {}, 0.0
         if use_tinker and os.environ.get("TINKER_API_KEY"):
             try:
@@ -509,7 +513,7 @@ class Forecaster:
         ys = [y for y in sorted(ser) if self.X - 15 <= y <= self.X]
         vs = [ser[y] for y in ys]
         half = 0.5 * sum(vs) / len(vs) + 0.5 * ols_predict(ys, vs, self.X + 1)
-        a = POINT_SHRINK.get(var, 0.25)
+        a = POINT_SHRINK.get((var, wname), POINT_SHRINK.get(var, 0.25))
         v = (1 - a) * d.q(0.5) + a * half
         return max(0.0, v) if (var in COUNT_VARS or var.startswith("precip")) else v
 

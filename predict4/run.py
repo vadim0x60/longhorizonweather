@@ -22,14 +22,15 @@ probabilities were overconfident (selection on noise), so they are shrunk halfwa
 A Nino3.4 regression term made forecasts worse at <= 16 years of history and is not used.
 Stated confidence is capped at 0.90.
 
-Point forecasts (CONTRACTS.md point duels, scored by absolute error): the full model mean
-over-reacts to noisy trends and anomalies, so the point is the trailing 16-year climatology
-moved part of the way toward it, clim16 + lambda * (model - clim16). lambda was tuned in a
-Round 4 arena: all ten current predictors run offline for X = 1988..1994 and 2003..2012 and
-scored by verify against the real X+1. Over those 16 years predict4 netted +210 at lambda=0.5
-for temperatures, +257 at 0.25 and +312 at 0 (best in both eras), so temperature points are the
-plain 16-year mean: rivals that extrapolate trends lose point duels to it. Precipitation keeps
-lambda = 0.25 (better than 0 or 0.5); hot days use the trailing median.
+Point forecasts (CONTRACTS.md point duels, scored by absolute error), for the trailing 16 years:
+  point = mean + b * (X+1 - mean year) + a * (year X's residual from that trend line),
+  b = w * OLS slope + (1 - w) * prior, w = n / (n + k).
+Temperatures use prior 0.03 C/yr and k = 40, a = 0.2 for annual windows and 0.1 for JJA, plus
+0.2 x year X's Sep-Dec residual (late-year anomalies persist into the next year).
+Precipitation uses prior 0, k = 40, a = 0.2. These come from a Round 5 arena: the ten current
+predictors run offline for X = 1985..1995 and 2003..2023 with a full 16-year history, and each
+candidate formula scored by verify's duel rule against their actual point values and the real
+X+1. Plain 16-year climatology (used in Round 4) lost badly in the fast-warming 2003..2023 era.
 
 Each location gets up to POINTS_PER_LOCATION point claims on the most commonly shared targets,
 then calibrated threshold/boolean claims fill up to 12 per location and 150 in total.
@@ -102,13 +103,18 @@ BOOLEAN_JOBS = [
     ("warmer_than_year_x", "temp_mean_c", list(WINDOWS)),
     ("wetter_than_year_x", "precip_sum_mm", list(WINDOWS)),
 ]
+# Sep-Dec of year X, used only as a predictor for temperature points (never claimed).
+WINDOWS["sond"] = ((9, 1), (12, 31))
 # Point targets in priority order (the targets rivals are most likely to share).
 # Jan-Feb and July temperature points lost duels in the arena (-32, -7), so they are not used.
 POINT_JOBS = [("temp_mean_c", "year"), ("temp_mean_c", "jja"), ("precip_sum_mm", "year"),
               ("temp_mean_max_c", "year"), ("temp_mean_min_c", "year"), ("precip_sum_mm", "jja"),
               ("temp_mean_c", "mam"), ("temp_mean_c", "son"), ("rainy_days_ge_1mm", "year"),
               ("frost_days_lt_0c", "year")]
-POINT_LAMBDA = {v: 0.0 for v in TEMP_VARS}   # others: 0.25
+# (prior trend per year, prior strength k in years, carry-over a of year X's residual)
+POINT_PARAMS = {"year": (0.03, 40.0, 0.2), "jja": (0.03, 40.0, 0.1)}
+SOND_CARRY = 0.2   # weight of year X's Sep-Dec residual in temperature points
+PRECIP_POINT_PARAMS = (0.0, 40.0, 0.2)
 POINT_DECIMALS = {"precip_sum_mm": 1}        # others: 2
 VAR_WEIGHT = {"temp_mean_c": 1.0, "temp_mean_max_c": 0.7, "temp_mean_min_c": 0.7,
               "hot_days_ge_30c": 0.6, "frost_days_lt_0c": 0.6,
@@ -281,15 +287,33 @@ def threshold_candidate(variable, mean, sd, lines):
     return {"kind": "threshold", "op": "gt", "value": hi}, p_gt, f"highest rival line {hi}"
 
 
-def point_forecast(series: dict, year_x: int, variable: str):
-    """Point forecast (value, model mean, sd) for X+1, or None. See the module docstring."""
+def trend_residual(series: dict, year_x: int, prior: float, k: float):
+    """(value of the shrunk trend line at X+1, residual of year X from it), last 16 years."""
+    s = {y: v for y, v in series.items() if y >= year_x - 15}
+    ys = sorted(s)
+    n = len(ys)
+    tbar, ybar = sum(ys) / n, sum(s.values()) / n
+    sxx = sum((y - tbar) ** 2 for y in ys)
+    b_ols = sum((y - tbar) * (s[y] - ybar) for y in ys) / sxx if sxx else 0.0
+    w = n / (n + k)
+    b = w * b_ols + (1 - w) * prior
+    return ybar + b * (year_x + 1 - tbar), s[year_x] - (ybar + b * (year_x - tbar))
+
+
+def point_forecast(series: dict, year_x: int, variable: str, wname: str, sond: dict | None = None):
+    """Point forecast (value, model mean, sd) for X+1, or None. See the module docstring.
+    `sond` is the same variable's Sep-Dec series, whose year-X residual is carried over."""
     f = forecast(series, year_x, variable)
     if f is None:
         return None
-    recent = [v for y, v in series.items() if y >= max(1980, year_x - 15)]
-    clim = statistics.median(recent) if variable == "hot_days_ge_30c" else statistics.mean(recent)
-    lam = 0.0 if variable == "hot_days_ge_30c" else POINT_LAMBDA.get(variable, 0.25)
-    value = clim + lam * (f[0] - clim)
+    if variable in TEMP_VARS:
+        prior, k, a = POINT_PARAMS.get(wname, POINT_PARAMS["year"])
+    else:
+        prior, k, a = PRECIP_POINT_PARAMS
+    line, resid_x = trend_residual(series, year_x, prior, k)
+    value = line + a * resid_x
+    if variable in TEMP_VARS and sond and year_x in sond and len(sond) >= MIN_YEARS:
+        value += SOND_CARRY * trend_residual(sond, year_x, prior, k)[1]
     if variable not in TEMP_VARS:
         value = max(value, 0.0)
     return round(value, POINT_DECIMALS.get(variable, 2)), f[0], f[1]
@@ -337,14 +361,16 @@ def build_claims(year_x: int, daily, coords):
             s = series(variable, wname)
             if variable in COUNT_VARS and (not s or statistics.mean(s.values()) < 3):
                 continue  # near-zero counts make uninformative duels
-            pf = point_forecast(s, year_x, variable)
+            pf = point_forecast(s, year_x, variable, wname,
+                                series(variable, "sond") if variable in TEMP_VARS else None)
             if pf is None:
                 continue
             value, mean, sd = pf
             # Probability mass within +-sd/2 of the point, as a rough confidence for readers.
             p = 2 * norm_cdf(0.5) - 1
             add(loc, wname, variable, {"kind": "point", "value": value}, p,
-                f"point = clim16 shrunk toward forecast {mean:.2f}±{sd:.2f} (backtest-tuned blend)", points)
+                f"point = 16-yr mean + trend shrunk to prior + damped year-X anomaly (arena-tuned); "
+                f"model {mean:.2f}±{sd:.2f}", points)
             n_points += 1
 
         for variable, wnames in THRESHOLD_JOBS:

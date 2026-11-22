@@ -20,10 +20,9 @@ Models each yearly target series y_t (one value per trailing year <= X) as
   variable), pooled across all locations and ridge-shrunk, on the detrended
   Sep-Dec anomaly of the preceding year.
 
-Point claims: 100 (5 per location: annual temp_mean/max/min, annual precip_sum,
-JJA temp_mean). Value = 16-y climatology + lam * (model - climatology), with
-lam = 0.05 * n_years (<= 0.8) for temperatures and 0.5 for precipitation, tuned
-in duels against the real Round 3 rivals (X=1985..2023). Then the best-ranked
+Point claims: 120 (6 per location: annual temp_mean/max/min, annual precip_sum,
+JJA and MAM temp_mean), values from point_value(), tuned in duels against the
+real Round 4 rivals (X=1985..2023). Then the best-ranked
 thresholds/booleans below, capped at 12 claims per location_id.
 
 Other claims are thresholds at the naive 15/16-year climatologies that trend and
@@ -263,8 +262,10 @@ MAX_PER_LOC = 12  # CONTRACTS.md Round 3
 # Point forecasts (Round 3 duels, closer to truth wins). Backtest X=2000..2023: on whole-year
 # windows the model median beats 15/16-y climatology, OLS trend and persistence in ~60-64%
 # of duels with gap >= min_gap; on seasons a 50/50 blend with the 10-y mean duels best.
+BASE_VARS = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "precip_sum_mm")
 POINT_SPECS = [("year", "temp_mean_c"), ("year", "temp_mean_max_c"), ("year", "temp_mean_min_c"),
-               ("year", "precip_sum_mm"), ("jja", "temp_mean_c")]
+               ("year", "precip_sum_mm"), ("jja", "temp_mean_c"), ("mam", "temp_mean_c")]
+PRECIP_RECENT_W = 0.3
 BOOL_PMIN = 0.70  # booleans near 0.6 lost more contradictions than they won in backtests
 
 
@@ -299,7 +300,7 @@ def fit_all(rows, meta, X, enso):
         lr = rows[loc]
         years = sorted(y for y in {int(d[:4]) for d in lr} if y <= X)
         for win in WINDOWS:
-            for var in ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "precip_sum_mm"):
+            for var in BASE_VARS:
                 ys, vs = yearly_series(lr, years, WINDOWS[win], var)
                 if len(vs) < MIN_YEARS or ys[-1] != X:
                     continue
@@ -328,16 +329,21 @@ def fit_all(rows, meta, X, enso):
 SOND_RIDGE = 5.0
 
 
-def point_value(ys, vs, var, f, X):
-    """Point = 16-y climatology + lam * (model - climatology). Duel backtest against the real
-    Round 3 rivals (X=1985..2023): the full model loses on short histories, so lam grows with
-    the number of trailing years n: lam = 0.05 n, 0.3 at n = 6 up to 0.8 at n = 16 (temperatures);
-    precipitation stays at 0.5, where the trend/cycle terms add noise."""
+def point_value(ys, vs, var, f, X, win):
+    """Point = 16-y climatology clim moved toward a forecast. Tuned in duels against the real
+    Round 4 rivals' point claims (X=1985..2023, verify duel rules, local truth):
+    * temperatures: clim + lam * (model - clim), lam = 0.05 * n_years capped at 0.8 for annual
+      windows (+148 / +74 / +49 for max / mean / min) and at 0.6 for seasons (JJA +32 vs +3);
+    * annual precipitation: clim + 0.3 * (mean of the last 3 years - clim), +70 vs -67 for the
+      Round 4 rule, positive in 1985-95, 1996-2009 and 2010-23 (ERA5 rainfall drifts; the
+      cycle/trend model adds noise there)."""
     r = [v for y, v in zip(ys, vs) if y >= X - 15]
     clim = sum(r) / len(r)
-    lam = 0.5 if var == "precip_sum_mm" else min(0.8, 0.05 * len(r))
-    pv = clim + lam * (f["mu"] - clim)
-    return max(pv, 0.0) if var == "precip_sum_mm" else pv  # ridge pseudo-sum of squared anomalies (degC^2)
+    if var == "precip_sum_mm":
+        recent = r[-3:]
+        return max(0.0, clim + PRECIP_RECENT_W * (sum(recent) / len(recent) - clim))
+    lam = min(0.8 if win == "year" else 0.6, 0.05 * len(r))
+    return clim + lam * (f["mu"] - clim)
 
 
 def candidates(rows, meta, X, enso):
@@ -355,7 +361,7 @@ def candidates(rows, meta, X, enso):
     F = fit_all(rows, meta, X, enso)
     for loc in sorted(rows):
         for win in WINDOWS:
-            for var in ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "precip_sum_mm"):
+            for var in BASE_VARS:
                 if (loc, win, var) not in F:
                     continue
                 ys, vs, f = F[(loc, win, var)]
@@ -369,10 +375,10 @@ def candidates(rows, meta, X, enso):
                 model = (f"trend {f['trend']:+.3f}/y, AR phi={f['phi']:.2f},{cyc} fcst {f['mu']:.2f}"
                          f"±{f['sigma']:.2f}")
                 if (win, var) in POINT_SPECS:
-                    pv = point_value(ys, vs, var, f, X)
+                    pv = point_value(ys, vs, var, f, X, win)
                     out.append((1.0, ("point", var, wclass(win)), {
                         "target": target(loc, win, var),
-                        "assertion": {"kind": "point", "value": round(pv, 1 if var == "precip_sum_mm" else 2)},
+                        "assertion": {"kind": "point", "value": round(pv, 2 if var in TEMP_VARS else 1)},
                         "confidence": 0.5, "rationale": "Point = 16-y climatology shrunk toward model; " + model + "."}))
                 if f["sigma"] <= 0 or len(vs) < 8:
                     continue  # probabilistic claims need a spread estimate from >= 8 years

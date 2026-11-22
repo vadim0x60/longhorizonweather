@@ -5,6 +5,7 @@ import datetime as dt
 import importlib.util
 import json
 import random
+import statistics
 import sys
 import tempfile
 import unittest
@@ -103,17 +104,31 @@ class Predict4Tests(unittest.TestCase):
         self.assertLessEqual(len(claims), P4.MAX_PER_LOCATION)
         acc, rej = VERIFY.filter_claims("predict4", claims, X)
         self.assertEqual(rej, [])
-        # Temperature points are the plain 16-year mean (lambda = 0), computed independently here.
-        # With a steady 0.15/yr warming that is well below year X: the point does not chase the trend.
-        by_year = {}
-        for r in rows:
-            by_year.setdefault(int(r["date"][:4]), []).append(float(r["temperature_2m_mean"]))
-        yearly = {y: sum(v) / len(v) for y, v in by_year.items() if y <= X}
-        mean16 = sum(yearly[y] for y in range(X - 15, X + 1)) / 16
+        # Annual temp_mean_c point = shrunk trend line at X+1 + 0.2 * year-X residual
+        # + 0.2 * year-X Sep-Dec residual, recomputed here with statistics.linear_regression.
+        def daily_mean(pred):
+            by = {}
+            for r in rows:
+                d = dt.date.fromisoformat(r["date"])
+                if d.year <= X and pred(d):
+                    by.setdefault(d.year, []).append(float(r["temperature_2m_mean"]))
+            return {y: sum(v) / len(v) for y, v in by.items() if y >= X - 15}
+
+        def line_and_resid(series):
+            ys = sorted(series)
+            slope, _ = statistics.linear_regression(ys, [series[y] for y in ys])
+            w = len(ys) / (len(ys) + 40)
+            b = w * slope + (1 - w) * 0.03
+            ybar, tbar = statistics.mean(series.values()), statistics.mean(ys)
+            return ybar + b * (X + 1 - tbar), series[X] - (ybar + b * (X - tbar))
+
+        line, r_year = line_and_resid(daily_mean(lambda d: True))
+        _, r_sond = line_and_resid(daily_mean(lambda d: d.month >= 9))
         annual = next(c for c in points if c["target"]["variable"] == "temp_mean_c"
                       and c["target"]["window_end"] == f"{X + 1}-12-31")
-        self.assertAlmostEqual(annual["assertion"]["value"], mean16, places=2)
-        self.assertLess(annual["assertion"]["value"], yearly[X] - 0.5)
+        self.assertAlmostEqual(annual["assertion"]["value"], line + 0.2 * r_year + 0.2 * r_sond, places=2)
+        # The shrunk trend undershoots the true 0.15/yr warming: below naive extrapolation.
+        self.assertLess(annual["assertion"]["value"], statistics.mean(daily_mean(lambda d: d.year == X).values()) + 0.15)
 
     def test_ignores_rows_after_year_x(self):
         a = self.run_p4(leak_value=99.0)
