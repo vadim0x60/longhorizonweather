@@ -26,7 +26,8 @@ Point forecasts (CONTRACTS.md point duels, scored by absolute error), for the tr
   point = mean + b * (X+1 - mean year) + a * (year X's residual from that trend line),
   b = w * OLS slope + (1 - w) * prior, w = n / (n + k).
 Temperatures use prior 0.03 C/yr and k = 40, a = 0.1 (annual: 0.2 until Round 10), plus
-0.2 x year X's Sep-Dec residual (late-year anomalies persist into the next year). Annual
+0.2 x year X's Sep-Dec residual (0.25 for temp_mean_max_c since Round 14; late-year
+anomalies persist into the next year). Annual
 temperature points also add ENSO_WEIGHT x a lagged-ENSO term (Round 12): the 16 residuals,
 ridge-regressed per location on the previous year's Oct-Dec Nino3.4, evaluated at year X's.
 Precipitation uses prior 0, k = 40, a = 0.2 (0.3 for X > 1995 since Round 13). These come from a Round 5 arena: the ten current
@@ -128,6 +129,9 @@ POINT_JOBS = [("temp_mean_c", "year"), ("temp_mean_c", "jja"), ("precip_sum_mm",
 # +43 -> +62 (1985-99 +33 -> +25, 2000-15 -27 -> -10, 2016-22 +37 -> +47); Round 9 grid agreed.
 POINT_PARAMS = {"year": (0.03, 40.0, 0.1), "jja": (0.03, 40.0, 0.1)}
 SOND_CARRY = 0.2   # weight of year X's Sep-Dec residual in temperature points
+# Round 14: temp_mean_max_c carries 0.25. X=1985..2023 net vs Round 13 / 12 / 11 rivals:
+# +56 -> +78, +67 -> +82, +89 -> +103; the gain is X >= 2008 (+26..+29), earlier years -2..-15.
+SOND_CARRY_VAR = {"temp_mean_max_c": 0.25}
 # Weight of the 1964..X mean when the history is contiguous to 1964. Round 11: 0.5 -> 0.6,
 # X=1985..1995 arena: vs Round 10 rivals +27 -> +64 (0.7: +7), vs Round 9 rivals +52 -> +69.
 LONG_MEAN_WEIGHT = 0.6
@@ -416,7 +420,7 @@ def point_forecast(series: dict, year_x: int, variable: str, wname: str, sond: d
     line, resid_x = trend_residual(series, year_x, prior, k)
     value = line + a * resid_x
     if variable in TEMP_VARS and sond and year_x in sond and len(sond) >= MIN_YEARS:
-        value += SOND_CARRY * trend_residual(sond, year_x, prior, k)[1]
+        value += SOND_CARRY_VAR.get(variable, SOND_CARRY) * trend_residual(sond, year_x, prior, k)[1]
     if variable in ENSO_VARS and wname == "year" and year_x in ENSO:
         value += ENSO_WEIGHT * enso_shift(series, year_x, prior, k)
     if long_history:

@@ -82,13 +82,19 @@ POINT_PRIO = {
     # Round 5: precip_sum_mm and hot_days_ge_30c points netted -19 and -43 against
     # the round-4 field over X=1985..2023 (no edge), so they are no longer emitted.
     "temp_mean_c": 1.0, "temp_mean_min_c": 0.9, "precip_sum_mm": 0.0,
-    "temp_mean_max_c": 0.7, "hot_days_ge_30c": 0.0, "temp_max_c": 0.1,
-    "frost_days_lt_0c": 0.1, "rainy_days_ge_1mm": 0.1, "precip_max_day_mm": 0.1,
-    "temp_min_c": 0.05, "wind_max_kmh": 0.05,
+    # Round 14: the remaining tail-variable points only ever filled spare slots and drew
+    # no duels in the round-13 arena; they are off so only tested targets are emitted.
+    "temp_mean_max_c": 0.7, "hot_days_ge_30c": 0.0, "temp_max_c": 0.0,
+    "frost_days_lt_0c": 0.0, "rainy_days_ge_1mm": 0.0, "precip_max_day_mm": 0.0,
+    "temp_min_c": 0.0, "wind_max_kmh": 0.0,
 }
 # Point priority per window: where rival point forecasts actually sit.
-POINT_WIN = {"FY": 3.0, "JJA": 2.5, "JF": 2.0, "JUL": 1.6, "MAM": 0.6, "SON": 0.6,
-             "Q1": 0.3, "Q4": 0.3, "JAN": 0.3}
+# Round 14: full verify vs the round-13 field (X = 1985..2023) by point window: temp_mean_c
+# FY +44, JJA +51, JF +14, MAM -23, SON -14 (Q1/Q4/JAN/JUL points draw no duels). MAM/SON
+# points are dropped and no filler is emitted: 120 point claims, +98 -> +135 overall.
+NONPOINT = 0  # 0: emit point claims only
+POINT_WIN = {"FY": 3.0, "JJA": 2.5, "JF": 2.0, "JUL": 1.6, "MAM": 0, "SON": 0,
+             "Q1": 0, "Q4": 0, "JAN": 0}
 # Variables whose points only go on full-year windows (rivals duel there).
 POINT_FY_ONLY = {"temp_mean_min_c", "temp_mean_max_c", "precip_sum_mm", "hot_days_ge_30c",
                  "temp_max_c", "temp_min_c", "precip_max_day_mm", "wind_max_kmh",
@@ -707,7 +713,7 @@ def build_claims(year_x, data_dir):
                     yrs = sorted(yr)
                     vals = [stat(var, yr[y][0]) for y in yrs]
                     clim = median(vals)
-                    if (var in POINT and POINT_PRIO[var] > 0
+                    if (var in POINT and POINT_PRIO[var] > 0 and POINT_WIN[tag] > 0
                             and not (var in POINT_FY_ONLY and tag != "FY")):
                         n_target = max(n for _, n in yr.values())
                         pv, pwhy = point_value(var, tag, dist, yrs, vals, target, n_target, anom)
@@ -776,7 +782,7 @@ def build_claims(year_x, data_dir):
 
     for _, c in points:
         take(c, POINTS_PER_LOC)
-    for _, c in cands:
+    for _, c in (cands if NONPOINT else []):
         take(c, MAX_PER_LOC)
     for _, c in points:  # spare capacity: more point duels
         take(c, MAX_PER_LOC)

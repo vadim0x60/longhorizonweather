@@ -165,7 +165,8 @@ PT_PRECIP_PRE1980 = (0.6, 0.4, 0, 0.0, 30.0, 0.1, 0.0)
 #   temp_mean_c ANN: nothing tried beat the current setting by more than 1 (left as is).
 PT_OVERRIDES = {("temp_mean_min_c", "ANN"): {"prior": 0.025, "E": 0.5},
                 ("temp_mean_c", "JJA"): {"W": 15},
-                ("temp_mean_max_c", "ANN"): {"W": 15, "E": 0.5},
+                ("temp_mean_max_c", "ANN"): {"W": 15, "A": 0.6, "C": 1.2},
+                ("temp_mean_c", "ANN"): {"prior": 0.02, "E": 0.4},
                 ("precip_sum_mm", "ANN"): {"A": 0.3, "C": 0.6},
                 ("hot_days_ge_30c", "ANN"): {"A": 0.8, "C": 0.6, "W": 15}}
 # Round 12, held-out check on X=1996..2022 even (round-11 field): the round-11 overrides held up
@@ -173,6 +174,10 @@ PT_OVERRIDES = {("temp_mean_min_c", "ANN"): {"prior": 0.025, "E": 0.5},
 # (+92 -> +78) lost a little there but stay ahead over both year sets (+12, +24). Hot days: the
 # count formula (A 1, C .3) gave +20 on odd / -5 on even years; A .8, C .6 on a 15-year base was
 # the only setting positive on both (+22 / +4); settings with less ridge won one set only.
+# Round 14, two year sets (14 odd years vs round-12 rivals / 14 even years vs round-13 rivals):
+#   temp_mean_max_c ANN: A .4, C 1, E .5 +2 / -19 -> A .6, C 1.2, no ENSO +11 / +29;
+#   temp_mean_c ANN: prior .015, no ENSO +1 / -13 -> prior .02 + E .4 +9 / +6.
+#   Less ridge lost on both (A 0: temp_mean_c -44 / -35, max -47 / -84; CV-skill gate -38 / -31).
 ENSO_RIDGE = 6.0           # ridge on the ENSO lag coefficient, in multiples of Nino3.4 variance
 PT_SOND_ANN = 0.2          # Sep-Nov carry for annual-window temperature points (see above)
 # Round 10: against the round-9 field over X=1981..1994 that setting lost (-24, -58 on 1981..87;

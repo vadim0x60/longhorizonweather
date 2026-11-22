@@ -57,6 +57,11 @@ PRECIP_RES_W = float(os.environ.get("P2_PRW", "0.3"))
 # X=1981-94 +77 -> +59, 1995-2013 odd -33 -> -35, 2014-24 -405 -> -252 (temp_mean_max_c -187 -> -70).
 TREND_ADJ_MAX = float(os.environ.get("P2_TAX", "1.0"))
 TREND_ADJ = float(os.environ.get("P2_TA", "0.7"))  # Round 9 rivals: early +2 -> +87, late20 -26 -> -1, late7 -46 -> -49
+# Round 14: + carry * year X's residual from the clim16 + own-slope line (annual temperatures),
+# as predict4/predict5 do. Round 13 rivals, two year sets (13 / 11 years over 1982..2024):
+# total +3 / -116 -> +26 / -81 (0.25: -19 / -48). Also tried for annual temp_mean_c: full trend
+# weight +29 / -126, Sep-Dec carry 0.2 +24 / -111, either with this carry: no better.
+RESID_CARRY = float(os.environ.get("P2_RES", "0.15"))
 SOND_CARRY = float(os.environ.get("P2_SC", "0.1"))  # + carry * year-X Sep-Dec anomaly, predict4-style; 0.3 lost badly in 1981-94
 PRECIP_MIN_YEAR = int(os.environ.get("P2_PMY", "0"))
 EPS = 0.01  # threshold margin so "le m" / "gt m" stay disjoint from rivals' gt/le at m
@@ -344,6 +349,10 @@ def main():
                     stx = core.window_stats(loc["days"][X], (9, 1), (12, 31), 0.0)
                     if sond is not None and stx and stx.get(var) is not None:
                         med += SOND_CARRY * (stx[var] - sond)
+                if var in TEMP3 and wname == "year" and RESID_CARRY and c16 is not None:
+                    stx = core.window_stats(loc["days"][X], *core.window_md(*w), 0.0)
+                    if stx and stx.get(var) is not None:
+                        med += RESID_CARRY * (stx[var] - (c16 + sl * 7.5))
                 if var in TEMP3 and wname == "year" and ENSO_W and X in nino_ond:
                     med += ENSO_W * enso_shift(loc, X, w, var, sl, nino_ond)
             hist = seq_history(loc, X, w, var)

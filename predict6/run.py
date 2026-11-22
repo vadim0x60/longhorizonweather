@@ -412,8 +412,9 @@ def sond_series(lr, X, var):
     return dict(zip(ys, vs))
 
 
-def point_value(ys, vs, var, f, X, win, sond=None):
-    """Point forecast for a duel (closer to truth wins). Built from three pieces, mixed per
+def point_value(ys, vs, var, f, X, win, sond=None, long_hist=None):
+    """Point forecast for a duel (closer to truth wins). long_hist is None for seasonal windows,
+    else whether a 1964..X long mean is blended in afterwards. Built from three pieces, mixed per
     target by duels against the real Round 5 rivals' points (tuned on X=1985..2009, checked
     on 2010..2023 held out, verify duel rule, local truth):
     * mine: 16-y climatology clim + lam * (model - clim), lam = 0.05 n capped at 0.8 (annual)
@@ -435,11 +436,19 @@ def point_value(ys, vs, var, f, X, win, sond=None):
     r = [v for _, v in sel]
     clim = sum(r) / len(r)
     if var == "precip_sum_mm":
+        line, res = shrunk_line([y for y, _ in sel], r, X, 0.0)
+        if long_hist is False:
+            # Round 14 (X > 1995; rivals converged on our Round 12 line + 0.3 res): median
+            # climatology, 5-year recency, 0.3 mine, year-X residual 0.4. Annual precip duels
+            # vs Round 13 rivals -20 -> +25, vs Round 12/11 rivals +19 -> +54.
+            c = median(r)
+            mine = c + PRECIP_RECENT_W * (sum(r[-5:]) / len(r[-5:]) - c)
+            return max(0.0, 0.3 * mine + 0.7 * (line + 0.4 * res))
         recent = r[-3:]
         mine = clim + PRECIP_RECENT_W * (sum(recent) / len(recent) - clim)
-        line, res = shrunk_line([y for y, _ in sel], r, X, 0.0)
         # Round 12: lean on the line and year X's residual (rain regimes persist): duels -86 -> +19
-        return max(0.0, 0.15 * mine + 0.85 * (line + 0.3 * res))
+        # Round 14: residual 0.3 -> 0.2 when a 1964..X long mean is blended in (+3 on 3 fields)
+        return max(0.0, 0.15 * mine + 0.85 * (line + (0.2 if long_hist else 0.3) * res))
     cap = (0.5 if var == "temp_mean_min_c" else 0.8) if win == "year" else (0.8 if win == "mam" else 0.6)
     mine = clim + min(cap, 0.05 * len(r)) * (f["mu"] - clim)
     carry = 0.0
@@ -494,8 +503,9 @@ def candidates(rows, meta, X, enso):
                 model = (f"trend {f['trend']:+.3f}/y, AR phi={f['phi']:.2f},{cyc} fcst {f['mu']:.2f}"
                          f"±{f['sigma']:.2f}")
                 if (win, var) in POINT_SPECS:
-                    pv = point_value(ys, vs, var, f, X, win, sond_series(rows[loc], X, var))
                     lm = long_mean(pre.get(loc), ys, vs, var, WINDOWS[win], X) if win == "year" else None
+                    pv = point_value(ys, vs, var, f, X, win, sond_series(rows[loc], X, var),
+                                     None if win != "year" else lm is not None)
                     if lm is not None:  # Round 8: annual points meet a 1964..X mean (X <= 1995)
                         pv = (1 - LONG_W[var]) * pv + LONG_W[var] * lm
                     if win == "year" and var in ("temp_mean_c", "temp_mean_min_c"):
