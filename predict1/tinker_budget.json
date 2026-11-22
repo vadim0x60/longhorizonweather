@@ -536,7 +536,15 @@
    "tokens": 62055,
    "usd": 0.0121,
    "note": "run.py inference X=1993, 840 prompts"
+  },
+  {
+   "utc": "2026-11-22T09:12:51Z",
+   "kind": "prefill",
+   "model": "Qwen/Qwen3-8B",
+   "tokens": 62167,
+   "usd": 0.0121,
+   "note": "run.py inference X=1989, 840 prompts"
   }
  ],
- "total_usd": 1.9174
+ "total_usd": 1.9295
 }

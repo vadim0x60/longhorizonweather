@@ -163,6 +163,9 @@ PT_PRECIP_PRE1980 = (0.6, 0.4, 0, 0.0, 30.0, 0.1, 0.0)
 #   temp_mean_max_c ANN: W 15 + E .5: +26 (+5/+21) -> +43 (+8/+35)
 #   precip_sum_mm ANN: A .3, C .6: +39 (-6/+45) -> +77 (+21/+56)
 #   temp_mean_c ANN: nothing tried beat the current setting by more than 1 (left as is).
+# Round 15 tried for temp_mean_min_c ANN: C .9, prior .03, year-X residual (R) .2: -9 / -9 ->
+# +1 / +3 in the grid on the round-12 / 13 fields, but -7 end to end vs the round-14 field
+# (X=1996..2022, 6 years), so it is not used.
 PT_OVERRIDES = {("temp_mean_min_c", "ANN"): {"prior": 0.025, "E": 0.5},
                 ("temp_mean_c", "JJA"): {"W": 15},
                 ("temp_mean_max_c", "ANN"): {"W": 15, "A": 0.6, "C": 1.2},
@@ -185,6 +188,10 @@ PT_SOND_ANN = 0.2          # Sep-Nov carry for annual-window temperature points 
 # mean + full trend term shrunk toward 0.015 C/yr + 0.1 x the Sep-Nov residual gives +39
 # (+23 on 1981..87, +16 on 1988..94); the post-1995 setting gives -19, a 0.025 prior -32.
 PT_TEMP_PRE1980 = (0.0, 1.0, 12, 0.015, 30.0, 0.0, 0.1)
+# Round 15: annual temp_mean_min_c with a damped trend term (C 0.75). Duels X=1985..94 vs the
+# round-14 field +3 -> +12, X=1981..94 vs the round-9 field +4 -> +12; adding year-X residual and
+# a bigger Sep-Nov carry won only the round-14 field (+33 vs +2 on round 9).
+PT_TMIN_PRE1980 = (0.0, 0.75, 12, 0.015, 30.0, 0.0, 0.1)
 # Hot-day points from shifted daily highs (see point_value) beat the count-series formula in the
 # local arena for X=1985..1995 (-22 -> -2 on hot days over 1985-88, +43 net over 1985-95) but
 # lost for X=1998..2023 (+24 -> +10), so "auto" shifts only when the history reaches before 1980.
@@ -708,14 +715,14 @@ def make_claims(days, meta, years, X, indices, log):
         fam = "temp" if var in TEMPS else ("count" if var in COUNTS else "precip")
         params = PT_PARAMS[fam]
         if fam == "temp" and min(ys) < 1980 and not os.environ.get("P8_NO_EARLY"):
-            params = PT_TEMP_PRE1980
+            params = PT_TMIN_PRE1980 if (var, win) == ("temp_mean_min_c", "ANN") else PT_TEMP_PRE1980
         if fam == "precip" and min(ys) < 1980:
             params = PT_PRECIP_PRE1980
         A, C, nlo, prior, k, carry, sond_w = params
         if params is PT_PARAMS["temp"] and win == "ANN":
             sond_w = PT_SOND_ANN
         ov = PT_OVERRIDES.get((var, win), {}) if params is PT_PARAMS[fam] and min(ys) >= 1980 else {}
-        A, C, prior = ov.get("A", A), ov.get("C", C), ov.get("prior", prior)
+        A, C, prior, carry = ov.get("A", A), ov.get("C", C), ov.get("prior", prior), ov.get("R", carry)
         sl = (sl * n_sl + prior * k) / (n_sl + k)
         A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
         med = m + (A * (med - m) if med is not None else 0.0) + C * sl * (T - ym)

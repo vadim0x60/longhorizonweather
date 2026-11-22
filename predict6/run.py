@@ -265,7 +265,8 @@ MAX_PER_LOC = 12  # CONTRACTS.md Round 3
 BASE_VARS = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "precip_sum_mm")
 POINT_SPECS = [("year", "temp_mean_c"), ("year", "temp_mean_max_c"), ("year", "temp_mean_min_c"),
                ("year", "precip_sum_mm"), ("jja", "temp_mean_c"), ("mam", "temp_mean_c"),
-               ("jf", "temp_mean_c")]
+               ("jf", "temp_mean_c"), ("jja", "precip_sum_mm")]
+JJA_PRECIP_POINTS = 10  # Round 15: the 10 wettest summers' JJA totals replace booleans (1 duel in 39 years)
 PRECIP_RECENT_W = 0.3
 BOOL_PMIN = 0.70  # booleans near 0.6 lost more contradictions than they won in backtests
 
@@ -437,6 +438,11 @@ def point_value(ys, vs, var, f, X, win, sond=None, long_hist=None):
     clim = sum(r) / len(r)
     if var == "precip_sum_mm":
         line, res = shrunk_line([y for y, _ in sel], r, X, 0.0)
+        if long_hist is None:
+            # Round 15, JJA totals: median climatology, 5-year recency, no year-X residual
+            # (summer rain does not persist). JJA precip duels vs Round 14 rivals: +33 (all cities)
+            c = median(r)
+            return max(0.0, 0.3 * (c + PRECIP_RECENT_W * (sum(r[-5:]) / len(r[-5:]) - c)) + 0.7 * line)
         if long_hist is False:
             # Round 14 (X > 1995; rivals converged on our Round 12 line + 0.3 res): median
             # climatology, 5-year recency, 0.3 mine, year-X residual 0.4. Annual precip duels
@@ -564,6 +570,9 @@ def main():
             a = c["assertion"]
             return a.get("op", a.get("value"))
         points = [c for p, cat, c in cands if cat[0] == "point"]
+        jja_p = lambda c: c["target"]["variable"] == "precip_sum_mm" and c["target"]["window_start"][5:] == "06-01"
+        points = [c for c in points if not jja_p(c)] + sorted(
+            (c for c in points if jja_p(c)), key=lambda c: -c["assertion"]["value"])[:JJA_PRECIP_POINTS]
         ranked = sorted(((2 * p - 1) * (cat_weight(cat, side(c)) + 0.01), i)
                         for i, (p, cat, c) in enumerate(cands)
                         if cat[0] != "point" and p >= (BOOL_PMIN if cat[0] == "bool" else PMIN))

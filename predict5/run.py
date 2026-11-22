@@ -40,6 +40,10 @@ PRIOR_WEIGHT_YEARS = 16.0      # prior counts like this many years of slope evid
 COUNT_PRIOR_WEIGHT_YEARS = 8.0  # same, for hot/frost day counts
 # ENSO lag helped point skill for daily-mean and daily-min temperatures only (backtest).
 ENSO_VARS = ("temp_mean_c", "temp_mean_min_c")
+# Share of the temperature slope prior taken from the network-mean slope (rest: fixed global prior).
+# Round 15 backtest, X = 1980..2023, vs the round-12/13/14 fields: 0 -63/-71/-83, 0.25 -29/-39/-57
+# (better in both eras on all three), 0.5 -43/-45/-72 (X <= 1995 negative), 0.75 -63 (round 14).
+POOL_WEIGHT = 0.25
 ENSO_RIDGE_YEARS = 6.0         # ridge on the ENSO lag coefficient, in years of evidence; None disables
 
 _MDAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
@@ -233,6 +237,15 @@ def enso_adjust(yrs, ys, pred_fn, enso, x):
     return beta * (enso[x] - nbar), beta
 
 
+def ols_slope(years, ys):
+    n = len(ys)
+    if n < 2:
+        return 0.0
+    tbar, ybar = sum(years) / n, sum(ys) / n
+    sxx = sum((t - tbar) ** 2 for t in years)
+    return sum((t - tbar) * (y - ybar) for t, y in zip(years, ys)) / sxx if sxx else 0.0
+
+
 def trend_forecast(years, ys, target_year, prior_slope, prior_weight=None):
     """OLS slope shrunk toward prior_slope; returns (pred, predictive_sd, slope)."""
     n = len(ys)
@@ -343,6 +356,19 @@ def build_pool(locs, x, enso=None):
                 items.append(dict(sond=sond, lid=lid, loc=loc, wname=wname, s=s, e=e, wk=window_kind(wname),
                                   var=var, yrs=yrs, ys=ys, base=base, pred=pred, sd=sd, b=b, fit=fit,
                                   prior=prior, pw=pw))
+    if POOL_WEIGHT > 0:
+        # Shrink toward a prior that is partly the network-mean slope of the same variable and
+        # window (all locations, years <= X), damping single-location trend noise.
+        net = defaultdict(list)
+        for it in items:
+            if it["var"] in TEMP_VARS:
+                net[(it["var"], it["wname"])].append(ols_slope(it["yrs"], it["ys"]))
+        for it in items:
+            if it["var"] in TEMP_VARS and len(net[(it["var"], it["wname"])]) >= 5:
+                sl = net[(it["var"], it["wname"])]
+                it["prior"] = (1 - POOL_WEIGHT) * it["prior"] + POOL_WEIGHT * sum(sl) / len(sl)
+                it["pred"], it["sd"], it["b"], it["fit"] = trend_forecast(it["yrs"], it["ys"], target_year,
+                                                                         it["prior"], it["pw"])
     lam = point_damping(items, enso, x)
     out = []
     for it in items:

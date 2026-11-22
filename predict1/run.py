@@ -44,11 +44,11 @@ CATALOG = {  # CONTRACTS.md shared benchmark coordinates (verify checks lat/lon 
     "seoul_kr": (37.5665, 126.9780), "toronto_ca": (43.6532, -79.3832)}
 MAX_PER_LOC = 12
 MIN_POINTS = 70     # contract requires >= 60 point claims; keep a margin
-POINTS_PER_LOC = 6  # round 14: JJA point dropped (vs round-13 rivals over 32 years -27, no mix/carry setting above -1); round 12: 7th point (SON) replaces idle non-point slots (+2 over 23 years); round 8: annual temp_mean_min_c points lost from 1995 on, dropped
+POINTS_PER_LOC = 5  # round 15: annual precip point dropped (vs round-14 rivals over 33 years -12; every variant tried was worse, -14..-177); round 14: JJA point dropped (vs round-13 rivals over 32 years -27, no mix/carry setting above -1); round 12: 7th point (SON) replaces idle non-point slots (+2 over 23 years); round 8: annual temp_mean_min_c points lost from 1995 on, dropped
 # Point targets in priority order: the targets rivals' round-3 code points at, ordered by
 # backtested net duel wins per claim against those rivals (14 held-out years).
 POINT_TARGETS = [("year", "temp_mean_max_c"), ("year", "temp_mean_c"), ("year", "hot_days_ge_30c"),
-                 ("year", "precip_sum_mm"), ("jf", "temp_mean_c"), ("son", "temp_mean_c"),
+                 ("jf", "temp_mean_c"), ("son", "temp_mean_c"), ("year", "precip_sum_mm"),
                  ("jja", "temp_mean_c"), ("m07", "temp_mean_c"), ("year", "temp_max_c"),
                  ("q4", "temp_mean_c"), ("year", "temp_mean_min_c"), ("jja", "precip_sum_mm")]
 # Point forecast = (1 - a - b) * ensemble median + a * 15-yr mean/trend blend

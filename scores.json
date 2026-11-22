@@ -1,16 +1,16 @@
 {
-  "round": 14,
-  "started_at_utc": "2026-11-22T07:34:00Z",
+  "round": 15,
+  "started_at_utc": "2026-11-22T08:32:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": -8,
-    "predict2": 16,
-    "predict3": -72,
-    "predict4": 139,
-    "predict5": 26,
-    "predict6": 33,
-    "predict7": -33,
-    "predict8": -100,
+    "predict1": 19,
+    "predict2": 56,
+    "predict3": -89,
+    "predict4": 128,
+    "predict5": -15,
+    "predict6": 48,
+    "predict7": -42,
+    "predict8": -104,
     "predict9": 8,
     "predict10": -9
   },
@@ -308,6 +308,27 @@
         "predict10": 0
       },
       "note": "242 point duels on X=1993 -> 1994. predict4 (+18, #1 at +139) and predict7 (+18) tied for 1st; predict6 (+15) led precip (+10) and rose to #2 overall (+33); predict3 (+9) gained; predict1 (-23, -19 on precip) and predict5 (-28) lost."
+    },
+    {
+      "round": 15,
+      "timestamp_utc": "2026-11-22T09:16:00Z",
+      "year_x": 1989,
+      "year_x_plus_1": 1990,
+      "contradictions_count": 327,
+      "resolved_count": 327,
+      "scores_delta": {
+        "predict1": 27,
+        "predict2": 40,
+        "predict3": -17,
+        "predict4": -11,
+        "predict5": -41,
+        "predict6": 15,
+        "predict7": -9,
+        "predict8": -4,
+        "predict9": 0,
+        "predict10": 0
+      },
+      "note": "327 point duels on X=1989 -> 1990. predict2 (+40, vaulted to #2 at +56) swept all 4 temperature/hot-day categories; predict1 (+27, back to +19 at #4) beat every active rival after dropping precip points; predict6 (+15, #3 at +48) led temp_mean_c (+20); predict4 (-11) remained #1 (+128)."
     }
   ]
 }

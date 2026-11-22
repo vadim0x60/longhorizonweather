@@ -25,7 +25,7 @@ Stated confidence is capped at 0.90.
 Point forecasts (CONTRACTS.md point duels, scored by absolute error), for the trailing 16 years:
   point = mean + b * (X+1 - mean year) + a * (year X's residual from that trend line),
   b = w * OLS slope + (1 - w) * prior, w = n / (n + k).
-Temperatures use prior 0.03 C/yr and k = 40, a = 0.1 (annual: 0.2 until Round 10), plus
+Temperatures use prior 0.03 C/yr (0.045 for temp_mean_max_c when X > 1995) and k = 40, a = 0.1 (annual: 0.2 until Round 10), plus
 0.2 x year X's Sep-Dec residual (0.25 for temp_mean_max_c since Round 14; late-year
 anomalies persist into the next year). Annual
 temperature points also add ENSO_WEIGHT x a lagged-ENSO term (Round 12): the 16 residuals,
@@ -132,6 +132,10 @@ SOND_CARRY = 0.2   # weight of year X's Sep-Dec residual in temperature points
 # Round 14: temp_mean_max_c carries 0.25. X=1985..2023 net vs Round 13 / 12 / 11 rivals:
 # +56 -> +78, +67 -> +82, +89 -> +103; the gain is X >= 2008 (+26..+29), earlier years -2..-15.
 SOND_CARRY_VAR = {"temp_mean_max_c": 0.25}
+# Round 15: for X > 1995 (history from 1980 on) temp_mean_max_c trends shrink toward 0.045 C/yr
+# instead of 0.03 (daily highs warm faster). X=1996..2023 net vs Round 14 rivals -23 -> +14
+# (0.04 -12, 0.05 +5, 0.055 -5, 0.06 -31), vs Round 13 rivals +10 -> +24 (0.05: +31).
+TREND_PRIOR_POST1995 = {"temp_mean_max_c": 0.045}
 # Weight of the 1964..X mean when the history is contiguous to 1964. Round 11: 0.5 -> 0.6,
 # X=1985..1995 arena: vs Round 10 rivals +27 -> +64 (0.7: +7), vs Round 9 rivals +52 -> +69.
 LONG_MEAN_WEIGHT = 0.6
@@ -413,6 +417,8 @@ def point_forecast(series: dict, year_x: int, variable: str, wname: str, sond: d
     long_history = all(y in series for y in range(LONG_FIRST_YEAR, year_x + 1))
     if variable in TEMP_VARS:
         prior, k, a = POINT_PARAMS.get(wname, POINT_PARAMS["year"])
+        if not long_history:
+            prior = TREND_PRIOR_POST1995.get(variable, prior)
     else:
         prior, k, a = PRECIP_POINT_PARAMS
         if not long_history:

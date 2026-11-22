@@ -63,6 +63,10 @@ TREND_ADJ = float(os.environ.get("P2_TA", "0.7"))  # Round 9 rivals: early +2 ->
 # weight +29 / -126, Sep-Dec carry 0.2 +24 / -111, either with this carry: no better.
 RESID_CARRY = float(os.environ.get("P2_RES", "0.15"))
 SOND_CARRY = float(os.environ.get("P2_SC", "0.1"))  # + carry * year-X Sep-Dec anomaly, predict4-style; 0.3 lost badly in 1981-94
+# Round 15 (predict4-style): Tmax carries 0.25 of year X's Sep-Dec anomaly. Round 14 rivals, two
+# year sets (13 / 11 years over 1982..2024): total +13 / -89 -> +16 / -49 (hot days -26 / -20 ->
+# -13 / -12 via the shifted-highs count); 0.4: -86 / -81. Precip residual 0.4 with it: +2 / -43.
+SOND_CARRY_MAX = float(os.environ.get("P2_SCX", "0.25"))
 PRECIP_MIN_YEAR = int(os.environ.get("P2_PMY", "0"))
 EPS = 0.01  # threshold margin so "le m" / "gt m" stay disjoint from rivals' gt/le at m
 TEMP3 = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c")
@@ -348,7 +352,7 @@ def main():
                     sond = clim16(loc, X - 1, (date(X, 9, 1).isoformat(), date(X, 12, 31).isoformat()), var)
                     stx = core.window_stats(loc["days"][X], (9, 1), (12, 31), 0.0)
                     if sond is not None and stx and stx.get(var) is not None:
-                        med += SOND_CARRY * (stx[var] - sond)
+                        med += (SOND_CARRY_MAX if var == "temp_mean_max_c" else SOND_CARRY) * (stx[var] - sond)
                 if var in TEMP3 and wname == "year" and RESID_CARRY and c16 is not None:
                     stx = core.window_stats(loc["days"][X], *core.window_md(*w), 0.0)
                     if stx and stx.get(var) is not None:

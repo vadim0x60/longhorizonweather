@@ -82,9 +82,9 @@ POINT_PRIO = {
     # Round 5: precip_sum_mm and hot_days_ge_30c points netted -19 and -43 against
     # the round-4 field over X=1985..2023 (no edge), so they are no longer emitted.
     "temp_mean_c": 1.0, "temp_mean_min_c": 0.9, "precip_sum_mm": 0.0,
-    # Round 14: the remaining tail-variable points only ever filled spare slots and drew
-    # no duels in the round-13 arena; they are off so only tested targets are emitted.
-    "temp_mean_max_c": 0.7, "hot_days_ge_30c": 0.0, "temp_max_c": 0.0,
+    # Round 15: temp_mean_max_c points are off. In the round-14 arena they netted -67 over
+    # X=1985..2023 (removing them: +60 -> +127), and they lost live in rounds 10-12.
+    "temp_mean_max_c": 0.0, "hot_days_ge_30c": 0.0, "temp_max_c": 0.0,
     "frost_days_lt_0c": 0.0, "rainy_days_ge_1mm": 0.0, "precip_max_day_mm": 0.0,
     "temp_min_c": 0.0, "wind_max_kmh": 0.0,
 }
