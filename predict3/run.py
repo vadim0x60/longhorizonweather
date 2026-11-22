@@ -15,7 +15,7 @@ Offline, stdlib-only statistical forecaster for year X+1:
   * Mean model also carries a pooled lag-1 persistence of each variable's own
     detrended anomaly (helps precipitation and day counts).
   * Claims (contract: >= 60 points, <= 12 per location, <= 150 total):
-      - 100 `point` claims for ANN/JJA/SON temp_mean_c and ANN temp_mean_max_c,
+      - 100 `point` claims for ANN/JJA/MAM temp_mean_c and ANN temp_mean_max_c,
         temp_mean_min_c at all 20 locations. Point = clim + lambda*(median - clim),
         lambda = 1 with >= 16 years of record (else 0.67*n/16), times 0.6 when the
         16-year window reaches back before 1980. Those years come from the bundled
@@ -28,14 +28,13 @@ Offline, stdlib-only statistical forecaster for year X+1:
     Non-point claims are ranked by how many rival claims a target attracts (POP,
     measured offline on past years) times the expected net margin.
 
-Dev-time evaluation (rivals' Round 7 code run offline with Tinker off, scored by
-verify/run.py on locally collected truth, X=1985..1995 and 1998..2023):
-  Round 7 settings                        early +15  late +237  total +252
-  + persistence floors rho, phi >= 0.2    early  -3  late +442  total +439 (odd +279, even +160)
-Diagnosis (live Round 7, X=2014, reproduced as -40 vs -39 live): after the very cold
-2014 in Chicago/Toronto/New York, the fitted year-X persistence was ~0 (in-sample AR(1)
-estimates on 16 detrended points are biased toward 0), so the points sat above climatology
-while predict4's fixed 0.2 x residual + 0.2 x Sep-Dec pulled them down. Floors give +51 there.
+Dev-time evaluation (rivals' Round 8 code run offline with Tinker off, full 1980..2024
+history incl. 1996-97, scored by verify/run.py on local truth, X=1985..2023):
+  Round 8 settings (floors 0.2, SON points)  total  +87
+  floors 0.1                                 total +100
+  floors 0.1, MAM instead of SON points      total +123 (1985-95 -43, 1998-2023 +172, odd +59, even +64)
+  rejected: floors 0.3 (-408), blending in a predict4-style shrunk-trend line (0.3: +28, 0.7: -91).
+The simulation reproduces live Round 8 (X=1999: -7 vs -9 live, same per-rival losses).
 Model ablations: Sep-Dec persistence clearly helps; per-location ENSO fits hurt;
 pooled ENSO is neutral-to-slightly-positive for temperature.
 
@@ -61,7 +60,7 @@ MAX_PER_LOCATION = 12   # Round 3 contract cap per location_id
 LAMBDA = 0.5             # threshold position between climatology (0) and our median (1)
 THRESHOLD_WEIGHT = 0.3   # base ranking weight of threshold claims relative to booleans
 SIGMA_INFLATE = 1.00     # calibrated so out-of-sample z-scores have ~unit spread (backtests X=2006..2023)
-PHI_MIN = 0.2            # floor on the Sep-Dec carry-over (fitted values ~0.1 are biased low; predict4 uses 0.2)
+PHI_MIN = 0.1            # floor on the Sep-Dec carry-over (fitted ~0.1 is biased low); 0.1 and 0.2 tie, 0.3 collapses (-408)
 PHI_MAX = 0.7            # cap on pooled persistence coefficient
 USE_PRE1980 = True       # fill X-15..1979 from predict3/data/era5_daily_pre1980.csv.gz
 PRE1980_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "era5_daily_pre1980.csv.gz")
@@ -70,15 +69,15 @@ SOND_OWN = True          # carry over the variable's own Sep-Dec column (vs Sep-
 PRECIP_RECENT_W = 0.3    # precip point = clim + w * (last-3-year mean - clim), as in predict6: +54 vs model median
 OWN_LAG = True           # pooled lag-1 persistence of each variable's own detrended anomaly
 RHO_MAX = 0.6
-RHO_MIN = 0.2            # floor on own-anomaly persistence (fitted ~0.0: in-sample AR(1) bias)
+RHO_MIN = 0.1            # floor on own-anomaly persistence (fitted ~0.0: in-sample AR(1) bias)
 USE_ENSO = True          # pooled ENSO term, temperature variables only (backtest: small gain 2015-2023, neutral 2006-2014)
 ENSO_VARS = {"temp_mean_c", "temp_max_c", "temp_min_c", "temp_mean_max_c", "temp_mean_min_c"}
 OTHER_TREND_SHRINK = 0.5  # extra shrink of EB-weighted trends for non-temperature variables
 BOOL_MIN_CONF = 0.65
 # Round 3: point duels (closer to truth wins once two points differ by min_gap). Point claims go on the
 # most contested numeric targets for every location; >= 60 are required by the contract.
-POINT_PAIRS = [("ANN", "temp_mean_c"), ("JJA", "temp_mean_c"), ("ANN", "temp_mean_max_c"), ("ANN", "temp_mean_min_c"), ("SON", "temp_mean_c")]
-# ANN precip_sum_mm points were dropped in Round 7: -34 net vs Round 6 rivals (SON temp_mean_c: +116 net).
+POINT_PAIRS = [("ANN", "temp_mean_c"), ("JJA", "temp_mean_c"), ("ANN", "temp_mean_max_c"), ("ANN", "temp_mean_min_c"), ("MAM", "temp_mean_c")]
+# ANN precip_sum_mm points were dropped in Round 7 (-34 net); SON temp_mean_c -> MAM in Round 9 (SON -6, MAM +17).
 MIN_POINTS = 60
 POINT_LAMBDA = {"temp": (1.0, 0.67, 16), "other": (1.0, 0.67, 16)}  # (lambda at full record, short-record scale, full-record years): point = clim + lambda*(median - clim)
 POINT_PRIORITY = 100.0   # points are placed before any other claim

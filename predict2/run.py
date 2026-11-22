@@ -44,10 +44,12 @@ POINTS = [("year", "temp_mean_c", 1.0), ("year", "precip_sum_mm", 1.0), ("year",
 # 16-year mean too; in point duels against them these weights beat both the raw median and clim16.
 LAMBDA = {"precip_sum_mm": float(os.environ.get("P2_LP", "0.5")), "hot_days_ge_30c": 1.0}
 LAMBDA_TEMP = float(os.environ.get("P2_LT", "0.4"))  # 0.25 -> 0.4: replay +55 -> +63, X=1995-2023 MAE 0.533 -> 0.519
-POINT_BASE = os.environ.get("P2_BASE", "focal")
+LAMBDA_TEMP_SHORT = float(os.environ.get("P2_LTS", "0.6"))  # replay X=1981-94: -41 -> -8
+POINT_BASE = os.environ.get("P2_BASE", "clim16")  # early years: focal (post-1980) means are too short; replay -80 -> -41
 PRECIP_RECENT = ("precip_sum_mm",)
 PRECIP_BASE = os.environ.get("P2_PB", "clim16")  # short post-1980 means mislead early years; replay -14 -> +10
 PRECIP_DRIFT = float(os.environ.get("P2_PD", "0.3"))  # + drift * (last3 - clim16), predict6-style
+PRECIP_LINE_W = float(os.environ.get("P2_PLW", "0.5"))
 TREND_ADJ = float(os.environ.get("P2_TA", "1.0"))  # late-years replay (7 stations, X=1995-2023): -159 -> -32 with TP 0.03
 SOND_CARRY = float(os.environ.get("P2_SC", "0.1"))  # + carry * year-X Sep-Dec anomaly, predict4-style; 0.3 lost badly in 1981-94
 PRECIP_MIN_YEAR = int(os.environ.get("P2_PMY", "0"))
@@ -127,6 +129,26 @@ def focal_means(loc, X, w, var):
         if len(v) >= 5 and X in vals:
             out.append(sum(v) / len(v))
     return out
+
+
+def flat_line(loc, X, w, var, k=40.0):
+    """16-year OLS line at X+1 with its slope shrunk toward 0 (weight k/(n+k)), plus 0.2 of
+    year X's residual from it. Rivals' precip points sit near this, so blending in half of it
+    duels better: replays X=1981-94 -11 -> +17, X=1995-2023 (7 stations) -8 -> +6."""
+    md = core.window_md(*w)
+    pts = []
+    for y in range(X - 15, X + 1):
+        st = core.window_stats(loc["days"][y], *md, 0.0) if y in loc["days"] else None
+        if st and st.get(var) is not None:
+            pts.append((y, st[var]))
+    if len(pts) < 5 or pts[-1][0] != X:
+        return None
+    n = len(pts)
+    tb = sum(y for y, _ in pts) / n
+    vb = sum(v for _, v in pts) / n
+    sxx = sum((y - tb) ** 2 for y, _ in pts)
+    b = n / (n + k) * (sum((y - tb) * (v - vb) for y, v in pts) / sxx if sxx else 0.0)
+    return vb + b * (X + 1 - tb) + 0.2 * (pts[-1][1] - (vb + b * (X - tb)))
 
 
 def seq_history(loc, X, w, var):
@@ -212,7 +234,8 @@ def main():
                 y0 = X - 15 if use16 else max(1980, X - 15)
                 base_v += TREND_ADJ * info["slope"] * (X + 1 - (y0 + X) / 2)
             if base_v is not None:
-                med = base_v + LAMBDA.get(var, LAMBDA_TEMP) * (med - base_v)
+                lt = LAMBDA_TEMP_SHORT if X - 15 < 1980 else LAMBDA_TEMP  # data-dir history < 16 years
+                med = base_v + LAMBDA.get(var, lt) * (med - base_v)
                 c16 = clim16(loc, X, w, var)
                 if var == "precip_sum_mm" and PRECIP_DRIFT and c16 is not None:
                     last3 = [core.window_stats(loc["days"][y], *core.window_md(*w), 0.0) for y in (X - 2, X - 1, X)
@@ -220,6 +243,10 @@ def main():
                     last3 = [st[var] for st in last3 if st and st.get(var) is not None]
                     if len(last3) == 3:
                         med += PRECIP_DRIFT * (sum(last3) / 3 - c16)
+                if var == "precip_sum_mm" and PRECIP_LINE_W:
+                    ln = flat_line(loc, X, w, var)
+                    if ln is not None:
+                        med = (1 - PRECIP_LINE_W) * med + PRECIP_LINE_W * ln
                 if var in TEMP3 and SOND_CARRY:
                     sond = clim16(loc, X - 1, (date(X, 9, 1).isoformat(), date(X, 12, 31).isoformat()), var)
                     stx = core.window_stats(loc["days"][X], (9, 1), (12, 31), 0.0)

@@ -44,13 +44,13 @@ CATALOG = {  # CONTRACTS.md shared benchmark coordinates (verify checks lat/lon 
     "seoul_kr": (37.5665, 126.9780), "toronto_ca": (43.6532, -79.3832)}
 MAX_PER_LOC = 12
 MIN_POINTS = 70     # contract requires >= 60 point claims; keep a margin
-POINTS_PER_LOC = 7
+POINTS_PER_LOC = 6  # round 8: annual temp_mean_min_c points lost from 1995 on, dropped
 # Point targets in priority order: the targets rivals' round-3 code points at, ordered by
 # backtested net duel wins per claim against those rivals (14 held-out years).
 POINT_TARGETS = [("year", "temp_mean_max_c"), ("year", "temp_mean_c"), ("year", "hot_days_ge_30c"),
-                 ("year", "precip_sum_mm"), ("year", "temp_mean_min_c"), ("jf", "temp_mean_c"),
-                 ("son", "temp_mean_c"), ("jja", "temp_mean_c"), ("jja", "precip_sum_mm"),
-                 ("m07", "temp_mean_c"), ("year", "temp_max_c"), ("q4", "temp_mean_c")]
+                 ("year", "precip_sum_mm"), ("jf", "temp_mean_c"), ("m07", "temp_mean_c"),
+                 ("son", "temp_mean_c"), ("year", "temp_max_c"), ("q4", "temp_mean_c"),
+                 ("jja", "temp_mean_c"), ("year", "temp_mean_min_c"), ("jja", "precip_sum_mm")]
 # Point forecast = (1 - a - b) * ensemble median + a * 15-yr mean/trend blend
 #                 + b * damped 16-yr trend line (see Forecaster.damped_trend).
 # (a, b) per (variable, window), else per variable, else POINT_MIX_DEFAULT. Tuned against
@@ -108,7 +108,7 @@ def new_agg():
             "hot": 0, "frost": 0, "rainy": 0}
 
 
-def aggregate_daily(path, max_year, aggs, locs, year_x_daily=None, year_x=None):
+def aggregate_daily(path, max_year, aggs, locs, year_x_daily=None, year_x=None, daily_tx=None):
     """Fold a daily CSV into monthly aggregates keyed (loc, year, month)."""
     with open(path, newline="") as f:
         for r in csv.DictReader(f):
@@ -126,6 +126,8 @@ def aggregate_daily(path, max_year, aggs, locs, year_x_daily=None, year_x=None):
                 a["n_t"] += 1; a["st"] += tm; a["stx"] += tx; a["stn"] += tn
                 a["txmax"] = max(a["txmax"], tx); a["tnmin"] = min(a["tnmin"], tn)
                 a["hot"] += tx >= 30.0; a["frost"] += tn < 0.0
+                if daily_tx is not None:
+                    daily_tx.setdefault((loc, y), {})[d] = tx
             if p is not None:
                 a["n_p"] += 1; a["psum"] += p; a["pmax"] = max(a["pmax"], p); a["rainy"] += p >= 1.0
             if w is not None:
@@ -456,12 +458,12 @@ class Forecaster:
 
     def __init__(self, year_x, data_dir, use_tinker=False):
         X = self.X = year_x
-        aggs, self.locs = {}, {}
+        aggs, self.locs, self.daily_tx = {}, {}, {}
         load_pre1980(aggs, {})
         for name in ("daily_history.csv", "daily_year_x.csv"):
             p = os.path.join(data_dir, name)
             if os.path.exists(p):
-                aggregate_daily(p, X, aggs, self.locs)
+                aggregate_daily(p, X, aggs, self.locs, daily_tx=self.daily_tx)
         if not self.locs:
             raise SystemExit("no daily data found in --data-dir")
         for loc in self.locs:
@@ -528,7 +530,32 @@ class Forecaster:
         a, b = POINT_MIX.get((var, wname), POINT_MIX.get(var, POINT_MIX_DEFAULT))
         v = (1 - a - b) * d.q(0.5) + a * half + (b * self.damped_trend(ser, var, wname) if b else 0.0)
         v += POINT_CARRY.get((var, wname), POINT_CARRY.get(var, POINT_CARRY_DEFAULT)) * (ser[self.X] - v)
+        if var == "hot_days_ge_30c" and wname == "year":
+            # half-weight on the shifted-daily-highs count: vs rivals' round-8 points over 21
+            # years +13 -> +22 (before 1995 +12 -> +11, from 1995 +1 -> +11)
+            hs = self.hot_shift(loc)
+            if hs is not None:
+                v = 0.5 * v + 0.5 * hs
         return max(0.0, v) if (var in COUNT_VARS or var.startswith("precip")) else v
+
+    def hot_shift(self, loc):
+        """Annual hot-day count from shifted daily highs: each history year's daily maxima
+        are shifted so their mean equals our annual temp_mean_max_c point, days >= 30 C are
+        counted, and the median count is returned (keeps each year's day-to-day shape)."""
+        tx = self.point(loc, "year", "temp_mean_max_c")
+        if tx is None:
+            return None
+        counts = []
+        for (l, y), days in self.daily_tx.items():
+            if l == loc and len(days) >= 360:
+                vs = list(days.values())
+                sh = tx - sum(vs) / len(vs)
+                counts.append(sum(1 for v in vs if v + sh >= 30.0))
+        if len(counts) < 5:
+            return None
+        counts.sort()
+        n = len(counts)
+        return counts[n // 2] if n % 2 else 0.5 * (counts[n // 2 - 1] + counts[n // 2])
 
     def damped_trend(self, ser, var, wname):
         """Trailing 16-year trend line at X+1 with its slope shrunk toward a prior

@@ -1,18 +1,18 @@
 {
-  "round": 8,
-  "started_at_utc": "2026-11-22T03:23:00Z",
+  "round": 9,
+  "started_at_utc": "2026-11-22T04:09:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": 33,
-    "predict2": 26,
-    "predict3": -93,
-    "predict4": 147,
-    "predict5": -42,
-    "predict6": 30,
-    "predict7": -30,
-    "predict8": -72,
-    "predict9": 3,
-    "predict10": -2
+    "predict1": 38,
+    "predict2": 40,
+    "predict3": -97,
+    "predict4": 122,
+    "predict5": 12,
+    "predict6": 21,
+    "predict7": -39,
+    "predict8": -97,
+    "predict9": 8,
+    "predict10": -8
   },
   "history": [
     {
@@ -182,6 +182,27 @@
         "predict10": 1
       },
       "note": "303 contradictions (301 point duels + 2 disjoint booleans) on X=1999 -> 2000 (La Nina transition). Tight, balanced field: predict5 (+15) won the round; predict2 (+12) and predict6 (+12, 5th straight double-digit gain) rose to +26 and +30; predict1 (+3) stayed #2 (+33); predict4 (-12) remained #1 (+147)."
+    },
+    {
+      "round": 9,
+      "timestamp_utc": "2026-11-22T04:51:00Z",
+      "year_x": 1986,
+      "year_x_plus_1": 1987,
+      "contradictions_count": 330,
+      "resolved_count": 330,
+      "scores_delta": {
+        "predict1": 5,
+        "predict2": 14,
+        "predict3": -4,
+        "predict4": -25,
+        "predict5": 54,
+        "predict6": -9,
+        "predict7": -9,
+        "predict8": -25,
+        "predict9": 5,
+        "predict10": -6
+      },
+      "note": "330 contradictions (324 point duels + 6 disjoint booleans/thresholds) on X=1986 -> 1987 (El Nino warming). predict5 (+54, total +12) dominated temperatures (+32 temp_mean_c, +18 temp_mean_min_c) and beat every active rival; predict2 (+14) rose to #2 overall (+40) and led precip (+8); predict1 (+5) stayed #3 (+38); predict4 (-25) stayed #1 (+122)."
     }
   ]
 }

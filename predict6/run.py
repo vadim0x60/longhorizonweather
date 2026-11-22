@@ -396,6 +396,8 @@ def point_value(ys, vs, var, f, X, win, sond=None):
     * sond: 0.2 x year X's Sep-Dec residual of the same variable from that line.
     Annual temps use 0.3 mine + 0.7 (line + sond), with sond at 0.3 for temp_mean_c, JJA/Jan-Feb
     mine + sond (Round 8: back to 0.2, JJA -26 -> +5, Jan-Feb +5 -> +20), MAM mine, annual
+    (Round 9, vs Round 8 rivals X=1985..2023: temp_mean_max year-X residual 0.2 -> 0.3, +23 -> +51;
+    temp_mean_min lam cap 0.8 -> 0.5, +30 -> +39; both better in every period.)
     precipitation 0.5 mine + 0.5 line. Round 7 retune against the Round 6 rivals (X=1985..2023):
     precip 0.7 -> 0.5 mine (+25 -> +72), annual temps 0.5 -> 0.3 mine (max +57 -> +74, mean
     +36 -> +39), seasonal Sep-Dec carry 0.2 -> 0.1 (JJA -17 -> -1). Anchoring the history on a
@@ -408,7 +410,8 @@ def point_value(ys, vs, var, f, X, win, sond=None):
         mine = clim + PRECIP_RECENT_W * (sum(recent) / len(recent) - clim)
         line, res = shrunk_line([y for y, _ in sel], r, X, 0.0)
         return max(0.0, 0.5 * mine + 0.5 * (line + 0.2 * res))
-    mine = clim + min(0.8 if win == "year" else 0.6, 0.05 * len(r)) * (f["mu"] - clim)
+    cap = (0.5 if var == "temp_mean_min_c" else 0.8) if win == "year" else 0.6
+    mine = clim + min(cap, 0.05 * len(r)) * (f["mu"] - clim)
     carry = 0.0
     if sond and X in sond and len(sond) >= 3:
         sy = sorted(y for y in sond if y >= X - 15)
@@ -421,7 +424,8 @@ def point_value(ys, vs, var, f, X, win, sond=None):
     if var == "temp_mean_c":
         carry *= 1.5  # Round 8: Sep-Dec weight 0.3 for annual temp_mean_c (-19 -> +9 in duels)
     w = 0.3
-    return w * mine + (1 - w) * (line + 0.2 * res + carry)
+    a = 0.3 if var == "temp_mean_max_c" else 0.2
+    return w * mine + (1 - w) * (line + a * res + carry)
 
 
 def candidates(rows, meta, X, enso):

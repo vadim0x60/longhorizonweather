@@ -134,14 +134,26 @@ MAX_PER_LOC = 12          # CONTRACTS.md round 3: at most 12 claims per location
 #   halfway (A=.4, prior .015 K=30, CARRY=SOND=.1): +22 / +14, the only setting positive in both.
 #   Gating the ridge by its CV skill was much worse (-364 over 2009..2020).
 #   precipitation: round-5 setting +23 over 2009..2020; CARRY=0.1 gives +63 (8 of 12 years > 0).
+# Round 9 retune against the round-8 field (local arena, point duels net, X=1996..2007, 2009,
+# 2011..2023 odd; split 1996-2004 / 2005-2023):
+#   Gating the ridge by CV skill again lost (-88 vs -59 on temperatures; A=0 gives -200): the
+#   ridge helps even when its own CV skill is slightly negative, so A stays 0.4.
+#   Annual temperature windows were the weak spot (temp_mean_c ANN -19/-28, temp_mean_max_c ANN
+#   -14/+6); a 0.2 Sep-Nov carry for ANN windows only gives -7/+1 and -12/+17 (JJA keeps 0.1,
+#   where 0.2 costs 17). Against the round-7 field over X=2008..2022: -95 -> -88.
+#   precipitation: A=.4, C=.5, K=40, CARRY=.2 gives +97 (15 of 20 years > 0) vs +79 (13 of 20).
 PT_PARAMS = {"temp": (0.4, 1.0, 12, 0.015, 30.0, 0.1, 0.1),
-             "precip": (0.6, 0.4, 0, 0.0, 30.0, 0.1, 0.0),
+             "precip": (0.4, 0.5, 0, 0.0, 40.0, 0.2, 0.0),
              "count": (1.0, 0.3, 12, 0.0, 30.0, 0.0, 0.0)}
 # When the history reaches back before 1980 (X < 1995, via pre1980_monthly.csv) the 1964..79
 # decades were nearly flat, so a separate trend term only adds noise: temperature points use the
 # ridge (which has its own trend features) plus 0.1 x year X's residual from the trend line. In
 # duels vs the round-6 field over X=1985..1995: -12 with the round-5 temperature setting, +62 with
 # this; for X >= 1998 it would lose (-15 vs +1), so it is only used with the pre-1980 archive.
+# The round-9 precipitation setting lost on archive years (X=1985..1992 vs the round-6 field:
+# +5 with the round-8 setting, -17 with the new one), so it keeps the old one there.
+PT_PRECIP_PRE1980 = (0.6, 0.4, 0, 0.0, 30.0, 0.1, 0.0)
+PT_SOND_ANN = 0.2          # Sep-Nov carry for annual-window temperature points (see above)
 PT_TEMP_PRE1980 = (0.8, 0.0, 12, 0.0, 30.0, 0.1, 0.0)
 # Hot-day points from shifted daily highs (see point_value) beat the count-series formula in the
 # local arena for X=1985..1995 (-22 -> -2 on hot days over 1985-88, +43 net over 1985-95) but
@@ -657,7 +669,11 @@ def make_claims(days, meta, years, X, indices, log):
         params = PT_PARAMS[fam]
         if fam == "temp" and min(ys) < 1980 and not os.environ.get("P8_NO_EARLY"):
             params = PT_TEMP_PRE1980
+        if fam == "precip" and min(ys) < 1980:
+            params = PT_PRECIP_PRE1980
         A, C, nlo, prior, k, carry, sond_w = params
+        if params is PT_PARAMS["temp"] and win == "ANN":
+            sond_w = PT_SOND_ANN
         sl = (sl * n_sl + prior * k) / (n_sl + k)
         A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
         med = m + (A * (med - m) if med is not None else 0.0) + C * sl * (T - ym)
