@@ -20,9 +20,9 @@ Models each yearly target series y_t (one value per trailing year <= X) as
   variable), pooled across all locations and ridge-shrunk, on the detrended
   Sep-Dec anomaly of the preceding year.
 
-Point claims: 120 (6 per location: annual temp_mean/max/min, annual precip_sum,
-JJA and MAM temp_mean), values from point_value(), tuned in duels against the
-real Round 4 rivals (X=1985..2023). Then the best-ranked
+Point claims: 140 (7 per location: annual temp_mean/max/min, annual precip_sum,
+JJA, MAM and Jan-Feb temp_mean), values from point_value(), tuned in duels against
+the real Round 5 rivals (X=1985..2009, 2010..2023 held out). Then the best-ranked
 thresholds/booleans below, capped at 12 claims per location_id.
 
 Other claims are thresholds at the naive 15/16-year climatologies that trend and
@@ -264,7 +264,8 @@ MAX_PER_LOC = 12  # CONTRACTS.md Round 3
 # of duels with gap >= min_gap; on seasons a 50/50 blend with the 10-y mean duels best.
 BASE_VARS = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "precip_sum_mm")
 POINT_SPECS = [("year", "temp_mean_c"), ("year", "temp_mean_max_c"), ("year", "temp_mean_min_c"),
-               ("year", "precip_sum_mm"), ("jja", "temp_mean_c"), ("mam", "temp_mean_c")]
+               ("year", "precip_sum_mm"), ("jja", "temp_mean_c"), ("mam", "temp_mean_c"),
+               ("jf", "temp_mean_c")]
 PRECIP_RECENT_W = 0.3
 BOOL_PMIN = 0.70  # booleans near 0.6 lost more contradictions than they won in backtests
 
@@ -329,21 +330,54 @@ def fit_all(rows, meta, X, enso):
 SOND_RIDGE = 5.0
 
 
-def point_value(ys, vs, var, f, X, win):
-    """Point = 16-y climatology clim moved toward a forecast. Tuned in duels against the real
-    Round 4 rivals' point claims (X=1985..2023, verify duel rules, local truth):
-    * temperatures: clim + lam * (model - clim), lam = 0.05 * n_years capped at 0.8 for annual
-      windows (+148 / +74 / +49 for max / mean / min) and at 0.6 for seasons (JJA +32 vs +3);
-    * annual precipitation: clim + 0.3 * (mean of the last 3 years - clim), +70 vs -67 for the
-      Round 4 rule, positive in 1985-95, 1996-2009 and 2010-23 (ERA5 rainfall drifts; the
-      cycle/trend model adds noise there)."""
-    r = [v for y, v in zip(ys, vs) if y >= X - 15]
+def shrunk_line(ys, vs, X, prior, k=40.0):
+    """(value at X+1, residual of year X) of an OLS line whose slope is shrunk toward prior
+    with weight k / (n + k)."""
+    n = len(ys)
+    tb, yb = sum(ys) / n, sum(vs) / n
+    sxx = sum((y - tb) ** 2 for y in ys)
+    bo = sum((y - tb) * (v - yb) for y, v in zip(ys, vs)) / sxx if sxx else 0.0
+    b = n / (n + k) * bo + k / (n + k) * prior
+    return yb + b * (X + 1 - tb), vs[-1] - (yb + b * (X - tb))
+
+
+def sond_series(lr, X, var):
+    years = sorted(y for y in {int(d[:4]) for d in lr} if y <= X)
+    ys, vs = yearly_series(lr, years, (9, 1, 12, 31), var)
+    return dict(zip(ys, vs))
+
+
+def point_value(ys, vs, var, f, X, win, sond=None):
+    """Point forecast for a duel (closer to truth wins). Built from three pieces, mixed per
+    target by duels against the real Round 5 rivals' points (tuned on X=1985..2009, checked
+    on 2010..2023 held out, verify duel rule, local truth):
+    * mine: 16-y climatology clim + lam * (model - clim), lam = 0.05 n capped at 0.8 (annual)
+      or 0.6 (seasons); precipitation clim + 0.3 * (last-3-year mean - clim);
+    * line: 16-y OLS line with slope shrunk toward 0.03 C/y (temps) or 0 (precip), k = 40,
+      plus a damped (0.2) year-X residual (predict4's form);
+    * sond: 0.2 x year X's Sep-Dec residual of the same variable from that line.
+    Annual temps use 0.5 mine + 0.5 (line + sond), annual temp_mean_min 0.3 mine + 0.7 (line + sond),
+    JJA/Jan-Feb mine + sond, MAM mine, annual precipitation 0.7 mine + 0.3 line."""
+    sel = [(y, v) for y, v in zip(ys, vs) if y >= X - 15]
+    r = [v for _, v in sel]
     clim = sum(r) / len(r)
     if var == "precip_sum_mm":
         recent = r[-3:]
-        return max(0.0, clim + PRECIP_RECENT_W * (sum(recent) / len(recent) - clim))
-    lam = min(0.8 if win == "year" else 0.6, 0.05 * len(r))
-    return clim + lam * (f["mu"] - clim)
+        mine = clim + PRECIP_RECENT_W * (sum(recent) / len(recent) - clim)
+        line, res = shrunk_line([y for y, _ in sel], r, X, 0.0)
+        return max(0.0, 0.7 * mine + 0.3 * (line + 0.2 * res))
+    mine = clim + min(0.8 if win == "year" else 0.6, 0.05 * len(r)) * (f["mu"] - clim)
+    carry = 0.0
+    if sond and X in sond and len(sond) >= 3:
+        sy = sorted(y for y in sond if y >= X - 15)
+        carry = 0.2 * shrunk_line(sy, [sond[y] for y in sy], X, 0.03)[1]
+    if win == "mam":
+        return mine
+    if win != "year":
+        return mine + carry
+    line, res = shrunk_line([y for y, _ in sel], r, X, 0.03)
+    w = 0.3 if var == "temp_mean_min_c" else 0.5
+    return w * mine + (1 - w) * (line + 0.2 * res + carry)
 
 
 def candidates(rows, meta, X, enso):
@@ -375,7 +409,7 @@ def candidates(rows, meta, X, enso):
                 model = (f"trend {f['trend']:+.3f}/y, AR phi={f['phi']:.2f},{cyc} fcst {f['mu']:.2f}"
                          f"±{f['sigma']:.2f}")
                 if (win, var) in POINT_SPECS:
-                    pv = point_value(ys, vs, var, f, X, win)
+                    pv = point_value(ys, vs, var, f, X, win, sond_series(rows[loc], X, var))
                     out.append((1.0, ("point", var, wclass(win)), {
                         "target": target(loc, win, var),
                         "assertion": {"kind": "point", "value": round(pv, 2 if var in TEMP_VARS else 1)},

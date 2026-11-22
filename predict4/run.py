@@ -32,6 +32,10 @@ predictors run offline for X = 1985..1995 and 2003..2023 with a full 16-year his
 candidate formula scored by verify's duel rule against their actual point values and the real
 X+1. Plain 16-year climatology (used in Round 4) lost badly in the fast-warming 2003..2023 era.
 
+When the 16-year window reaches before 1980 (X < 1995), where datacollect has no data, the
+earlier years come from predict4/data/monthly_pre1980.csv (ERA5 monthly aggregates for
+1964..1979, built once by build_pre1980.py). In the arena this added +15 over X = 1985..1990.
+
 Each location gets up to POINTS_PER_LOCATION point claims on the most commonly shared targets,
 then calibrated threshold/boolean claims fill up to 12 per location and 150 in total.
 Runs offline, stdlib only.
@@ -155,6 +159,38 @@ def load_daily(data_dir: Path, year_x: int):
                     except (KeyError, ValueError):
                         pass
     return daily, coords
+
+
+PRE1980_CSV = Path(__file__).resolve().parent / "data" / "monthly_pre1980.csv"
+USE_PRE1980 = True
+PRE1980_VARS = {"temp_mean_c", "temp_mean_max_c", "temp_mean_min_c", "precip_sum_mm"}
+MONTH_WINDOWS = {"year": range(1, 13), "jja": range(6, 9), "sond": range(9, 13)}
+
+
+def load_pre1980(year_x: int) -> dict:
+    """{(location_id, variable, window): {year: value}} from the bundled 1964..1979 monthly file
+    (built by build_pre1980.py; every row is before 1980, so before any year X)."""
+    if not USE_PRE1980 or not PRE1980_CSV.exists():
+        return {}
+    months = defaultdict(dict)
+    with PRE1980_CSV.open(newline="") as fh:
+        for r in csv.DictReader(fh):
+            y, m = int(r["month"][:4]), int(r["month"][5:7])
+            if y <= year_x:
+                months[(r["location_id"], y)][m] = r
+    out = defaultdict(dict)
+    for (loc, y), mm in months.items():
+        for wname, ms in MONTH_WINDOWS.items():
+            if not all(m in mm for m in ms):
+                continue
+            days = sum(int(mm[m]["days"]) for m in ms)
+            for var in PRE1980_VARS:
+                if var == "precip_sum_mm":
+                    v = sum(float(mm[m][var]) for m in ms)
+                else:
+                    v = sum(float(mm[m][var]) * int(mm[m]["days"]) for m in ms) / days
+                out[(loc, var, wname)][y] = v
+    return out
 
 
 def claim_coords(loc: str, csv_coords):
@@ -321,6 +357,7 @@ def point_forecast(series: dict, year_x: int, variable: str, wname: str, sond: d
 
 def build_claims(year_x: int, daily, coords):
     y1 = year_x + 1
+    pre1980 = load_pre1980(year_x)
     candidates, points = [], []
 
     def add(loc, wname, variable, assertion, p, rationale, out=None):
@@ -358,11 +395,13 @@ def build_claims(year_x: int, daily, coords):
         for variable, wname in POINT_JOBS:
             if n_points >= POINTS_PER_LOCATION:
                 break
-            s = series(variable, wname)
+            # Years before 1980 (outside datacollect's history) come from the bundled file.
+            s = {**pre1980.get((loc, variable, wname), {}), **series(variable, wname)}
             if variable in COUNT_VARS and (not s or statistics.mean(s.values()) < 3):
                 continue  # near-zero counts make uninformative duels
-            pf = point_forecast(s, year_x, variable, wname,
-                                series(variable, "sond") if variable in TEMP_VARS else None)
+            sond = ({**pre1980.get((loc, variable, "sond"), {}), **series(variable, "sond")}
+                    if variable in TEMP_VARS else None)
+            pf = point_forecast(s, year_x, variable, wname, sond)
             if pf is None:
                 continue
             value, mean, sd = pf

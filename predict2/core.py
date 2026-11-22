@@ -154,6 +154,7 @@ def build_ensemble(loc, year_x, windows, params=Params, regime_shift=0.0):
                 smd, emd = window_md(*w)
                 st = window_stats(days[y], smd, emd, sh, math.exp(z * pjit))
                 if st is not None:
+                    st["year"] = y
                     ens[w].append((wgt, st))
     info = {"slope": slope, "resid_x": resid_x, "target_level": target_level, "n_years": len(yrs)}
     return ens, info

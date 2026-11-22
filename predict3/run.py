@@ -18,18 +18,21 @@ Offline, stdlib-only statistical forecaster for year X+1:
       - 100 `point` claims for ANN/JJA temp_mean_c and ANN precip_sum_mm,
         temp_mean_max_c, temp_mean_min_c at all 20 locations. Point = clim +
         lambda*(median - clim), lambda = 1 with >= 16 years of record, else 0.67*n/16:
-        short records (X near 1980) give noisy trends that lost Round 4 (X=1987);
+        short records (X near 1980) give noisy trends that lost Round 4 (X=1987).
+        Precipitation points use clim + 0.3*(last-3-year mean - clim) instead;
       - directional thresholds halfway between the trailing climatology and our
         median, only when P >= 0.65;
       - warmer/wetter-than-year-X booleans when P >= 0.65; hottest/wettest month.
     Non-point claims are ranked by how many rival claims a target attracts (POP,
     measured offline on past years) times the expected net margin.
 
-Dev-time evaluation (rivals' Round 4 code run offline with Tinker off, scored by
-verify/run.py on locally collected truth), split by era to avoid fitting one decade:
-X=1985..1995 +58, X=1998..2023 +695 (odd years +485, even +268). The simulation
-reproduces live Round 4 (X=1987: -34 simulated vs -37 live with the previous settings;
-+8 with these). Trend prior sd 0.015 beat 0.01 and 0.03 across both eras.
+Dev-time evaluation (rivals' Round 5 code run offline with Tinker off, scored by
+verify/run.py on locally collected truth, X=1985..1995 and 1998..2023):
+  Round 5 settings                        early +10  late +307  total +317
+  + own-column Sep-Dec carry-over         early  +2  late +413  total +415
+  + precip point clim + 0.3*(last3-clim)  early +33  late +436  total +469 (odd +351, even +118)
+The simulation reproduces live Round 5 (X=1985: predict4 -9, predict6 -2, as scored live);
+these settings give +7 there.
 Model ablations: Sep-Dec persistence clearly helps; per-location ENSO fits hurt;
 pooled ENSO is neutral-to-slightly-positive for temperature.
 
@@ -55,6 +58,8 @@ LAMBDA = 0.5             # threshold position between climatology (0) and our me
 THRESHOLD_WEIGHT = 0.3   # base ranking weight of threshold claims relative to booleans
 SIGMA_INFLATE = 1.00     # calibrated so out-of-sample z-scores have ~unit spread (backtests X=2006..2023)
 PHI_MAX = 0.7            # cap on pooled persistence coefficient
+SOND_OWN = True          # carry over the variable's own Sep-Dec column (vs Sep-Dec mean temperature): +98 in the arena
+PRECIP_RECENT_W = 0.3    # precip point = clim + w * (last-3-year mean - clim), as in predict6: +54 vs model median
 OWN_LAG = True           # pooled lag-1 persistence of each variable's own detrended anomaly
 RHO_MAX = 0.6
 USE_ENSO = True          # pooled ENSO term, temperature variables only (backtest: small gain 2015-2023, neutral 2006-2014)
@@ -249,23 +254,26 @@ def build(X, daily, nino):
         v = [nino.get(f"{y}-{m:02d}") for m in (10, 11, 12)]
         if all(x is not None for x in v):
             nino_ond[y] = sum(v) / 3
-    sond = {}  # loc -> {year: Sep-Dec mean temp}
-    for loc in locs:
-        sond[loc] = {}
-        for y in years_all:
-            vals = window_values(daily[loc], y, "09-01", "12-31", "temperature_2m_mean")
-            if vals:
-                sond[loc][y] = sum(vals) / len(vals)
-    sond_anom = {}
-    for loc in locs:
-        ys = sorted(sond[loc])
-        _, _, res, _, _ = fit_trend(ys, [sond[loc][y] for y in ys], True)
-        sond_anom[loc] = dict(zip(ys, res))
+    # Detrended Sep-Dec anomaly of year y, per daily column (each temperature variable can carry
+    # over its own column's late-year anomaly: max temps persist differently from mean temps).
+    sond_by_col = {}
+    for col in ("temperature_2m_mean", "temperature_2m_max", "temperature_2m_min"):
+        sond_by_col[col] = {}
+        for loc in locs:
+            ser = {}
+            for y in years_all:
+                vals = window_values(daily[loc], y, "09-01", "12-31", col)
+                if vals:
+                    ser[y] = sum(vals) / len(vals)
+            ys = sorted(ser)
+            _, _, res, _, _ = fit_trend(ys, [ser[y] for y in ys], True)
+            sond_by_col[col][loc] = dict(zip(ys, res))
 
     models = {}
     for wkey, var in PAIRS:
         start_md, end_md = WINDOWS[wkey]
         col, agg, tf, _ = CONT_VARS[var]
+        sond_anom = sond_by_col[col if SOND_OWN and col in sond_by_col else "temperature_2m_mean"]
         per_loc = {}
         for loc in locs:
             ser = {}
@@ -428,6 +436,10 @@ def make_claims(X, daily, meta, models):
             n = len(m["raw"])
             lam = 1.0 if n >= n_full else short_scale * n / n_full  # short records: trust trends less
             pv = clim + lam * (med - clim)
+            if var == "precip_sum_mm" and PRECIP_RECENT_W is not None:
+                # ERA5 rainfall drifts over a few years; the last 3 years beat the sqrt-space model here.
+                recent = [m["raw"][y] for y in sorted(m["raw"])[-3:]]
+                pv = clim + PRECIP_RECENT_W * (sum(recent) / len(recent) - clim)
             add(POINT_PRIORITY + pop, loc, wkey, var, {"kind": "point", "value": round(pv, 2)}, POINT_CONF,
                 f"point = climatology {clim:.2f} + {lam:.2f} x (median {med:.2f} - climatology) ({ann})")
         elif pop:

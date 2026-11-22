@@ -42,9 +42,12 @@ POINTS = [("year", "temp_mean_c", 1.0), ("year", "precip_sum_mm", 1.0), ("year",
           ("jf", "temp_mean_c", 0.5)]
 # Point value = clim16 + LAMBDA * (ensemble median - clim16). Rivals shrink toward the trailing
 # 16-year mean too; in point duels against them these weights beat both the raw median and clim16.
-LAMBDA = {"precip_sum_mm": 0.5, "hot_days_ge_30c": 1.0}
-LAMBDA_TEMP = float(os.environ.get("P2_LT", "0.25"))
+LAMBDA = {"precip_sum_mm": float(os.environ.get("P2_LP", "0.5")), "hot_days_ge_30c": 1.0}
+LAMBDA_TEMP = float(os.environ.get("P2_LT", "0.4"))  # 0.25 -> 0.4: replay +55 -> +63, X=1995-2023 MAE 0.533 -> 0.519
 POINT_BASE = os.environ.get("P2_BASE", "focal")
+PRECIP_RECENT = ("precip_sum_mm",)
+PRECIP_BASE = os.environ.get("P2_PB", "clim16")  # short post-1980 means mislead early years; replay -14 -> +10
+PRECIP_MIN_YEAR = int(os.environ.get("P2_PMY", "0"))
 EPS = 0.01  # threshold margin so "le m" / "gt m" stay disjoint from rivals' gt/le at m
 TEMP3 = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c")
 # relative value of a claim type: how likely it is to be contested and won
@@ -191,14 +194,16 @@ def main():
         wmap = {wname: (s, e) for wname, s, e in W}
         for rank, (wname, var, val) in enumerate(POINTS):
             w = wmap[wname]
-            pairs = [(st[var], wt) for wt, st in ens[w] if st.get(var) is not None]
+            pairs = [(st[var], wt) for wt, st in ens[w]
+                     if st.get(var) is not None and (var not in PRECIP_RECENT or st["year"] >= PRECIP_MIN_YEAR)]
             if len(pairs) < 15:
                 continue
             if var in core.COUNT_VARS and core.wquantile(pairs, 0.8) < MIN_GAP[var]:
                 continue  # near-zero count: no rival can be 2 days away on the right side
             fm = focal_means(loc, X, (wname,) + w, var)
             med = core.wquantile(pairs, 0.5)
-            base_v = clim16(loc, X, w, var) if POINT_BASE == "clim16" else (fm[0] if fm else None)
+            use16 = POINT_BASE == "clim16" or (var == "precip_sum_mm" and PRECIP_BASE == "clim16")
+            base_v = clim16(loc, X, w, var) if use16 else (fm[0] if fm else None)
             if base_v is not None:
                 med = base_v + LAMBDA.get(var, LAMBDA_TEMP) * (med - base_v)
             hist = seq_history(loc, X, w, var)

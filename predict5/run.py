@@ -102,6 +102,11 @@ POINT_PLAN = [
 # been under-forecasting the last WF_YEARS years.
 DAMPINGS = (0.5, 0.75, 1.0, 1.25, 1.5)
 DEFAULT_DAMPING = 0.5
+# Weight of year X's Sep-Dec departure from its own shrunk trend, added to temperature points
+# (late-year ocean/ENSO anomalies persist). Round 6 backtest vs the round-5 rival field,
+# X = 1985..2023: none +277, fixed 0.1 +606 (X <= 1995 +76, 1996+ +530), 0.2 +548, 0.3 +530;
+# letting the walk-forward choose from {0, 0.2, 0.4} gave +322 (X <= 1995 -2).
+SOND_CARRY = (0.1,)
 PERSISTENCE = (0.0,)     # share of year X's departure from trend carried into X+1
 POINT_ONLY_VARS = ()     # variables claimed only as points
 WF_YEARS = 10
@@ -228,11 +233,23 @@ def window_kind(wname):
     return "quarter" if wname[0] == "Q" else "month"
 
 
+def sond_resid(sond, year, prior, pw):
+    """Year's Sep-Dec departure from the shrunk trend of Sep-Dec over the 16 years up to it; 0 if unknown."""
+    if not sond:
+        return 0.0
+    sub = [(t, v) for t, v in zip(*sond) if year - 15 <= t <= year]
+    if len(sub) < MIN_YEARS or sub[-1][0] != year:
+        return 0.0
+    sy, sv = [t for t, _ in sub], [v for _, v in sub]
+    fit = trend_forecast(sy, sv, year + 1, prior, pw)[3]
+    return sv[-1] - fit(year)
+
+
 def point_damping(items, enso, x):
     """Per (variable, window kind), the share lambda of the trend + ENSO departure from the 15-year
     mean that minimized pooled absolute error in a walk-forward backtest over target years
     x-WF_YEARS+1 .. x, each forecast only from years before it. Uses data <= x only."""
-    grid = [(lm, kp) for lm in DAMPINGS for kp in PERSISTENCE]
+    grid = [(lm, kp, kc) for lm in DAMPINGS for kp in PERSISTENCE for kc in SOND_CARRY]
     err = defaultdict(lambda: [0.0] * len(grid))
     for it in items:
         yrs, ys, var = it["yrs"], it["ys"], it["var"]
@@ -249,13 +266,14 @@ def point_damping(items, enso, x):
                 pred += enso_adjust(sy, sv, fit, {k: v for k, v in enso.items() if k < t}, t - 1)[0]
             acc = err[(var, it["wk"])]
             last_resid = sv[-1] - fit(sy[-1]) if sy[-1] == t - 1 else 0.0
-            for i, (lm, kp) in enumerate(grid):
-                v = base + lm * (pred - base) + kp * last_resid
+            sr = sond_resid(it.get("sond"), t - 1, it["prior"], it["pw"])
+            for i, (lm, kp, kc) in enumerate(grid):
+                v = base + lm * (pred - base) + kp * last_resid + kc * sr
                 if var not in TEMP_VARS:
                     v = max(v, 0.0)
                 acc[i] += abs(v - ys[j])
     # ties: prefer more trend, then less persistence
-    return {k: grid[min(range(len(grid)), key=lambda i: (v[i], -grid[i][0], grid[i][1]))]
+    return {k: grid[min(range(len(grid)), key=lambda i: (v[i], -grid[i][0], grid[i][1], grid[i][2]))]
             for k, v in err.items() if any(v)}
 
 
@@ -287,7 +305,12 @@ def build_pool(locs, x, enso=None):
                     prior = (0.02 if var == "hot_days_ge_30c" else -0.02) * base
                     pw = COUNT_PRIOR_WEIGHT_YEARS
                 pred, sd, b, fit = trend_forecast(yrs, ys, target_year, prior, pw)
-                items.append(dict(lid=lid, loc=loc, wname=wname, s=s, e=e, wk=window_kind(wname),
+                sond = None
+                if var in TEMP_VARS and SOND_CARRY != (0.0,):
+                    sser = [(yr, stat(days, window_days(yr, "09-01", "12-31"), var)) for yr in hist_years]
+                    sser = [(t, v) for t, v in sser if v is not None]
+                    sond = ([t for t, _ in sser], [v for _, v in sser])
+                items.append(dict(sond=sond, lid=lid, loc=loc, wname=wname, s=s, e=e, wk=window_kind(wname),
                                   var=var, yrs=yrs, ys=ys, base=base, pred=pred, sd=sd, b=b, fit=fit,
                                   prior=prior, pw=pw))
     lam = point_damping(items, enso, x)
@@ -301,15 +324,16 @@ def build_pool(locs, x, enso=None):
         if var not in TEMP_VARS:
             pred = max(pred, 0.0)
         # Point forecast: 15y mean plus the walk-forward-chosen share of the trend + ENSO departure.
-        lm, kp = lam.get((var, wk), (DEFAULT_DAMPING, 0.0))
-        pv = base + lm * (pred - base) + kp * (ys[-1] - it["fit"](yrs[-1]))
+        lm, kp, kc = lam.get((var, wk), (DEFAULT_DAMPING, 0.0, 0.0))
+        pv = (base + lm * (pred - base) + kp * (ys[-1] - it["fit"](yrs[-1]))
+              + kc * sond_resid(it["sond"], x, it["prior"], it["pw"]))
         if var not in TEMP_VARS:
             pv = max(pv, 0.0)
         out.append(_cand(lid, loc, wname, s, e, var,
                          {"kind": "point", "value": round(pv, 2 if var in TEMP_VARS else 1)}, 1.0,
                          f"{var}|point|{wk}",
                          f"point forecast: 15y mean {base:.2f}, trend {b * 10:+.2f}/decade,"
-                         f" ENSO lag {shift:+.2f}, damping {lm:.2f}, persistence {kp:.2f} (walk-forward) -> {pv:.2f}"))
+                         f" ENSO lag {shift:+.2f}, damping {lm:.2f}, persistence {kp:.2f}, Sep-Dec carry {kc:.2f} (walk-forward) -> {pv:.2f}"))
         if var in POINT_ONLY_VARS:
             continue
         if var in TEMP_VARS:

@@ -106,6 +106,15 @@ TC = {
     "temp_mean_max_c": (0.5, 60.0, 0.15),
     "temp_mean_min_c": (0.5, 60.0, 0.15),
 }
+# Round 6: a third component, a damped trend-residual forecast (16 data-dir years):
+#   line = clim16 + b * (X+1 - mid-year), b = n/(n+40) * OLS + 40/(n+40) * 0.03,
+#   p4 = line + 0.2 * (year X - its value on the line) + 0.2 * Sep-Dec anomaly.
+# Final temperature-mean point = 0.25 * round-4 rule + 0.25 * tc + 0.5 * p4. Against
+# the round-5 field over X = 1985..2023 this netted +501 (1985-2003 +209, 2004-2023
+# +292) vs +340 for the round-5 0.5/0.5 blend, positive on every target in both eras;
+# neighbouring weights (0.15..0.3) all scored +480..+501.
+BLEND = (0.25, 0.25, 0.5)
+P4 = (0.03, 40.0, 0.2, 0.2)  # (prior slope, prior strength k, residual carry, Sep-Dec carry)
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRE1980 = os.path.join(HERE, "pre1980_monthly.csv")
 GAP_HINT = {"temp_mean_c": 0.25, "temp_mean_max_c": 0.25, "temp_mean_min_c": 0.25,
@@ -557,6 +566,17 @@ def tc_point(var, years, vals, pre, target_year, anom):
     return clim + s * (target_year - sum(years) / len(years)) + c * anom, s
 
 
+def residual_point(years, vals, target_year, anom):
+    prior, k, a, cs = P4
+    n = len(years)
+    tb, yb = sum(years) / n, sum(vals) / n
+    sxx = sum((t - tb) ** 2 for t in years)
+    b_ols = sum((t - tb) * (v - yb) for t, v in zip(years, vals)) / sxx if sxx else 0.0
+    b = n / (n + k) * b_ols + k / (n + k) * prior
+    resid = vals[-1] - (yb + b * (years[-1] - tb)) if years[-1] == target_year - 1 else 0.0
+    return yb + b * (target_year - tb) + a * resid + cs * anom
+
+
 def sep_dec_anomaly(days, hist_years, year_x):
     ser = window_series(days, "09-01", "12-31", hist_years)
     yr = yearly("temp_mean_c", ser)
@@ -635,11 +655,13 @@ def build_claims(year_x, data_dir):
                         if var in TC:
                             pre = pre1980_series(pre_all.get(lid, {}), s_md, e_md, var)
                             tcv, slope = tc_point(var, yrs, vals, pre, target, anom)
-                            w = TC[var][0]
-                            pv = round(w * pv + (1 - w) * tcv, 2)
-                            pwhy = (f"{w:.2f} x [{pwhy}] + {1 - w:.2f} x trend-corrected clim "
+                            rpv = residual_point(yrs, vals, target, anom)
+                            w1, w2, w3 = BLEND
+                            pv = round(w1 * pv + w2 * tcv + w3 * rpv, 2)
+                            pwhy = (f"{w1:.2f} x [{pwhy}] + {w2:.2f} x trend-corrected clim "
                                     f"{tcv:.2f} (slope {slope:+.3f}/yr over {len(pre)} pre-1980 + "
-                                    f"{len(yrs)} recent yrs)")
+                                    f"{len(yrs)} recent yrs) + {w3:.2f} x damped trend-residual "
+                                    f"{rpv:.2f}")
                         points.append((POINT_WIN[tag] * POINT_PRIO[var], {
                             "target": {"location_id": lid, "lat": lat, "lon": lon,
                                        "window_start": ws, "window_end": we, "variable": var},

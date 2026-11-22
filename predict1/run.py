@@ -51,12 +51,18 @@ POINT_TARGETS = [("year", "temp_mean_max_c"), ("year", "temp_mean_c"), ("year", 
                  ("year", "precip_sum_mm"), ("year", "temp_mean_min_c"), ("jf", "temp_mean_c"),
                  ("jja", "temp_mean_c"), ("jja", "precip_sum_mm"), ("m07", "temp_mean_c"),
                  ("year", "temp_max_c"), ("son", "temp_mean_c"), ("q4", "temp_mean_c")]
-# Weight on the 15-year mean/trend blend in point forecasts, tuned against rivals'
-# round-3 point claims over 14 held-out years: temperatures do best at the long-history
-# median; precipitation totals at the recent-window blend (ERA5 rain drifts over decades).
-POINT_SHRINK = {"temp_mean_c": 0.0, "temp_mean_max_c": 0.0, "temp_max_c": 0.0,
-                "precip_sum_mm": 1.0, "precip_max_day_mm": 0.5,
-                ("temp_mean_c", "jja"): 0.25}  # summer means: pure median lost (-8/474), 0.25 won in both eras
+# Point forecast = (1 - a - b) * ensemble median + a * 15-yr mean/trend blend
+#                 + b * damped 16-yr trend line (see Forecaster.damped_trend).
+# (a, b) per (variable, window), else per variable, else POINT_MIX_DEFAULT. Tuned against
+# rivals' round-5 point claims over 19 held-out years (1981..2022), keeping only choices
+# that won in both eras (before / from 1995). Temperatures need the long-history median;
+# precipitation totals drift over decades, so they lean on the recent windows.
+POINT_MIX_DEFAULT = (0.25, 0.0)
+POINT_MIX = {"temp_mean_max_c": (0.0, 0.0), "temp_max_c": (0.0, 0.0),
+             ("temp_mean_c", "year"): (0.0, 0.5), ("temp_mean_c", "jf"): (0.0, 0.5),
+             ("temp_mean_c", "jja"): (0.0, 0.25), "temp_mean_c": (0.0, 0.0),
+             "temp_mean_min_c": (0.0, 0.5),
+             "precip_sum_mm": (0.5, 0.5), "precip_max_day_mm": (0.5, 0.0)}
 MIN_P = 0.7  # offensive bets only with a real edge: backtests vs. rivals' claims lose below ~0.7
 DEF_W = 0.5  # weight of "honeypot" value: a likely-true claim on a target rivals often claim
 WIN_PRIOR = {"year": 0.3, "jja": 0.2, "mam": 0.1, "son": 0.1, "jf": 0.05}
@@ -513,9 +519,24 @@ class Forecaster:
         ys = [y for y in sorted(ser) if self.X - 15 <= y <= self.X]
         vs = [ser[y] for y in ys]
         half = 0.5 * sum(vs) / len(vs) + 0.5 * ols_predict(ys, vs, self.X + 1)
-        a = POINT_SHRINK.get((var, wname), POINT_SHRINK.get(var, 0.25))
-        v = (1 - a) * d.q(0.5) + a * half
+        a, b = POINT_MIX.get((var, wname), POINT_MIX.get(var, POINT_MIX_DEFAULT))
+        v = (1 - a - b) * d.q(0.5) + a * half + (b * self.damped_trend(ser, var, wname) if b else 0.0)
         return max(0.0, v) if (var in COUNT_VARS or var.startswith("precip")) else v
+
+    def damped_trend(self, ser, var, wname):
+        """Trailing 16-year trend line at X+1 with its slope shrunk toward a prior
+        (0.03/yr for temperatures, 0 otherwise; weight n/(n+40)), plus a damped share of
+        year X's residual from that line (0.1 for JJA, else 0.2)."""
+        s = {y: v for y, v in ser.items() if self.X - 15 <= y <= self.X}
+        ys = sorted(s)
+        n = len(ys)
+        tb, yb = sum(ys) / n, sum(s.values()) / n
+        sxx = sum((y - tb) ** 2 for y in ys)
+        b_ols = sum((y - tb) * (s[y] - yb) for y in ys) / sxx if sxx else 0.0
+        prior = 0.03 if var.startswith("temp") else 0.0
+        slope = n / (n + 40) * b_ols + 40 / (n + 40) * prior
+        carry = 0.1 if wname == "jja" else 0.2
+        return yb + slope * (self.X + 1 - tb) + carry * (s[self.X] - (yb + slope * (self.X - tb)))
 
     def p_bool(self, loc, wname, bvar):
         """P(warmer/wetter than year X) and the year-X value."""
@@ -748,7 +769,7 @@ def build_claims(F, opp):
             ws, we = month_window(Y, m1, m2)
             tgt = {"location_id": loc, "lat": lat, "lon": lon, "window_start": ws, "window_end": we, "variable": var}
             by_loc[loc].append((tgt, {"kind": "point", "value": round(pv, 2)}, 0.5,
-                                f"point forecast (median / 15-yr blend per POINT_SHRINK); sd {d.s:.2f}"))
+                                f"point forecast (median / 15-yr blend / damped trend per POINT_MIX); sd {d.s:.2f}"))
             point_keys.add((loc, wname, var))
     # 2) remaining slots: honeypot / offensive claims, ranked by expected contradiction gain
     cands.sort(key=lambda c: (-round(c[0], 4), -c[1]))

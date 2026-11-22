@@ -130,6 +130,25 @@ class Predict4Tests(unittest.TestCase):
         # The shrunk trend undershoots the true 0.15/yr warming: below naive extrapolation.
         self.assertLess(annual["assertion"]["value"], statistics.mean(daily_mean(lambda d: d.year == X).values()) + 0.15)
 
+    def test_pre1980_windows(self):
+        # Two months of JJA-style data: day-weighted temperature means, precip sums; no year > X.
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "m.csv"
+            rows = ["location_id,month,days,temp_mean_c,temp_mean_max_c,temp_mean_min_c,precip_sum_mm"]
+            for m, days, t, pr in ((6, 30, 10.0, 5.0), (7, 31, 20.0, 7.5), (8, 31, 30.0, 1.0)):
+                rows += [f"london_uk,1975-{m:02d},{days},{t},{t + 4},{t - 4},{pr}",
+                         f"london_uk,1976-{m:02d},{days},{t},{t + 4},{t - 4},{pr}"]
+            p.write_text("\n".join(rows) + "\n")
+            old = P4.PRE1980_CSV
+            P4.PRE1980_CSV = p
+            self.addCleanup(setattr, P4, "PRE1980_CSV", old)
+            pre = P4.load_pre1980(1975)
+        jja = pre[("london_uk", "temp_mean_c", "jja")]
+        self.assertEqual(list(jja), [1975])  # 1976 is after year_x
+        self.assertAlmostEqual(jja[1975], (30 * 10 + 31 * 20 + 31 * 30) / 92)
+        self.assertAlmostEqual(pre[("london_uk", "precip_sum_mm", "jja")][1975], 13.5)
+        self.assertNotIn(("london_uk", "temp_mean_c", "year"), pre)  # incomplete year
+
     def test_ignores_rows_after_year_x(self):
         a = self.run_p4(leak_value=99.0)
         b = self.run_p4(leak_value=-50.0)

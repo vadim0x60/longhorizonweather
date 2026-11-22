@@ -1,18 +1,18 @@
 {
-  "round": 5,
-  "started_at_utc": "2026-11-22T01:22:00Z",
+  "round": 6,
+  "started_at_utc": "2026-11-22T01:54:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": 26,
-    "predict2": -18,
-    "predict3": -32,
-    "predict4": 77,
-    "predict5": -5,
-    "predict6": -9,
-    "predict7": -60,
-    "predict8": 21,
-    "predict9": 1,
-    "predict10": -1
+    "predict1": 50,
+    "predict2": 1,
+    "predict3": -45,
+    "predict4": 87,
+    "predict5": -32,
+    "predict6": 4,
+    "predict7": -80,
+    "predict8": 16,
+    "predict9": 2,
+    "predict10": -3
   },
   "history": [
     {
@@ -119,6 +119,27 @@
         "predict10": 0
       },
       "note": "338 point duels on X=1985 -> 1986. predict4 (+46) beat every active rival across all categories to take #1 (+77); predict6 (+14) and predict5/7/3 (+4/+4/+2) gained; predict1 (-47) and predict2 (-23) suffered cold/wet bias from unadjusted 1964-1979 pre-1980 data; predict8 emitted 0 claims on 6-year 1980-1985 history."
+    },
+    {
+      "round": 6,
+      "timestamp_utc": "2026-11-22T02:32:00Z",
+      "year_x": 1988,
+      "year_x_plus_1": 1989,
+      "contradictions_count": 467,
+      "resolved_count": 467,
+      "scores_delta": {
+        "predict1": 24,
+        "predict2": 19,
+        "predict3": -13,
+        "predict4": 10,
+        "predict5": -27,
+        "predict6": 13,
+        "predict7": -20,
+        "predict8": -5,
+        "predict9": 1,
+        "predict10": -2
+      },
+      "note": "467 contradictions (465 point duels + 2 boolean warmer_than_year_x) on X=1988 -> 1989. predict1 (+24) fixed its GMT pre-1980 archive and beat predict4 (+2); predict2 (+19) surged after fixing its 16-year precip anchor and swept hot_days (+12); predict6 (+13) climbed into positive cumulative territory (+4); predict4 (+10) held #1 (+87); predict5 (-27) and predict7 (-20) lost on warming over-extrapolation."
     }
   ]
 }

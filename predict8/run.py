@@ -5,6 +5,9 @@ For year X, reads only <data_dir>/daily_history.csv and the optional
 <data_dir>/indices_monthly.json (both strictly <= X-12-31) and emits claims about
 year X+1.
 
+For X < 1995, histories are extended back to 16 years with predict8/pre1980_monthly.csv
+(monthly ERA5 aggregates for 1964..1979, built by build_pre1980.py; all dated before 1980).
+
 Model. Per variable and window group (annual, season/quarter, month) one pooled
 ridge model is fit across all locations and windows on standardized anomalies
 z = (s_t - clim_<t) / sd_<t, with causal features from years < t only:
@@ -125,8 +128,8 @@ MAX_PER_LOC = 12          # CONTRACTS.md round 3: at most 12 claims per location
 #   precipitation keeps the round-4 setting A=.6 C=.4 (odd +105 / even +95, best on both halves);
 #   day counts A=1 C=.3 NLO=12 (odd +49 / even -2; round-4 setting +3 / -6).
 PT_PARAMS = {"temp": (0.8, 1.0, 12), "precip": (0.6, 0.4, 0), "count": (1.0, 0.3, 12)}
-PT_PRIOR = 0.0
-PT_K = 30.0
+PT_PRIOR = float(os.environ.get("P8_PT_PRIOR", "0.0"))
+PT_K = float(os.environ.get("P8_PT_K", "30"))
 POINTS_PER_LOC = 6        # point claims per city (>= 60 point claims required overall)
 # point-forecast targets and their priority (how much we trust the model there x popularity)
 # priority = net duel score per target vs rivals' round-4 points (odd X = 1987..2011):
@@ -135,6 +138,10 @@ POINTS_PER_LOC = 6        # point claims per city (>= 60 point claims required o
 POINT_TARGETS = {("precip_sum_mm", "ANN"): 1.0, ("temp_mean_min_c", "ANN"): 0.9,
                  ("temp_mean_c", "ANN"): 0.85, ("temp_mean_c", "JJA"): 0.8,
                  ("hot_days_ge_30c", "ANN"): 0.7, ("temp_mean_max_c", "ANN"): 0.65}
+# extra point targets used only when the history is too short for any CV fit (X <= ~1988), where
+# no boolean/threshold claims are possible, so every city still gets POINTS_PER_LOC points
+SHORT_POINT_TARGETS = {("temp_max_c", "ANN"): 0.3, ("rainy_days_ge_1mm", "ANN"): 0.25,
+                       ("temp_min_c", "ANN"): 0.2, ("precip_sum_mm", "JJA"): 0.15}
 MODELS = ["clim", "trend", "full", "tele", "tele2"]
 LAMBDA = {"trend": 0.05, "full": 0.2, "tele": 0.4, "tele2": 0.8}
 LAMBDA = {k: v * float(os.environ.get("P8_LSCALE", "1")) for k, v in LAMBDA.items()}
@@ -544,9 +551,53 @@ def boolean_cv_accuracy(var, fit, series, pmin):
 
 # ---------------------------------------------------------------- claims
 
+PRE1980 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pre1980_monthly.csv")
+HIST_YEARS = 16  # datacollect's history length; pre-1980 months only fill up to this
+
+
+def add_pre1980(series, X, path=PRE1980):
+    """Extend each series with bundled 1964..1979 monthly ERA5 aggregates (all dated before 1980,
+    so <= X-12-31 for every X >= 1980), only for years >= X - 15: short histories get the same
+    16-year span datacollect provides from X = 1995 on. Returns the years added."""
+    first = X - HIST_YEARS + 1
+    if first >= 1980 or not os.path.exists(path):
+        return []
+    mon = {}
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f):
+            y = int(r["year"])
+            if first <= y < 1980:
+                mon[(r["location_id"], y, int(r["month"]))] = {k: float(v) for k, v in r.items()
+                                                                if k not in ("location_id",)}
+    added = set()
+    for var, by_key in series.items():
+        for (loc, win), s in by_key.items():
+            m0, d0, m1, d1 = WINDOWS[win]
+            if d0 != 1 or d1 != 0:
+                continue  # partial-month windows (JF28) are not reconstructible from months
+            for y in range(first, 1980):
+                ms = [mon.get((loc, y, m)) for m in range(m0, m1 + 1)]
+                if y in s or any(v is None or v["ndays"] < calendar.monthrange(y, i + m0)[1]
+                                 for i, v in enumerate(ms)):
+                    continue
+                n = sum(v["ndays"] for v in ms)
+                val = {"temp_mean_c": sum(v["tm_mean"] * v["ndays"] for v in ms) / n,
+                       "temp_mean_max_c": sum(v["tx_mean"] * v["ndays"] for v in ms) / n,
+                       "temp_mean_min_c": sum(v["tn_mean"] * v["ndays"] for v in ms) / n,
+                       "temp_max_c": max(v["tx_max"] for v in ms), "temp_min_c": min(v["tn_min"] for v in ms),
+                       "precip_sum_mm": sum(v["p_sum"] for v in ms), "precip_max_day_mm": max(v["p_max"] for v in ms),
+                       "rainy_days_ge_1mm": sum(v["rainy"] for v in ms), "hot_days_ge_30c": sum(v["hot"] for v in ms),
+                       "frost_days_lt_0c": sum(v["frost"] for v in ms), "wind_max_kmh": max(v["w_max"] for v in ms)}[var]
+                s[y] = val
+                added.add(y)
+    return sorted(added)
+
+
 def make_claims(days, meta, years, X, indices, log):
     T = X + 1
     series = build_series(days, years)
+    if not os.environ.get("P8_NO_PRE1980"):
+        years = sorted(set(years) | set(add_pre1980(series, X)))
     fz = Featurizer(series, meta, indices)
     fits = {}
     for var in VARS:
@@ -567,27 +618,30 @@ def make_claims(days, meta, years, X, indices, log):
     # 0. point forecasts: the forecast median, which minimises expected absolute error and so
     #    is the value most likely to be closer to the truth than a rival's point
     point_cands = []
-    for (var, win), ww in POINT_TARGETS.items():
+    short = not any(fits.values())  # history too short for any CV fit (X <= ~1988)
+    targets = {**POINT_TARGETS, **(SHORT_POINT_TARGETS if short else {})}
+    for (var, win), ww in targets.items():
         for loc in fz.locs:
             f = fc.get(var, loc, win)
             s = series[var].get((loc, win), {})
             ys = sorted(s)
-            if f is None and len(ys) < 8:
+            if not ys:
                 continue
             if var in COUNTS and sum(1 for y in ys if s[y] == 0) > 0.3 * len(ys):
                 continue
-            # too little history for the CV-fitted ridge (X <= ~1990): climatology + trend term
+            # without a CV-fitted ridge (short history): history mean + damped trend term
             med = fc.value_quantile(f, 0.5) if f else None
             skill = f[4]["skill"] if f else 0.0
-            if len(ys) >= 8:
-                m = mean([s[y] for y in ys])
-                ym = mean(ys)
-                sl = sum((y - ym) * (s[y] - m) for y in ys) / sum((y - ym) ** 2 for y in ys)
-                prior = PT_PRIOR if var in TEMPS else 0.0
-                sl = (sl * len(ys) + prior * PT_K) / (len(ys) + PT_K)
-                A, C, nlo = PT_PARAMS["temp" if var in TEMPS else ("count" if var in COUNTS else "precip")]
-                A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
-                med = m + (A * (med - m) if med is not None else 0.0) + C * sl * (T - ym)
+            m = mean([s[y] for y in ys])
+            ym = mean(ys)
+            sxx = sum((y - ym) ** 2 for y in ys)
+            sl = sum((y - ym) * (s[y] - m) for y in ys) / sxx if len(ys) >= 3 else 0.0
+            n_sl = len(ys) if len(ys) >= 3 else 0
+            prior = PT_PRIOR if var in TEMPS else 0.0
+            sl = (sl * n_sl + prior * PT_K) / (n_sl + PT_K)
+            A, C, nlo = PT_PARAMS["temp" if var in TEMPS else ("count" if var in COUNTS else "precip")]
+            A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
+            med = m + (A * (med - m) if med is not None else 0.0) + C * sl * (T - ym)
             if var in NONNEG:
                 med = max(0.0, med)
             how = ("history mean moved toward the ridge median (CV skill %+.0f%% vs climatology) plus damped trend"
@@ -679,7 +733,7 @@ def make_claims(days, meta, years, X, indices, log):
             s_by_m = {m: series[var][(loc, "M%02d" % m)] for m in range(1, 13)}
             hist_hits = hist_n = 0
             for y in years[MIN_PAST:]:
-                if all(y in s_by_m[m] for m in s_by_m):
+                if all(y in s_by_m[m] for m in s_by_m) and all(min(s_by_m[m]) < y for m in s_by_m):
                     clim = {m: mean([s_by_m[m][yy] for yy in s_by_m[m] if yy < y]) for m in s_by_m}
                     hist_n += 1
                     hist_hits += int(max(clim, key=clim.get) == max(s_by_m, key=lambda m: s_by_m[m][y]))
@@ -750,7 +804,7 @@ def main():
     days, meta = load(a.data_dir, X)
     indices = load_indices(a.data_dir, X)
     years = sorted({y for l in days for y in days[l]})
-    claims = make_claims(days, meta, years, X, indices, log) if len(years) >= 8 else []
+    claims = make_claims(days, meta, years, X, indices, log) if years else []
     claims = claims[:MAX_CLAIMS]
     for i, c in enumerate(claims, 1):
         c["claim_id"] = "p8_%03d" % i
