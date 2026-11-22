@@ -11,6 +11,7 @@ import calendar
 import csv
 import gzip
 import math
+import os
 from collections import defaultdict
 from datetime import date
 from statistics import NormalDist
@@ -111,19 +112,20 @@ def theil_sen(xs, ys):
 
 class Params:
     tau = 25.0           # recency e-folding (years) for analog weights
-    trend_prior = 0.02   # degC/yr prior for local warming
+    trend_prior = float(os.environ.get("P2_TP", "0.03"))  # degC/yr prior for local warming
     trend_years = 35     # trailing years used for the local trend
     trend_shrink = 30.0  # pseudo-years pulling the local slope to the prior
     phi = 0.15           # persistence of year-X annual anomaly
     jitter = 0.5         # degC kernel sd on top of analog spread
     precip_jitter = 0.12 # log-sd multiplicative precip kernel
     min_years_for_x = 1
+    max_age = int(os.environ.get("P2_MAXAGE", "999"))  # oldest analog year allowed, in years before X
 
 
 def build_ensemble(loc, year_x, windows, params=Params, regime_shift=0.0):
     """Return ({window: [(weight, stats)]}, info) for X+1 using analog years <= X."""
     days = loc["days"]
-    yrs = [y for y in complete_years(days) if y <= year_x]
+    yrs = [y for y in complete_years(days) if year_x - params.max_age <= y <= year_x]
     ann = {y: annual_mean(days[y]) for y in yrs}
     tyrs = [y for y in yrs if y > year_x - params.trend_years]
     if len(tyrs) >= 8:

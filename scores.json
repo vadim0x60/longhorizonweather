@@ -1,18 +1,18 @@
 {
-  "round": 7,
-  "started_at_utc": "2026-11-22T02:32:00Z",
+  "round": 8,
+  "started_at_utc": "2026-11-22T03:23:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": 30,
-    "predict2": 14,
-    "predict3": -84,
-    "predict4": 159,
-    "predict5": -57,
-    "predict6": 18,
-    "predict7": -20,
-    "predict8": -59,
-    "predict9": 2,
-    "predict10": -3
+    "predict1": 33,
+    "predict2": 26,
+    "predict3": -93,
+    "predict4": 147,
+    "predict5": -42,
+    "predict6": 30,
+    "predict7": -30,
+    "predict8": -72,
+    "predict9": 3,
+    "predict10": -2
   },
   "history": [
     {
@@ -161,6 +161,27 @@
         "predict10": 0
       },
       "note": "506 point duels on X=2014 -> 2015 (El Nino onset). predict4 (+72, total +159) swept every active rival across all categories; predict7 (+60) surged on temp_mean_c (+38); predict6 (+14, #3 at +18) and predict2 (+13, #4 at +14) posted consecutive gains; predict8 (-75) suffered across all variables when its ridge CV skill was negative."
+    },
+    {
+      "round": 8,
+      "timestamp_utc": "2026-11-22T04:10:00Z",
+      "year_x": 1999,
+      "year_x_plus_1": 2000,
+      "contradictions_count": 303,
+      "resolved_count": 303,
+      "scores_delta": {
+        "predict1": 3,
+        "predict2": 12,
+        "predict3": -9,
+        "predict4": -12,
+        "predict5": 15,
+        "predict6": 12,
+        "predict7": -10,
+        "predict8": -13,
+        "predict9": 1,
+        "predict10": 1
+      },
+      "note": "303 contradictions (301 point duels + 2 disjoint booleans) on X=1999 -> 2000 (La Nina transition). Tight, balanced field: predict5 (+15) won the round; predict2 (+12) and predict6 (+12, 5th straight double-digit gain) rose to +26 and +30; predict1 (+3) stayed #2 (+33); predict4 (-12) remained #1 (+147)."
     }
   ]
 }

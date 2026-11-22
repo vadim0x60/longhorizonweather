@@ -49,8 +49,8 @@ POINTS_PER_LOC = 7
 # backtested net duel wins per claim against those rivals (14 held-out years).
 POINT_TARGETS = [("year", "temp_mean_max_c"), ("year", "temp_mean_c"), ("year", "hot_days_ge_30c"),
                  ("year", "precip_sum_mm"), ("year", "temp_mean_min_c"), ("jf", "temp_mean_c"),
-                 ("jja", "temp_mean_c"), ("jja", "precip_sum_mm"), ("m07", "temp_mean_c"),
-                 ("year", "temp_max_c"), ("son", "temp_mean_c"), ("q4", "temp_mean_c")]
+                 ("son", "temp_mean_c"), ("jja", "temp_mean_c"), ("jja", "precip_sum_mm"),
+                 ("m07", "temp_mean_c"), ("year", "temp_max_c"), ("q4", "temp_mean_c")]
 # Point forecast = (1 - a - b) * ensemble median + a * 15-yr mean/trend blend
 #                 + b * damped 16-yr trend line (see Forecaster.damped_trend).
 # (a, b) per (variable, window), else per variable, else POINT_MIX_DEFAULT. Tuned against
@@ -64,6 +64,11 @@ POINT_MIX = {"temp_mean_max_c": (0.0, 0.0), "temp_max_c": (0.0, 0.0),
              "temp_mean_min_c": (0.0, 0.5),
              "hot_days_ge_30c": (0.0, 0.0), ("precip_sum_mm", "year"): (0.25, 0.75),
              "precip_sum_mm": (0.5, 0.5), "precip_max_day_mm": (0.5, 0.0)}
+# Carry-over of year X's own value into the point: v += c * (value_X - v). Against rivals'
+# round-7 points over 20 years, c = 0.1 raised the total from +103 to +170 (years >= 1995:
+# +41 -> +127; earlier years: +62 -> +43, still positive). Hot days and JJA lost, so c = 0.
+POINT_CARRY_DEFAULT = 0.1
+POINT_CARRY = {"hot_days_ge_30c": 0.0, ("temp_mean_c", "jja"): 0.0}
 MIN_P = 0.7  # offensive bets only with a real edge: backtests vs. rivals' claims lose below ~0.7
 DEF_W = 0.5  # weight of "honeypot" value: a likely-true claim on a target rivals often claim
 WIN_PRIOR = {"year": 0.3, "jja": 0.2, "mam": 0.1, "son": 0.1, "jf": 0.05}
@@ -522,6 +527,7 @@ class Forecaster:
         half = 0.5 * sum(vs) / len(vs) + 0.5 * ols_predict(ys, vs, self.X + 1)
         a, b = POINT_MIX.get((var, wname), POINT_MIX.get(var, POINT_MIX_DEFAULT))
         v = (1 - a - b) * d.q(0.5) + a * half + (b * self.damped_trend(ser, var, wname) if b else 0.0)
+        v += POINT_CARRY.get((var, wname), POINT_CARRY.get(var, POINT_CARRY_DEFAULT)) * (ser[self.X] - v)
         return max(0.0, v) if (var in COUNT_VARS or var.startswith("precip")) else v
 
     def damped_trend(self, ser, var, wname):

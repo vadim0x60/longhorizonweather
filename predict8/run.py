@@ -27,7 +27,8 @@ years <= X; the one with the lowest CV MSE is the forecast, and its CV residuals
 Claims (one per target, <= 150 total, <= 12 per location_id):
   * point forecasts (up to 6 per city, >= 60 overall): history mean moved toward the
     ridge median (more so with longer history) plus a damped trend term, on annual
-    precip/temperatures/hot days and JJA temperature (see PT_PARAMS).
+    precip/temperatures/hot days and JJA temperature; for temperatures a trend shrunk to
+    0.015 C/yr, part of the ridge, and damped year-X and Sep-Nov anomalies (see PT_PARAMS).
   * warmer/wetter_than_year_x booleans where P(side) >= BOOL_MIN, confidence
     capped by the CV hit rate of such calls.
   * thresholds anchored at the trailing-history baseline, only on sides that were
@@ -119,28 +120,33 @@ if os.environ.get("P8_TMIN"):  # analysis hook: every side at this probability
 MIN_PAST = 5              # years of past data needed to standardize a target year
 MAX_CLAIMS = 150
 MAX_PER_LOC = 12          # CONTRACTS.md round 3: at most 12 claims per location_id
-# Point value = clim + A_eff * (ridge median - clim) + C * slope * (years ahead), where clim is
-# the history mean, slope the series' OLS trend shrunk toward PT_PRIOR (temperatures; 0 otherwise)
-# with the weight of PT_K prior years, and A_eff = A * clip((n - NLO) / (16 - NLO), 0, 1) for n
-# history years: the ridge is trusted only once it has a long history. Tuned by point duels
-# against all rivals' round-4 master code (odd X = 1987..2023 for tuning, even X as a check):
-#   temperatures A=.8 C=1 NLO=12: odd +117 / even +48 vs round-4 setting -31 / +57;
-#   precipitation keeps the round-4 setting A=.6 C=.4 (odd +105 / even +95, best on both halves);
-#   day counts A=1 C=.3 NLO=12 (odd +49 / even -2; round-4 setting +3 / -6).
-PT_PARAMS = {"temp": (0.8, 1.0, 12), "precip": (0.6, 0.4, 0), "count": (1.0, 0.3, 12)}
+# Point value = clim + A_eff * (ridge median - clim) + C * slope * (years ahead)
+#               + CARRY * (year X's residual from the trend line) + SOND * (Sep-Nov residual),
+# where clim is the history mean, slope the series' OLS trend shrunk toward PRIOR with the weight
+# of K prior years, A_eff = A * clip((n - NLO) / (16 - NLO), 0, 1) for n history years, and the
+# Sep-Nov residual is year X's temp_mean_c SON value minus that series' OLS trend line.
+# PT_PARAMS[family] = (A, C, NLO, PRIOR, K, CARRY, SOND).
+# Round 8 retune against the round-7 field (all rivals' master code, local arena; temperature
+# point duels net for X=2011..2020 / X=2008,2021,2022):
+#   round-5 setting (A=.8, C=1, own trend only, no anomalies): -144 / +44 (-68 on X=2014: no ridge
+#     skill, a flat post-2000s own trend and ignored late-year warmth left points ~0.2 C cold);
+#   predict4-like (A=0, trend shrunk to .03 C/yr K=40, CARRY=SOND=.2): +98 / -46;
+#   halfway (A=.4, prior .015 K=30, CARRY=SOND=.1): +22 / +14, the only setting positive in both.
+#   Gating the ridge by its CV skill was much worse (-364 over 2009..2020).
+#   precipitation: round-5 setting +23 over 2009..2020; CARRY=0.1 gives +63 (8 of 12 years > 0).
+PT_PARAMS = {"temp": (0.4, 1.0, 12, 0.015, 30.0, 0.1, 0.1),
+             "precip": (0.6, 0.4, 0, 0.0, 30.0, 0.1, 0.0),
+             "count": (1.0, 0.3, 12, 0.0, 30.0, 0.0, 0.0)}
 # When the history reaches back before 1980 (X < 1995, via pre1980_monthly.csv) the 1964..79
 # decades were nearly flat, so a separate trend term only adds noise: temperature points use the
 # ridge (which has its own trend features) plus 0.1 x year X's residual from the trend line. In
-# duels vs the round-6 field over X=1985..1995: -12 with PT_PARAMS["temp"], +62 with this; for
-# X >= 1998 this setting would lose (-15 vs +1), so it is only used with the pre-1980 archive.
-PT_TEMP_PRE1980 = (0.8, 0.0, 12)
-PT_CARRY_PRE1980 = 0.1
+# duels vs the round-6 field over X=1985..1995: -12 with the round-5 temperature setting, +62 with
+# this; for X >= 1998 it would lose (-15 vs +1), so it is only used with the pre-1980 archive.
+PT_TEMP_PRE1980 = (0.8, 0.0, 12, 0.0, 30.0, 0.1, 0.0)
 # Hot-day points from shifted daily highs (see point_value) beat the count-series formula in the
 # local arena for X=1985..1995 (-22 -> -2 on hot days over 1985-88, +43 net over 1985-95) but
 # lost for X=1998..2023 (+24 -> +10), so "auto" shifts only when the history reaches before 1980.
 HOT_MODE = os.environ.get("P8_HOT_MODE", "auto")
-PT_PRIOR = float(os.environ.get("P8_PT_PRIOR", "0.0"))
-PT_K = float(os.environ.get("P8_PT_K", "30"))
 POINTS_PER_LOC = 6        # point claims per city (>= 60 point claims required overall)
 # point-forecast targets and their priority (how much we trust the model there x popularity)
 # priority = net duel score per target vs rivals' round-4 points (odd X = 1987..2011):
@@ -647,16 +653,23 @@ def make_claims(days, meta, years, X, indices, log):
         sxx = sum((y - ym) ** 2 for y in ys)
         sl = sum((y - ym) * (s[y] - m) for y in ys) / sxx if len(ys) >= 3 else 0.0
         n_sl = len(ys) if len(ys) >= 3 else 0
-        prior = PT_PRIOR if var in TEMPS else 0.0
-        sl = (sl * n_sl + prior * PT_K) / (n_sl + PT_K)
-        A, C, nlo = PT_PARAMS["temp" if var in TEMPS else ("count" if var in COUNTS else "precip")]
-        carry = 0.0
-        if var in TEMPS and min(ys) < 1980 and not os.environ.get("P8_NO_EARLY"):
-            (A, C, nlo), carry = PT_TEMP_PRE1980, PT_CARRY_PRE1980
+        fam = "temp" if var in TEMPS else ("count" if var in COUNTS else "precip")
+        params = PT_PARAMS[fam]
+        if fam == "temp" and min(ys) < 1980 and not os.environ.get("P8_NO_EARLY"):
+            params = PT_TEMP_PRE1980
+        A, C, nlo, prior, k, carry, sond_w = params
+        sl = (sl * n_sl + prior * k) / (n_sl + k)
         A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
         med = m + (A * (med - m) if med is not None else 0.0) + C * sl * (T - ym)
         if carry and X in s:
             med += carry * (s[X] - (m + sl * (X - ym)))
+        if sond_w:
+            so = series["temp_mean_c"].get((loc, "SON"), {})
+            if len(so) >= 8 and X in so:
+                sy = sorted(so)
+                sm, sym = mean([so[y] for y in sy]), mean(sy)
+                ss = sum((y - sym) * (so[y] - sm) for y in sy) / sum((y - sym) ** 2 for y in sy)
+                med += sond_w * (so[X] - (sm + ss * (X - sym)))
         if var == "hot_days_ge_30c" and (HOT_MODE == "shift" or (HOT_MODE == "auto" and min(ys) < 1980)):
             # shift each history year's daily highs so its mean high matches our annual
             # mean-high point forecast, count days >= 30 C, and take the median count

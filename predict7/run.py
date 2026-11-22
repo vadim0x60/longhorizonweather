@@ -115,6 +115,14 @@ TC = {
 # neighbouring weights (0.15..0.3) all scored +480..+501.
 BLEND = (0.25, 0.25, 0.5)
 P4 = (0.03, 40.0, 0.2, 0.2)  # (prior slope, prior strength k, residual carry, Sep-Dec carry)
+# Round 8: when the data-dir history is cut at 1980 (X <= 1995, under 16 years of
+# record), the bundled pre-1980 file makes it contiguous back to LONG_FIRST, and the
+# temperature-mean point becomes 0.5 x blend + 0.5 x mean of LONG_FIRST..X. Against
+# the round-7 field this lifted X = 1985..1995 from +5 to +78 (all of 1985..2023 from
+# +225 to +298); weights 0.4 / 0.6 scored +249 / +285, and using it for every X
+# (long history) lost badly (-417), so it is only for short histories.
+LONG_WEIGHT = 0.5
+LONG_FIRST = 1964
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRE1980 = os.path.join(HERE, "pre1980_monthly.csv")
 GAP_HINT = {"temp_mean_c": 0.25, "temp_mean_max_c": 0.25, "temp_mean_min_c": 0.25,
@@ -658,6 +666,12 @@ def build_claims(year_x, data_dir):
                             rpv = residual_point(yrs, vals, target, anom)
                             w1, w2, w3 = BLEND
                             pv = round(w1 * pv + w2 * tcv + w3 * rpv, 2)
+                            long_ys = [y for y in range(LONG_FIRST, 1980) if y in pre]
+                            if (hist_years[0] == 1980 and yrs
+                                    and len(long_ys) == 1980 - LONG_FIRST):
+                                lm = (sum(pre[y] for y in long_ys) + sum(vals)) / (len(long_ys) + len(vals))
+                                pv = round((1 - LONG_WEIGHT) * pv + LONG_WEIGHT * lm, 2)
+                                pwhy += f"; then {LONG_WEIGHT:.2f} x {LONG_FIRST}..{year_x} mean {lm:.2f}"
                             pwhy = (f"{w1:.2f} x [{pwhy}] + {w2:.2f} x trend-corrected clim "
                                     f"{tcv:.2f} (slope {slope:+.3f}/yr over {len(pre)} pre-1980 + "
                                     f"{len(yrs)} recent yrs) + {w3:.2f} x damped trend-residual "

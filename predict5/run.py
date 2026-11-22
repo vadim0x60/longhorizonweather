@@ -108,7 +108,10 @@ POINT_PLAN = [
 # (X <= 1995 +6, 1996+ +367); a 0.25 floor (+219) and carried-over persistence (+402 but
 # X <= 1995 -16) did not hold in both eras. lambda > 1 is only chosen when the shrunk trend has
 # been under-forecasting the last WF_YEARS years.
-DAMPINGS = (0.5, 0.75, 1.0, 1.25, 1.5)
+# Round 8 (round-7 field, corrected data, X = 1980..2023, with Sep-Dec 0.2): floor 0.5 +178,
+# floor 0.75 +271 (X <= 1995 +131, 1996+ +140); floor 1.0 lost (-69 without Sep-Dec change).
+# At X = 2014 the 0.5 floor was chosen for all 120 points after the slow-warming 2005-2014.
+DAMPINGS = (0.75, 1.0, 1.25, 1.5)
 DEFAULT_DAMPING = 0.5
 # lambda <= this * years of history; None = no cap. Round 7 backtest (corrected data, round-6
 # field, X = 1980..2023): caps of 0.05 / 0.075 / 0.1 per year gave -409 / -313 / -269 vs -278
@@ -118,7 +121,9 @@ LAMBDA_CAP_PER_YEAR = None
 # (late-year ocean/ENSO anomalies persist). Round 6 backtest vs the round-5 rival field,
 # X = 1985..2023: none +277, fixed 0.1 +606 (X <= 1995 +76, 1996+ +530), 0.2 +548, 0.3 +530;
 # letting the walk-forward choose from {0, 0.2, 0.4} gave +322 (X <= 1995 -2).
-SOND_CARRY = (0.1,)
+# Round 8 re-test (round-7 field, X = 1980..2023, lambda floor 0.75): 0.1 +60, 0.2 +271.
+# Adding predict4's 0.2 carry-over of year X's own residual: +154 (X <= 1995 -26), not used.
+SOND_CARRY = (0.2,)
 PERSISTENCE = (0.0,)     # share of year X's departure from trend carried into X+1
 POINT_ONLY_VARS = ()     # variables claimed only as points
 WF_YEARS = 10

@@ -48,6 +48,7 @@ POINT_BASE = os.environ.get("P2_BASE", "focal")
 PRECIP_RECENT = ("precip_sum_mm",)
 PRECIP_BASE = os.environ.get("P2_PB", "clim16")  # short post-1980 means mislead early years; replay -14 -> +10
 PRECIP_DRIFT = float(os.environ.get("P2_PD", "0.3"))  # + drift * (last3 - clim16), predict6-style
+TREND_ADJ = float(os.environ.get("P2_TA", "1.0"))  # late-years replay (7 stations, X=1995-2023): -159 -> -32 with TP 0.03
 SOND_CARRY = float(os.environ.get("P2_SC", "0.1"))  # + carry * year-X Sep-Dec anomaly, predict4-style; 0.3 lost badly in 1981-94
 PRECIP_MIN_YEAR = int(os.environ.get("P2_PMY", "0"))
 EPS = 0.01  # threshold margin so "le m" / "gt m" stay disjoint from rivals' gt/le at m
@@ -206,6 +207,10 @@ def main():
             med = core.wquantile(pairs, 0.5)
             use16 = POINT_BASE == "clim16" or (var == "precip_sum_mm" and PRECIP_BASE == "clim16")
             base_v = clim16(loc, X, w, var) if use16 else (fm[0] if fm else None)
+            if base_v is not None and var in TEMP3 and TREND_ADJ:
+                # the 16-yr mean is centred ~8 years before X+1: move it onto the local trend
+                y0 = X - 15 if use16 else max(1980, X - 15)
+                base_v += TREND_ADJ * info["slope"] * (X + 1 - (y0 + X) / 2)
             if base_v is not None:
                 med = base_v + LAMBDA.get(var, LAMBDA_TEMP) * (med - base_v)
                 c16 = clim16(loc, X, w, var)

@@ -330,6 +330,44 @@ def fit_all(rows, meta, X, enso):
 SOND_RIDGE = 5.0
 
 
+PRE1980 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "monthly_pre1980.csv")
+PRE_IDX = {"temp_mean_c": 1, "temp_mean_max_c": 2, "temp_mean_min_c": 3, "precip_sum_mm": 4}
+LONG_W = {"temp_mean_c": 0.5, "temp_mean_max_c": 0.5, "temp_mean_min_c": 0.5, "precip_sum_mm": 0.25}
+
+
+def load_pre1980():
+    """{loc: {(year, month): (days, tmean, tmax, tmin, precip)}} for 1964..1979: ERA5 monthly
+    aggregates from the Open-Meteo archive (same source and GMT days as datacollect), copied
+    from the repo's predict4/data/monthly_pre1980.csv. Every row predates 1980, so it is
+    earlier than any arena year X."""
+    out = defaultdict(dict)
+    if os.path.exists(PRE1980):
+        with open(PRE1980, newline="") as f:
+            for r in csv.DictReader(f):
+                if r["month"] < "1980":
+                    out[r["location_id"]][(int(r["month"][:4]), int(r["month"][5:7]))] = (
+                        int(r["days"]), float(r["temp_mean_c"]), float(r["temp_mean_max_c"]),
+                        float(r["temp_mean_min_c"]), float(r["precip_sum_mm"]))
+    return out
+
+
+def long_mean(pre, ys, vs, var, win, X):
+    """Mean of the window statistic over 1964..X, or None unless 1964..X is contiguous
+    (pre-1980 archive + datacollect's history from 1980, i.e. X <= 1995)."""
+    ms, _, me, _ = win
+    if not pre or var not in PRE_IDX or X - 15 > 1980 or set(range(1980, X + 1)) - set(ys):
+        return None
+    i = PRE_IDX[var]
+    old = []
+    for y in range(1964, 1980):
+        recs = [pre.get((y, m)) for m in range(ms, me + 1)]
+        if None in recs:
+            return None
+        old.append(sum(r[i] for r in recs) if var == "precip_sum_mm" else sum(r[0] * r[i] for r in recs) / sum(r[0] for r in recs))
+    new = [v for y, v in zip(ys, vs) if y >= 1980]
+    return (sum(old) + sum(new)) / (len(old) + len(new))
+
+
 def shrunk_line(ys, vs, X, prior, k=40.0):
     """(value at X+1, residual of year X) of an OLS line whose slope is shrunk toward prior
     with weight k / (n + k)."""
@@ -356,7 +394,8 @@ def point_value(ys, vs, var, f, X, win, sond=None):
     * line: 16-y OLS line with slope shrunk toward 0.03 C/y (temps) or 0 (precip), k = 40,
       plus a damped (0.2) year-X residual (predict4's form);
     * sond: 0.2 x year X's Sep-Dec residual of the same variable from that line.
-    Annual temps use 0.3 mine + 0.7 (line + sond), JJA/Jan-Feb mine + sond/2, MAM mine, annual
+    Annual temps use 0.3 mine + 0.7 (line + sond), with sond at 0.3 for temp_mean_c, JJA/Jan-Feb
+    mine + sond (Round 8: back to 0.2, JJA -26 -> +5, Jan-Feb +5 -> +20), MAM mine, annual
     precipitation 0.5 mine + 0.5 line. Round 7 retune against the Round 6 rivals (X=1985..2023):
     precip 0.7 -> 0.5 mine (+25 -> +72), annual temps 0.5 -> 0.3 mine (max +57 -> +74, mean
     +36 -> +39), seasonal Sep-Dec carry 0.2 -> 0.1 (JJA -17 -> -1). Anchoring the history on a
@@ -377,8 +416,10 @@ def point_value(ys, vs, var, f, X, win, sond=None):
     if win == "mam":
         return mine
     if win != "year":
-        return mine + 0.5 * carry
+        return mine + carry
     line, res = shrunk_line([y for y, _ in sel], r, X, 0.03)
+    if var == "temp_mean_c":
+        carry *= 1.5  # Round 8: Sep-Dec weight 0.3 for annual temp_mean_c (-19 -> +9 in duels)
     w = 0.3
     return w * mine + (1 - w) * (line + 0.2 * res + carry)
 
@@ -396,6 +437,7 @@ def candidates(rows, meta, X, enso):
                 "variable": var}
 
     F = fit_all(rows, meta, X, enso)
+    pre = load_pre1980()
     for loc in sorted(rows):
         for win in WINDOWS:
             for var in BASE_VARS:
@@ -413,6 +455,9 @@ def candidates(rows, meta, X, enso):
                          f"±{f['sigma']:.2f}")
                 if (win, var) in POINT_SPECS:
                     pv = point_value(ys, vs, var, f, X, win, sond_series(rows[loc], X, var))
+                    lm = long_mean(pre.get(loc), ys, vs, var, WINDOWS[win], X) if win == "year" else None
+                    if lm is not None:  # Round 8: annual points meet a 1964..X mean (X <= 1995)
+                        pv = (1 - LONG_W[var]) * pv + LONG_W[var] * lm
                     out.append((1.0, ("point", var, wclass(win)), {
                         "target": target(loc, win, var),
                         "assertion": {"kind": "point", "value": round(pv, 2 if var in TEMP_VARS else 1)},

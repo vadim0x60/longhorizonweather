@@ -28,14 +28,14 @@ Offline, stdlib-only statistical forecaster for year X+1:
     Non-point claims are ranked by how many rival claims a target attracts (POP,
     measured offline on past years) times the expected net margin.
 
-Dev-time evaluation (rivals' Round 6 code run offline with Tinker off, scored by
+Dev-time evaluation (rivals' Round 7 code run offline with Tinker off, scored by
 verify/run.py on locally collected truth, X=1985..1995 and 1998..2023):
-  Round 6 settings                        early -14  late +213  total +199
-  SON temp points instead of precip       early -19  late +278  total +259
-  + pre-1980 fill, lambda x0.6 there      early +32  late +278  total +310 (odd +284, even +26)
-  (pre-1980 fill at full lambda: early -49; tighter trend prior and no-ENSO were not better.)
-The simulation reproduces live Round 6 (X=1988: -15 vs -13 live, with the same per-rival
-and per-variable losses); these settings give -2 there.
+  Round 7 settings                        early +15  late +237  total +252
+  + persistence floors rho, phi >= 0.2    early  -3  late +442  total +439 (odd +279, even +160)
+Diagnosis (live Round 7, X=2014, reproduced as -40 vs -39 live): after the very cold
+2014 in Chicago/Toronto/New York, the fitted year-X persistence was ~0 (in-sample AR(1)
+estimates on 16 detrended points are biased toward 0), so the points sat above climatology
+while predict4's fixed 0.2 x residual + 0.2 x Sep-Dec pulled them down. Floors give +51 there.
 Model ablations: Sep-Dec persistence clearly helps; per-location ENSO fits hurt;
 pooled ENSO is neutral-to-slightly-positive for temperature.
 
@@ -61,6 +61,7 @@ MAX_PER_LOCATION = 12   # Round 3 contract cap per location_id
 LAMBDA = 0.5             # threshold position between climatology (0) and our median (1)
 THRESHOLD_WEIGHT = 0.3   # base ranking weight of threshold claims relative to booleans
 SIGMA_INFLATE = 1.00     # calibrated so out-of-sample z-scores have ~unit spread (backtests X=2006..2023)
+PHI_MIN = 0.2            # floor on the Sep-Dec carry-over (fitted values ~0.1 are biased low; predict4 uses 0.2)
 PHI_MAX = 0.7            # cap on pooled persistence coefficient
 USE_PRE1980 = True       # fill X-15..1979 from predict3/data/era5_daily_pre1980.csv.gz
 PRE1980_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "era5_daily_pre1980.csv.gz")
@@ -69,6 +70,7 @@ SOND_OWN = True          # carry over the variable's own Sep-Dec column (vs Sep-
 PRECIP_RECENT_W = 0.3    # precip point = clim + w * (last-3-year mean - clim), as in predict6: +54 vs model median
 OWN_LAG = True           # pooled lag-1 persistence of each variable's own detrended anomaly
 RHO_MAX = 0.6
+RHO_MIN = 0.2            # floor on own-anomaly persistence (fitted ~0.0: in-sample AR(1) bias)
 USE_ENSO = True          # pooled ENSO term, temperature variables only (backtest: small gain 2015-2023, neutral 2006-2014)
 ENSO_VARS = {"temp_mean_c", "temp_max_c", "temp_min_c", "temp_mean_max_c", "temp_mean_min_c"}
 OTHER_TREND_SHRINK = 0.5  # extra shrink of EB-weighted trends for non-temperature variables
@@ -325,7 +327,7 @@ def build(X, daily, nino):
                     if p is not None:
                         num += p * m["res"][y]
                         den += p * p
-            phi = min(max(num / den if den > 0 else 0.0, 0.0), PHI_MAX)
+            phi = min(max(num / den if den > 0 else 0.0, PHI_MIN), PHI_MAX)
         # Pooled own-variable lag-1 persistence of the detrended residual (all variables).
         rho = 0.0
         if OWN_LAG:
@@ -336,7 +338,9 @@ def build(X, daily, nino):
                         e = m["res"][y] - phi * sond_anom[loc].get(y - 1, 0.0)
                         num += m["res"][y - 1] * e
                         den += m["res"][y - 1] ** 2
-            rho = min(max(num / den if den > 0 else 0.0, 0.0), RHO_MAX)
+            # In-sample AR(1) estimates on 16 detrended points are biased toward 0 (Hurwicz bias,
+            # about -(1 + 3 rho) / n), so the fitted value gets a floor.
+            rho = min(max(num / den if den > 0 else 0.0, RHO_MIN), RHO_MAX)
         # ENSO teleconnection per location, pooled across locations.
         est = {}
         for loc, m in per_loc.items():
@@ -372,7 +376,7 @@ def build(X, daily, nino):
             sigma = s * math.sqrt(lev) * t_infl * SIGMA_INFLATE
             mu = m["a"] + m["b"] * t1 + phi * sond_anom[loc].get(X, 0.0) + rho * m["res"][X] + g * nino_ond.get(X, 0.0)
             models[(loc, wkey, var)] = {
-                "mu": mu, "sigma": sigma, "tf": tf, "phi": phi, "gamma": g, "trend": m["b"],
+                "mu": mu, "sigma": sigma, "tf": tf, "phi": phi, "rho": rho, "gamma": g, "trend": m["b"],
                 "z_x": m["z"][X], "raw": m["raw"], "nino_x": nino_ond.get(X),
             }
     return models
