@@ -7,12 +7,16 @@ Pipeline (see CONTRACTS.md):
   1. Load predict1.json .. predict10.json (missing, empty, or malformed files mean no claims).
   2. Validate each claim and enforce anti-spam limits, in file order:
      invalid claims are rejected; a repeated (location_id, window_start, window_end, variable)
-     key keeps only its first valid claim; at most 150 claims are accepted per predictor.
-  3. For every pair predict{i}, predict{j} (i < j) with claims on the same canonical target
-     whose assertions cannot both be true, record a contradiction.
+     key keeps only its first valid claim; at most 12 claims per location_id and at most 150
+     claims in total are accepted per predictor.
+  3. For every pair predict{i}, predict{j} (i < j) with claims on the same canonical target,
+     record a contradiction when their threshold/interval/boolean/categorical assertions
+     cannot both be true, or when both are point forecasts at least min_gap[variable] apart.
+     A point claim is only ever compared with another point claim.
   4. Fetch daily ground truth for year X+1 (and X when needed) from the Open-Meteo archive
      API, compute the target variable, and score: the true side gets +1, the false side -1;
-     both false or unresolvable is 0 / 0.
+     both false or unresolvable is 0 / 0. For point duels the strictly closer forecast gets
+     +1 and the farther -1; errors within 1e-9 of each other are a 0 / 0 tie.
 
 Only the Python standard library is used.
 """
@@ -35,6 +39,7 @@ from pathlib import Path
 
 PREDICTORS = [f"predict{i}" for i in range(1, 11)]
 MAX_CLAIMS_PER_PREDICTOR = 150
+MAX_CLAIMS_PER_LOCATION = 12
 
 CATALOG = {
     "london_uk": (51.5074, -0.1278),
@@ -71,6 +76,15 @@ COUNT_VARS = {"hot_days_ge_30c", "frost_days_lt_0c", "rainy_days_ge_1mm"}
 CATEGORICAL_VARS = {"wettest_month", "hottest_month"}
 BOOLEAN_VARS = {"warmer_than_year_x", "wetter_than_year_x"}
 ALL_VARS = NUMERIC_VARS | CATEGORICAL_VARS | BOOLEAN_VARS
+# Two point forecasts disagree when they are at least this far apart (CONTRACTS.md).
+POINT_MIN_GAP = {
+    "temp_mean_c": 0.25, "temp_mean_max_c": 0.25, "temp_mean_min_c": 0.25,
+    "temp_max_c": 0.50, "temp_min_c": 0.50,
+    "precip_sum_mm": 20.0, "precip_max_day_mm": 3.0, "wind_max_kmh": 2.0,
+    "hot_days_ge_30c": 2.0, "frost_days_lt_0c": 2.0, "rainy_days_ge_1mm": 2.0,
+}
+# Float tolerance for point gaps and ties, so 15.30 vs 15.05 counts as a 0.25 gap.
+POINT_EPS = 1e-9
 MONTHS = {f"{m:02d}" for m in range(1, 13)}
 
 DAILY_FIELDS = [
@@ -147,7 +161,12 @@ def normalize_assertion(variable: str, a) -> dict:
             if low > high:
                 raise ClaimError("interval low must be <= high")
             return {"kind": "interval", "low": low, "high": high}
-        raise ClaimError(f"{variable} needs a threshold or interval assertion")
+        if kind == "point":
+            value = a.get("value")
+            if not _is_number(value):
+                raise ClaimError("point value must be a finite number")
+            return {"kind": "point", "value": value}
+        raise ClaimError(f"{variable} needs a threshold, interval or point assertion")
     if variable in BOOLEAN_VARS:
         if kind != "boolean" or not isinstance(a.get("value"), bool):
             raise ClaimError(f"{variable} needs a boolean assertion with a true/false value")
@@ -214,7 +233,7 @@ def load_predictor_file(path: Path) -> tuple[list, str | None]:
 
 def filter_claims(predictor: str, raw_claims: list, year_x: int) -> tuple[list, list]:
     """Validate and apply anti-spam rules in file order. Returns (accepted, rejected)."""
-    accepted, rejected, seen = [], [], set()
+    accepted, rejected, seen, per_loc = [], [], set(), {}
     for idx, raw in enumerate(raw_claims):
         cid = raw.get("claim_id") if isinstance(raw, dict) and isinstance(raw.get("claim_id"), str) else None
         cid = cid or f"{predictor}#{idx}"
@@ -228,11 +247,17 @@ def filter_claims(predictor: str, raw_claims: list, year_x: int) -> tuple[list, 
         if key in seen:
             rejected.append({"claim_id": cid, "index": idx, "reason": "duplicate target key"})
             continue
+        loc = claim["target"]["location_id"]
+        if per_loc.get(loc, 0) >= MAX_CLAIMS_PER_LOCATION:
+            rejected.append({"claim_id": cid, "index": idx,
+                             "reason": f"exceeds {MAX_CLAIMS_PER_LOCATION} claims for {loc}"})
+            continue
         if len(accepted) >= MAX_CLAIMS_PER_PREDICTOR:
             rejected.append({"claim_id": cid, "index": idx,
                              "reason": f"exceeds {MAX_CLAIMS_PER_PREDICTOR} claims per predictor"})
             continue
         seen.add(key)
+        per_loc[loc] = per_loc.get(loc, 0) + 1
         claim["predictor"] = predictor
         accepted.append(claim)
     return accepted, rejected
@@ -271,7 +296,11 @@ def _as_interval(variable: str, a: dict):
 
 
 def assertions_disjoint(variable: str, a: dict, b: dict) -> bool:
-    """True when no value of the variable can satisfy both assertions."""
+    """True when no value of the variable can satisfy both assertions.
+
+    Point forecasts are not set-valued assertions; they are compared by points_disagree."""
+    if a["kind"] == "point" or b["kind"] == "point":
+        return False
     if a["kind"] in ("boolean", "categorical") or b["kind"] in ("boolean", "categorical"):
         return a["kind"] == b["kind"] and a["value"] != b["value"]
     alo, alc, ahi, ahc = _as_interval(variable, a)
@@ -290,8 +319,14 @@ def assertions_disjoint(variable: str, a: dict, b: dict) -> bool:
     return lo > hi or (lo == hi and not (lo_c and hi_c))
 
 
+def points_disagree(variable: str, a: dict, b: dict) -> bool:
+    return (a["kind"] == b["kind"] == "point"
+            and abs(a["value"] - b["value"]) >= POINT_MIN_GAP[variable] - POINT_EPS)
+
+
 def find_contradictions(claims_by_predictor: dict) -> list:
-    """All (claim_i, claim_j), i < j, on the same target with disjoint assertions."""
+    """All (claim_i, claim_j), i < j, on the same target with disjoint assertions or
+    point forecasts at least min_gap apart."""
     by_target: dict[tuple, list] = {}
     for p in PREDICTORS:
         for c in claims_by_predictor.get(p, []):
@@ -304,7 +339,8 @@ def find_contradictions(claims_by_predictor: dict) -> list:
                 a, b = group[i], group[j]
                 if a["predictor"] == b["predictor"]:
                     continue
-                if assertions_disjoint(key[3], a["assertion"], b["assertion"]):
+                if (assertions_disjoint(key[3], a["assertion"], b["assertion"])
+                        or points_disagree(key[3], a["assertion"], b["assertion"])):
                     out.append((a, b))
     return out
 
@@ -548,8 +584,18 @@ def score(year_x: int, claims_by_predictor: dict, fetch_daily) -> dict:
                 dt.date.fromisoformat(t["window_end"]), year_x)
         truth = truth_cache[key]
         entry = {"target": t, "a": _claim_view(a), "b": _claim_view(b), "truth": truth}
+        entry["kind"] = "point" if a["assertion"]["kind"] == "point" else "disjoint"
         if truth is None:
             entry.update(status="unresolvable", a_correct=None, b_correct=None, delta_a=0, delta_b=0)
+        elif entry["kind"] == "point":
+            ea, eb = abs(a["assertion"]["value"] - truth), abs(b["assertion"]["value"] - truth)
+            da = 0 if abs(ea - eb) <= POINT_EPS else (1 if ea < eb else -1)
+            db = -da
+            deltas[a["predictor"]] += da
+            deltas[b["predictor"]] += db
+            resolved += 1
+            status = "tie" if da == 0 else ("a_wins" if da > 0 else "b_wins")
+            entry.update(status=status, a_error=_r(ea), b_error=_r(eb), delta_a=da, delta_b=db)
         else:
             ac = assertion_holds(t["variable"], a["assertion"], truth)
             bc = assertion_holds(t["variable"], b["assertion"], truth)

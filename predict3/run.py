@@ -12,18 +12,20 @@ Offline, stdlib-only statistical forecaster for year X+1:
   * Skewed, non-negative variables (precipitation, day counts) are modelled in
     sqrt space.
   * Predictive spread = residual spread with parameter-uncertainty inflation.
-  * Claims are built to be contradicted (scoring only happens on disjoint claims):
-      - directional thresholds halfway between the trailing climatology, where
-        rivals anchor, and our forecast median, kept only when P >= 0.55;
-      - warmer/wetter-than-year-X booleans when P >= 0.65;
-      - hottest/wettest month inside popular windows.
-    Claims are ranked by how many rival claims a target attracts (POP, measured by
-    running the other predictors' published code offline on past years) times the
-    expected net margin, then capped at 150 (10 per location).
+  * Mean model also carries a pooled lag-1 persistence of each variable's own
+    detrended anomaly (helps precipitation and day counts).
+  * Claims (Round 3 contract: >= 60 points, <= 12 per location, <= 150 total):
+      - 80 `point` claims = predictive median for ANN/JJA temp_mean_c, ANN
+        precip_sum_mm and ANN temp_mean_max_c at all 20 locations;
+      - directional thresholds halfway between the trailing climatology and our
+        median, only when P >= 0.65;
+      - warmer/wetter-than-year-X booleans when P >= 0.65; hottest/wettest month.
+    Non-point claims are ranked by how many rival claims a target attracts (POP,
+    measured offline on past years) times the expected net margin.
 
-Dev-time evaluation (X=2008..2023; rivals' round-1 code run offline, scored with
-verify/run.py logic on locally collected truth): net +30 over 53 contradictions
-(40 won), no losing year. Claim calibration: mean confidence 0.66, hit rate 0.66.
+Dev-time evaluation, X=1998..2023 (rivals' Round 2 code run offline, local truth):
+point medians beat naive climatology/trend/persistence/damped points in 59.6% of
+duels with gap >= min_gap; non-point claims net +8 over 37 contradictions.
 Model ablations: Sep-Dec persistence clearly helps; per-location ENSO fits hurt;
 pooled ENSO is neutral-to-slightly-positive for temperature.
 
@@ -38,21 +40,30 @@ import json
 import math
 import os
 import statistics
+import sys
 from collections import defaultdict
 
 ND = statistics.NormalDist()
 
 MAX_CLAIMS = 150
-MAX_PER_LOCATION = 10
+MAX_PER_LOCATION = 12   # Round 3 contract cap per location_id
 LAMBDA = 0.5             # threshold position between climatology (0) and our median (1)
 THRESHOLD_WEIGHT = 0.3   # base ranking weight of threshold claims relative to booleans
 SIGMA_INFLATE = 1.00     # calibrated so out-of-sample z-scores have ~unit spread (backtests X=2006..2023)
 PHI_MAX = 0.7            # cap on pooled persistence coefficient
+OWN_LAG = True           # pooled lag-1 persistence of each variable's own detrended anomaly
+RHO_MAX = 0.6
 USE_ENSO = True          # pooled ENSO term, temperature variables only (backtest: small gain 2015-2023, neutral 2006-2014)
 ENSO_VARS = {"temp_mean_c", "temp_max_c", "temp_min_c", "temp_mean_max_c", "temp_mean_min_c"}
 OTHER_TREND_SHRINK = 0.5  # extra shrink of EB-weighted trends for non-temperature variables
 BOOL_MIN_CONF = 0.65
-THR_MIN_CONF = 0.55
+# Round 3: point duels (closer to truth wins once two points differ by min_gap). Point claims go on the
+# most contested numeric targets for every location; >= 60 are required by the contract.
+POINT_PAIRS = [("ANN", "temp_mean_c"), ("JJA", "temp_mean_c"), ("ANN", "precip_sum_mm"), ("ANN", "temp_mean_max_c")]
+MIN_POINTS = 60
+POINT_PRIORITY = 100.0   # points are placed before any other claim
+POINT_CONF = 0.59        # backtest share of point duels won vs naive climatology/trend/persistence points
+THR_MIN_CONF = 0.65
 WET_BOOL_MIN_CONF = 0.65
 CAT_MIN_CONF = 0.5
 
@@ -280,7 +291,18 @@ def build(X, daily, nino):
                         num += p * m["res"][y]
                         den += p * p
             phi = min(max(num / den if den > 0 else 0.0, 0.0), PHI_MAX)
-        # ENSO teleconnection per location, EB-shrunk across locations.
+        # Pooled own-variable lag-1 persistence of the detrended residual (all variables).
+        rho = 0.0
+        if OWN_LAG:
+            num = den = 0.0
+            for loc, m in per_loc.items():
+                for y in m["years"]:
+                    if (y - 1) in m["res"]:
+                        e = m["res"][y] - phi * sond_anom[loc].get(y - 1, 0.0)
+                        num += m["res"][y - 1] * e
+                        den += m["res"][y - 1] ** 2
+            rho = min(max(num / den if den > 0 else 0.0, 0.0), RHO_MAX)
+        # ENSO teleconnection per location, pooled across locations.
         est = {}
         for loc, m in per_loc.items():
             xs, rs = [], []
@@ -289,7 +311,7 @@ def build(X, daily, nino):
                 p = sond_anom[loc].get(y - 1, 0.0)
                 if n_prev is not None and (y - 1) in m["res"]:
                     xs.append(n_prev)
-                    rs.append(m["res"][y] - phi * p)
+                    rs.append(m["res"][y] - phi * p - rho * m["res"][y - 1])
             if len(xs) >= 6 and max(xs) - min(xs) > 0.3:
                 _, g, se, _, _, _ = ols(xs, rs)
                 est[loc] = (g, se)
@@ -303,7 +325,7 @@ def build(X, daily, nino):
             g = gammas.get(loc, 0.0)
             fitted_res = []
             for y in m["years"]:
-                pred = phi * sond_anom[loc].get(y - 1, 0.0) + g * nino_ond.get(y - 1, 0.0) if (y - 1) in m["res"] else 0.0
+                pred = (phi * sond_anom[loc].get(y - 1, 0.0) + rho * m["res"][y - 1] + g * nino_ond.get(y - 1, 0.0)) if (y - 1) in m["res"] else 0.0
                 fitted_res.append(m["res"][y] - pred)
             n = len(fitted_res)
             k = 2  # per-location trend; phi and pooled gamma are shared across 20 locations
@@ -313,7 +335,7 @@ def build(X, daily, nino):
             # Small-sample t inflation (approx) + misspecification factor.
             t_infl = 1 + 1.0 / max(n - k, 2)
             sigma = s * math.sqrt(lev) * t_infl * SIGMA_INFLATE
-            mu = m["a"] + m["b"] * t1 + phi * sond_anom[loc].get(X, 0.0) + g * nino_ond.get(X, 0.0)
+            mu = m["a"] + m["b"] * t1 + phi * sond_anom[loc].get(X, 0.0) + rho * m["res"][X] + g * nino_ond.get(X, 0.0)
             models[(loc, wkey, var)] = {
                 "mu": mu, "sigma": sigma, "tf": tf, "phi": phi, "gamma": g, "trend": m["b"],
                 "z_x": m["z"][X], "raw": m["raw"], "nino_x": nino_ond.get(X),
@@ -393,7 +415,12 @@ def make_claims(X, daily, meta, models):
         ann = f"trend {m['trend']:+.3f}/yr" + (f", Sep-Dec persistence phi={m['phi']:.2f}" if m["phi"] else "") + (
             f", ENSO gamma={m['gamma']:+.2f} x OND Nino3.4 {m['nino_x']:+.2f}" if m["gamma"] and m["nino_x"] is not None else "")
         pop = POP.get((wkey, var), 0.0)
-        if pop:
+        if (wkey, var) in POINT_PAIRS:
+            # Predictive median: minimises expected absolute error, which decides point duels.
+            med = inverse(m["tf"], m["mu"])
+            add(POINT_PRIORITY + pop, loc, wkey, var, {"kind": "point", "value": round(med, 2)}, POINT_CONF,
+                f"point = predictive median ({len(m['raw'])}-yr ERA5 series; {ann})")
+        elif pop:
             r = threshold_claim(m, var)
             if r and r[1] >= THR_MIN_CONF and not (var in COUNT_VARS and max(m["raw"].values()) < 3):
                 assertion, p, clim, med = r
@@ -443,6 +470,9 @@ def make_claims(X, daily, meta, models):
         out.append(c["claim"])
         if len(out) >= MAX_CLAIMS:
             break
+    n_points = sum(c["assertion"]["kind"] == "point" for c in out)
+    if n_points < MIN_POINTS:  # only possible with incomplete data; still emit what we have
+        print(f"[predict3] WARNING: only {n_points} point claims (contract asks for {MIN_POINTS})", file=sys.stderr)
     return [{"claim_id": f"p3_{i:03d}", **c} for i, c in enumerate(out, 1)]
 
 

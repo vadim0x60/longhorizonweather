@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""predict7: Extreme-Value & Tail-Risk Contrarian (round 2).
+"""predict7: Extreme-Value & Tail-Risk Contrarian (round 3).
 
 Builds a full predictive distribution (a quantile table) for every
 (location, window, variable) target in year X+1 from data dated <= X-12-31,
@@ -18,7 +18,9 @@ Distributions (stdlib only):
     the median sits below the mean, as it does in the data.
 All spreads are widened by factors set in a 2010-2023 hindcast.
 
-Claims: "gt"/"lt" thresholds at the quantile where the claim holds with
+Round 3: 6 `point` claims per location (120 total) on the most-contested
+targets (see POINT / POINT_PRIO), then the rest of the 12-per-location budget.
+Other claims: "gt"/"lt" thresholds at the quantile where the claim holds with
 probability P_SIDE, pointing to the side of climatology our forecast leans to,
 and warmer/wetter-than-year-X booleans when P >= P_BOOL. When another
 predictor's claim falls on the far side of our threshold, our claim holds with
@@ -51,6 +53,35 @@ CFG = {
         "temp_mean_min_c": (1.45, 1.1),
     },
 }
+
+# Point forecasts (round 3 duels: the value closer to the truth wins).
+# point = w * (distribution mean or median) + (1 - w) * (climatology+OLS)/2.
+# The median is used where the tail is heavy (daily rain maxima, day counts of
+# rare events): it minimises absolute error, so it wins closest-to-truth duels
+# against mean forecasts that the right tail drags upward. Weights from a
+# 2010-2023 hindcast against climatology, OLS, persistence and blend rivals.
+POINT = {
+    "temp_mean_c": (0.75, "mean"), "temp_mean_max_c": (0.75, "mean"),
+    "temp_mean_min_c": (0.25, "mean"), "temp_max_c": (0.75, "mean"),
+    "temp_min_c": (0.75, "mean"), "precip_sum_mm": (0.5, "mean"),
+    "precip_max_day_mm": (0.75, "median"), "wind_max_kmh": (0.5, "mean"),
+    "hot_days_ge_30c": (0.75, "mean"), "frost_days_lt_0c": (0.75, "median"),
+    "rainy_days_ge_1mm": (0.75, "median"),
+}
+# Point-duel priority per variable (how often rivals target it x hindcast edge).
+POINT_PRIO = {
+    "temp_mean_c": 1.0, "precip_sum_mm": 0.9, "temp_mean_max_c": 0.75,
+    "temp_mean_min_c": 0.65, "hot_days_ge_30c": 0.6, "frost_days_lt_0c": 0.55,
+    "temp_max_c": 0.5, "rainy_days_ge_1mm": 0.45, "precip_max_day_mm": 0.45,
+    "temp_min_c": 0.4, "wind_max_kmh": 0.2,
+}
+POINTS_PER_LOC = 6
+GAP_HINT = {"temp_mean_c": 0.25, "temp_mean_max_c": 0.25, "temp_mean_min_c": 0.25,
+            "temp_max_c": 0.5, "temp_min_c": 0.5, "precip_sum_mm": 20.0,
+            "precip_max_day_mm": 3.0, "wind_max_kmh": 2.0, "hot_days_ge_30c": 2.0,
+            "frost_days_lt_0c": 2.0, "rainy_days_ge_1mm": 2.0}  # verify min_gap
+MAX_PER_LOC = 12
+POINT_DECIMALS = {"precip_sum_mm": 0, "precip_max_day_mm": 1, "wind_max_kmh": 1}
 
 # Probability grid of the quantile tables.
 GRID = [0.0025 + i * (0.995 / 200) for i in range(201)]
@@ -423,6 +454,24 @@ def distribution(var, ser, target_year):
 
 
 # --------------------------------------------------------------------- claims
+def point_value(var, dist, years, vals, target_year, n_target):
+    n = len(vals)
+    mt = sum(years) / n
+    my = sum(vals) / n
+    sxx = sum((t - mt) ** 2 for t in years)
+    b = sum((t - mt) * (v - my) for t, v in zip(years, vals)) / sxx if sxx else 0.0
+    anchor = 0.5 * (my + my + b * (target_year - mt))
+    w, base = POINT[var]
+    centre = dist.q(0.5) if base == "median" else sum(dist.qs) / len(dist.qs)
+    v = w * centre + (1 - w) * anchor
+    if VARS[var][1] in ("count", "total", "dailymax"):
+        v = max(0.0, v)
+    if VARS[var][1] == "count":
+        v = min(float(n_target), v)
+    return round(v, POINT_DECIMALS.get(var, 1 if VARS[var][1] == "count" else 2)), centre, anchor
+
+
+
 def fmt(v, var):
     return int(v) if VARS[var][1] == "count" else round(v, 1)
 
@@ -450,7 +499,7 @@ def build_claims(year_x, data_dir):
     rows, meta = load(data_dir)
     target = year_x + 1
     hist_years = list(range(max(1980, year_x - 15), year_x + 1))
-    cands = []
+    cands, points = [], []
     for lid in sorted(rows):
         days = {d: v for d, v in rows[lid].items() if d <= f"{year_x}-12-31"}
         lat, lon = meta[lid]
@@ -481,7 +530,22 @@ def build_claims(year_x, data_dir):
                     if dist is None or dist.q(0.05) == dist.q(0.95):
                         continue
                     yr = yearly(var, ser)
-                    clim = median([stat(var, yr[y][0]) for y in yr])
+                    yrs = sorted(yr)
+                    vals = [stat(var, yr[y][0]) for y in yrs]
+                    clim = median(vals)
+                    if var in POINT:
+                        n_target = max(n for _, n in yr.values())
+                        pv, centre, anchor = point_value(var, dist, yrs, vals, target, n_target)
+                        points.append((wprio * POINT_PRIO[var], {
+                            "target": {"location_id": lid, "lat": lat, "lon": lon,
+                                       "window_start": ws, "window_end": we, "variable": var},
+                            "assertion": {"kind": "point", "value": pv},
+                            "confidence": round(dist.cdf(pv + 0.5 * GAP_HINT[var])
+                                                - dist.cdf(pv - 0.5 * GAP_HINT[var]), 3),
+                            "rationale": f"EVT/tail-risk point: {POINT[var][0]:.2f} x "
+                                         f"{POINT[var][1]} {centre:.2f} of {dist.why} + rest x "
+                                         f"clim/OLS anchor {anchor:.2f}; window {tag}.",
+                        }))
                     assertion, prob = numeric_claim(var, dist, clim)
                     if prob > CFG["P_SIDE"] + 0.2 or assertion["value"] < 0:
                         continue  # degenerate (e.g. "gt -1" hot days): nobody disagrees
@@ -495,17 +559,27 @@ def build_claims(year_x, data_dir):
                     "confidence": round(prob, 3),
                     "rationale": f"EVT/tail-risk: {why}; window {tag}.",
                 }))
+    # Points first (POINTS_PER_LOC best per location), then everything else by
+    # priority, keeping <= MAX_PER_LOC per location and one claim per target.
+    points.sort(key=lambda c: -c[0])
     cands.sort(key=lambda c: -c[0])
-    claims, seen = [], set()
-    for _, c in cands:
+    claims, seen, per_loc = [], set(), defaultdict(int)
+
+    def take(c, cap):
         t = c["target"]
         key = (t["location_id"], t["window_start"], t["window_end"], t["variable"])
-        if key in seen:
-            continue
+        if key in seen or per_loc[t["location_id"]] >= cap or len(claims) >= MAX_CLAIMS:
+            return
         seen.add(key)
+        per_loc[t["location_id"]] += 1
         claims.append(dict(claim_id=f"p7_{len(claims) + 1:03d}", **c))
-        if len(claims) >= MAX_CLAIMS:
-            break
+
+    for _, c in points:
+        take(c, POINTS_PER_LOC)
+    for _, c in cands:
+        take(c, MAX_PER_LOC)
+    for _, c in points:  # spare capacity: more point duels
+        take(c, MAX_PER_LOC)
     return claims
 
 

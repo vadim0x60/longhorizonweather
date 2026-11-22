@@ -25,6 +25,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import core  # noqa: E402
 
 MAX_CLAIMS = 150
+MAX_PER_LOC = 12
+POINTS_FIRST = 6  # point claims reserved per location before the shared ranking (>= 60 overall)
+MIN_GAP = {"temp_mean_c": 0.25, "temp_mean_max_c": 0.25, "temp_mean_min_c": 0.25, "temp_max_c": 0.5,
+           "temp_min_c": 0.5, "precip_sum_mm": 20.0, "precip_max_day_mm": 3.0, "wind_max_kmh": 2.0,
+           "hot_days_ge_30c": 2.0, "frost_days_lt_0c": 2.0, "rainy_days_ge_1mm": 2.0}
+# Point targets in priority order: (window, variable, duel value). Point duels go to whoever is
+# closer to truth; the analog-ensemble median won ~60% of duels against climatology/trend point
+# rules in 1981-2012 replays (all 20 stations), most clearly for JF, July and annual hot days.
+POINTS = [("year", "temp_mean_c", 1.0), ("jf", "temp_mean_c", 1.0), ("jja", "temp_mean_c", 0.9),
+          ("year", "precip_sum_mm", 0.9), ("m07", "temp_mean_c", 0.85), ("year", "hot_days_ge_30c", 0.85),
+          ("m01", "temp_mean_c", 0.8), ("mam", "temp_mean_c", 0.75), ("son", "temp_mean_c", 0.7),
+          ("jf", "temp_mean_max_c", 0.7), ("year", "frost_days_lt_0c", 0.65), ("jja", "precip_sum_mm", 0.5)]
 EPS = 0.01  # threshold margin so "le m" / "gt m" stay disjoint from rivals' gt/le at m
 TEMP3 = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c")
 # relative value of a claim type: how likely it is to be contested and won
@@ -68,31 +80,6 @@ def windows(Y):
 WIN_W = {"year": 1.0, "jja": 0.9, "mam": 0.8, "son": 0.8, "jf": 0.7, "jf28": 0.7}
 
 
-EXTRA = ("temp_max_c", "temp_min_c", "precip_max_day_mm", "wind_max_kmh")
-
-
-def rnd_out(lo, hi, var):
-    if var in core.COUNT_VARS:
-        return math.floor(lo), math.ceil(hi)
-    return math.floor(lo * 10) / 10, math.ceil(hi * 10) / 10
-
-
-def shapes(pairs, var):
-    """Interval and one-sided candidates from the ensemble quantiles: [(shape, assertion, p)]."""
-    out = []
-    for cov in (0.5, 0.65, 0.8):
-        lo, hi = rnd_out(core.wquantile(pairs, 0.5 - cov / 2), core.wquantile(pairs, 0.5 + cov / 2), var)
-        if hi > lo:
-            out.append(("iv%d" % (cov * 100), {"kind": "interval", "low": lo, "high": hi},
-                        core.wprob(pairs, lambda x: lo <= x <= hi)))
-    for q in (0.2, 0.3):
-        lo = rnd_out(core.wquantile(pairs, q), 0, var)[0]
-        hi = rnd_out(0, core.wquantile(pairs, 1 - q), var)[1]
-        out.append(("gtq%d" % (q * 100), {"kind": "threshold", "op": "gt", "value": lo}, core.wprob(pairs, lambda x: x > lo)))
-        out.append(("ltq%d" % (q * 100), {"kind": "threshold", "op": "lt", "value": hi}, core.wprob(pairs, lambda x: x < hi)))
-    return out
-
-
 def focal_means(loc, X, w, var):
     """Naive climatological means of a window stat: years max(1980,X-15)..X and max(1980,X-14)..X."""
     md = core.window_md(w[1], w[2])
@@ -116,7 +103,6 @@ def main():
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-tinker", action="store_true")
-    ap.add_argument("--pool", action="store_true", help="dump every candidate (analysis only, not a valid submission)")
     a = ap.parse_args()
     X, Y = a.year_x, a.year_x + 1
     locs = load(a.data_dir, X)
@@ -150,6 +136,23 @@ def main():
                 "assertion": asr, "confidence": round(min(0.97, max(0.5, p)), 3),
                 "rationale": "%s; %s" % (why, tag)}))
 
+        wmap = {wname: (s, e) for wname, s, e in W}
+        for rank, (wname, var, val) in enumerate(POINTS):
+            w = wmap[wname]
+            pairs = [(st[var], wt) for wt, st in ens[w] if st.get(var) is not None]
+            if len(pairs) < 15:
+                continue
+            if var in core.COUNT_VARS and core.wquantile(pairs, 0.8) < MIN_GAP[var]:
+                continue  # near-zero count: no rival can be 2 days away on the right side
+            med = core.wquantile(pairs, 0.5)
+            v = round(med) if var in core.COUNT_VARS else round(med, 2)
+            g = MIN_GAP[var]
+            p = core.wprob(pairs, lambda x: abs(x - v) < g)
+            cands.append((None, rank, val, {
+                "target": dict(base, window_start=w[0], window_end=w[1], variable=var),
+                "assertion": {"kind": "point", "value": v}, "confidence": round(min(0.97, max(0.05, p)), 3),
+                "rationale": "analog-ensemble median; P(|err|<%g)=%.2f; %s" % (g, p, tag)}))
+
         for wname, s, e in W:
             w = (s, e)
             members = ens[w]
@@ -177,18 +180,11 @@ def main():
                     opts = (("gt", hi, core.wprob(pairs, lambda x: x > hi)),
                             ("le", lo, core.wprob(pairs, lambda x: x <= lo)))
                 op, v, p = max(opts, key=lambda o: o[2])
-                if p < MIN_P and not a.pool:
+                if p < MIN_P:
                     continue
                 tw = TYPE_W.get(("temp" if var in TEMP3 else var, op), 0.5)
                 add(tw * (2 * p - 1), wname, w, var, {"kind": "threshold", "op": op, "value": v}, p,
                     "P=%.2f vs naive clim %.2f" % (p, fm[0]), (var, op))
-            if a.pool:
-                for var in TEMP3 + ("precip_sum_mm", "hot_days_ge_30c", "frost_days_lt_0c", "rainy_days_ge_1mm") + EXTRA:
-                    pairs = [(st[var], wt) for wt, st in members if st.get(var) is not None]
-                    if len(pairs) < 15 or core.wquantile(pairs, 0.9) == core.wquantile(pairs, 0.1):
-                        continue
-                    for shp, asr, p in shapes(pairs, var):
-                        add(0, wname, w, var, asr, p, shp, (var, shp))
             for var, stat in (("warmer_than_year_x", "temp_mean_c"), ("wetter_than_year_x", "precip_sum_mm")):
                 xv = core.year_x_actual(loc, X, w, stat)
                 if xv is None:
@@ -198,24 +194,28 @@ def main():
                 val, p = (True, pt) if pt >= 0.5 else (False, 1 - pt)
                 # trace-rain windows: one drizzle event flips every rival pair at once
                 dry = stat == "precip_sum_mm" and min(xv, core.wquantile(pairs, 0.5)) < DRY_MM
-                if p < (DRY_MIN_P if dry else MIN_P) and not a.pool:
+                if p < (DRY_MIN_P if dry else MIN_P):
                     continue
                 add(TYPE_W[(var, val)] * (2 * p - 1), wname, w, var, {"kind": "boolean", "value": val}, p,
                     "year X %s=%.1f, P(exceed)=%.2f" % (stat, xv, pt), (var, val))
 
-    cands.sort(key=lambda c: -c[0])
-    out, seen = [], set()
-    for _, _, kind, c in cands:
+    # 1) the first POINTS_FIRST point claims of every location; 2) everything else by score
+    # (points valued at 0.35 * priority weight, comparable to a p~0.75 boolean), under the caps.
+    points = [c for c in cands if c[0] is None]
+    first = [c for c in points if c[1] < POINTS_FIRST]
+    rest = [(0.35 * c[2], c[3]) for c in points if c[1] >= POINTS_FIRST]
+    rest += [(c[0], c[3]) for c in cands if c[0] is not None]
+    rest.sort(key=lambda c: -c[0])
+    out, seen, per_loc = [], set(), {}
+    for c in [c[3] for c in first] + [c for _, c in rest]:
         t = c["target"]
         k = (t["location_id"], t["window_start"], t["window_end"], t["variable"])
-        if k in seen and not a.pool:
+        if k in seen or per_loc.get(t["location_id"], 0) >= MAX_PER_LOC:
             continue
         seen.add(k)
-        c = {"claim_id": "p2_%03d" % (len(out) + 1), **c}
-        if a.pool:
-            c["kind_key"] = str(kind)
-        out.append(c)
-        if len(out) >= MAX_CLAIMS and not a.pool:
+        per_loc[t["location_id"]] = per_loc.get(t["location_id"], 0) + 1
+        out.append({"claim_id": "p2_%03d" % (len(out) + 1), **c})
+        if len(out) >= MAX_CLAIMS:
             break
     with open(a.out, "w") as fh:
         json.dump(out, fh, indent=1)

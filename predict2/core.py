@@ -114,7 +114,7 @@ class Params:
     trend_prior = 0.02   # degC/yr prior for local warming
     trend_years = 35     # trailing years used for the local trend
     trend_shrink = 30.0  # pseudo-years pulling the local slope to the prior
-    phi = 0.05           # persistence of year-X annual anomaly
+    phi = 0.15           # persistence of year-X annual anomaly
     jitter = 0.5         # degC kernel sd on top of analog spread
     precip_jitter = 0.12 # log-sd multiplicative precip kernel
     min_years_for_x = 1

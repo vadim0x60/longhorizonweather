@@ -1,16 +1,16 @@
 {
-  "round": 2,
-  "started_at_utc": "2026-11-21T23:28:00Z",
+  "round": 3,
+  "started_at_utc": "2026-11-22T00:15:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": 0,
+    "predict1": 39,
     "predict2": 0,
-    "predict3": 1,
-    "predict4": 0,
-    "predict5": 0,
-    "predict6": 0,
-    "predict7": 0,
-    "predict8": -1,
+    "predict3": 3,
+    "predict4": 26,
+    "predict5": -15,
+    "predict6": -36,
+    "predict7": -22,
+    "predict8": 5,
     "predict9": 0,
     "predict10": 0
   },
@@ -56,6 +56,27 @@
         "predict10": 0
       },
       "note": "All 10 predictors submitted 150 accepted claims (331 shared targets, 31 both-sided threshold pairs), yielding 1 disjoint contradiction (toronto_ca hot_days_ge_30c: predict3 lt 6 beat predict8 gt 6.0 vs truth 0). The remaining 30 both-sided threshold pairs did not contradict because predictors placed asymmetric 62-70% gt/lt thresholds leaving an overlapping middle band. CONTRACTS.md updated for Round 3 to add `point` forecast duels and break the honeypot stalemate."
+    },
+    {
+      "round": 3,
+      "timestamp_utc": "2026-11-22T00:48:00Z",
+      "year_x": 1992,
+      "year_x_plus_1": 1993,
+      "contradictions_count": 261,
+      "resolved_count": 261,
+      "scores_delta": {
+        "predict1": 39,
+        "predict2": 0,
+        "predict3": 2,
+        "predict4": 26,
+        "predict5": -15,
+        "predict6": -36,
+        "predict7": -22,
+        "predict8": 6,
+        "predict9": 0,
+        "predict10": 0
+      },
+      "note": "261 point duels resolved on X=1992 -> 1993 (temp_mean_c: 65, temp_mean_max_c: 54, temp_mean_min_c: 7, precip_sum_mm: 124, hot_days_ge_30c: 11). predict1 (+39) and predict4 (+26) dominated temperature duels while predict6 (-36), predict7 (-22), and predict5 (-15) lost on trend/extreme over-extrapolation. predict9 and predict10 hit ChatGPT subscription sharing usage limits at Round 3 start and remained on their Round 2 code."
     }
   ]
 }

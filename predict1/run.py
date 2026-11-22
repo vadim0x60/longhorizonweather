@@ -34,6 +34,23 @@ from collections import defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRE1980 = os.path.join(HERE, "data", "era5_monthly_pre1980.csv")
 MAX_CLAIMS = 150
+CATALOG = {  # CONTRACTS.md shared benchmark coordinates (verify checks lat/lon against these)
+    "london_uk": (51.5074, -0.1278), "new_york_us": (40.7128, -74.0060), "tokyo_jp": (35.6762, 139.6503),
+    "sydney_au": (-33.8688, 151.2093), "cairo_eg": (30.0444, 31.2357), "mumbai_in": (19.0760, 72.8777),
+    "sao_paulo_br": (-23.5505, -46.6333), "reykjavik_is": (64.1466, -21.9426), "nairobi_ke": (-1.2921, 36.8219),
+    "phoenix_us": (33.4484, -112.0740), "singapore_sg": (1.3521, 103.8198), "chicago_us": (41.8781, -87.6298),
+    "moscow_ru": (55.7558, 37.6173), "cape_town_za": (-33.9249, 18.4241), "lima_pe": (-12.0464, -77.0428),
+    "bangkok_th": (13.7563, 100.5018), "anchorage_us": (61.2181, -149.9003), "madrid_es": (40.4168, -3.7038),
+    "seoul_kr": (37.5665, 126.9780), "toronto_ca": (43.6532, -79.3832)}
+MAX_PER_LOC = 12
+MIN_POINTS = 70     # contract requires >= 60 point claims; keep a margin
+POINTS_PER_LOC = 5
+# Point targets in priority order: canonical windows rivals are told to use, ordered by
+# backtested duel edge vs. 15-year climatology/trend points (temperatures strongest).
+POINT_TARGETS = [("year", "temp_mean_c"), ("year", "temp_mean_max_c"), ("jja", "temp_mean_c"),
+                 ("year", "temp_max_c"), ("year", "precip_sum_mm"), ("jf", "temp_mean_c"),
+                 ("year", "temp_mean_min_c"), ("son", "temp_mean_c"), ("q4", "temp_mean_c"),
+                 ("q1", "temp_mean_c"), ("mam", "temp_mean_c"), ("m07", "temp_mean_c")]
 MIN_P = 0.7  # offensive bets only with a real edge: backtests vs. rivals' claims lose below ~0.7
 DEF_W = 0.5  # weight of "honeypot" value: a likely-true claim on a target rivals often claim
 WIN_PRIOR = {"year": 0.3, "jja": 0.2, "mam": 0.1, "son": 0.1, "jf": 0.05}
@@ -290,6 +307,115 @@ class Empirical(Predictive):
 
 
 # ----------------------------------------------------------------- forecaster
+def load_enso(data_dir, X):
+    """{year: Oct-Dec mean Nino3.4 anomaly} for years <= X, from indices_monthly.json."""
+    p = os.path.join(data_dir, "indices_monthly.json")
+    out = {}
+    try:
+        rows = json.load(open(p))["series"]["nino34_anom"]
+    except Exception:
+        return out
+    acc = defaultdict(list)
+    for r in rows:
+        y, m = int(r["date"][:4]), int(r["date"][5:7])
+        if y <= X and m >= 10 and r["value"] is not None:
+            acc[y].append(r["value"])
+    return {y: sum(v) / len(v) for y, v in acc.items() if len(v) == 3}
+
+
+def _solve(A, b):
+    n = len(b)
+    M = [row[:] + [b[i]] for i, row in enumerate(A)]
+    for i in range(n):
+        piv = max(range(i, n), key=lambda r: abs(M[r][i]))
+        M[i], M[piv] = M[piv], M[i]
+        if abs(M[i][i]) < 1e-12:
+            return [0.0] * n
+        for r in range(n):
+            if r != i:
+                f = M[r][i] / M[i][i]
+                for c in range(i, n + 1):
+                    M[r][c] -= f * M[i][c]
+    return [M[i][n] / M[i][i] for i in range(n)]
+
+
+class Corrector:
+    """Ridge correction of the ensemble's standardized residual for target year t,
+    from causal predictors of year t-1: this location's Oct-Dec temperature residual
+    (persistence), the network mean of those residuals, and Oct-Dec Nino3.4 with a
+    per-location coefficient. Fitted by walk-forward rows with t <= X only."""
+
+    RIDGE = 30.0
+    RIDGE_ENSO = 60.0
+
+    def __init__(self, F, enso):
+        self.F, self.enso = F, enso
+        self.q4 = {}
+        for loc in F.locs:
+            ser = F.series.get((loc, "q4", "temp_mean_c"), {})
+            for t in ser:
+                r = self._res(ser, t, "temp_mean_c")
+                if r is not None:
+                    self.q4[(loc, t)] = r
+        by_t = defaultdict(list)
+        for (loc, t), r in self.q4.items():
+            by_t[t].append(r)
+        self.net = {t: sum(v) / len(v) for t, v in by_t.items() if len(v) >= 3}
+        self.coef, self.ecoef = {}, {}
+        rows = defaultdict(list)
+        erows = defaultdict(list)
+        for (loc, wname, var), ser in F.series.items():
+            for t in ser:
+                if t > F.X:
+                    continue
+                e = self._res(ser, t, var)
+                x = self.feats(loc, t)
+                if e is None or x is None:
+                    continue
+                rows[(var, wname)].append((x, e))
+                erows[(loc, var, wkind(wname))].append((x, e))
+        for k, rs in rows.items():
+            self.coef[k] = self._ridge([x[:2] for x, _ in rs], [e for _, e in rs], self.RIDGE)
+        for k, rs in erows.items():
+            (var, wname) = k[1], None
+            # ENSO effect on what the first two features leave unexplained
+            out = []
+            for x, e in rs:
+                out.append(([x[2]], e))
+            self.ecoef[k] = self._ridge([x for x, _ in out], [e for _, e in out], self.RIDGE_ENSO)[0]
+
+    def _res(self, ser, t, var):
+        if sum(1 for y in ser if y < t) < 8:
+            return None
+        s = scale_of(ser)
+        if not s or s < 1e-6:
+            return None
+        w = self.F.model.get(var, {"w": (1, 0, 0, 0)})["w"]
+        return (ser[t] - sum(wi * ci for wi, ci in zip(w, base_forecasts(ser, t)))) / s
+
+    def feats(self, loc, t):
+        a, n = self.q4.get((loc, t - 1)), self.net.get(t - 1)
+        if a is None or n is None:
+            return None
+        return (a, n, self.enso.get(t - 1, 0.0))
+
+    @staticmethod
+    def _ridge(X, y, lam):
+        k = len(X[0]) if X else 0
+        if not X:
+            return [0.0] * k
+        A = [[sum(r[i] * r[j] for r in X) + (lam if i == j else 0.0) for j in range(k)] for i in range(k)]
+        b = [sum(r[i] * v for r, v in zip(X, y)) for i in range(k)]
+        return _solve(A, b)
+
+    def shift(self, loc, wname, var, t):
+        x = self.feats(loc, t)
+        if x is None:
+            return 0.0
+        c = self.coef.get((var, wname), [0.0, 0.0])
+        return c[0] * x[0] + c[1] * x[1] + self.ecoef.get((loc, var, wkind(wname)), 0.0) * x[2]
+
+
 def month_window(y, m1, m2):
     return f"{y}-{m1:02d}-01", f"{y}-{m2:02d}-{calendar.monthrange(y, m2)[1]:02d}"
 
@@ -317,6 +443,8 @@ class Forecaster:
                 aggregate_daily(p, X, aggs, self.locs)
         if not self.locs:
             raise SystemExit("no daily data found in --data-dir")
+        for loc in self.locs:
+            self.locs[loc] = CATALOG.get(loc, self.locs[loc])
         years = sorted({y for (_, y, _) in aggs if y <= X})
         self.series, self.monthly = {}, {}
         for loc in self.locs:
@@ -326,6 +454,7 @@ class Forecaster:
                     self.series[(loc, wname, v)] = sr
                 self.monthly[(loc, wname)] = monthly
         self.model, self.resid = fit_ensemble(self.series, X)
+        self.corr = Corrector(self, load_enso(data_dir, X))
         self.tinker_pred, self.blend = {}, 0.0
         if use_tinker and os.environ.get("TINKER_API_KEY"):
             try:
@@ -356,6 +485,8 @@ class Forecaster:
             if s and s > 1e-6 and eps and len(eps) >= 30:
                 w = self.model.get(var, {"w": (1, 0, 0, 0)})["w"]
                 m = sum(wi * ci for wi, ci in zip(w, base_forecasts(series, self.X + 1)))
+                if not os.environ.get("P1_NOCORR"):
+                    m += s * self.corr.shift(loc, wname, var, self.X + 1)
                 tp = self.tinker_pred.get(key)
                 if tp is not None:
                     m = (1 - self.blend) * m + self.blend * tp
@@ -363,6 +494,20 @@ class Forecaster:
                 d = Predictive(m, s, eps, lo)
         self._cache[key] = d
         return d
+
+    def point(self, loc, wname, var):
+        """Point forecast: median shrunk toward the 15-year climatology/trend blend that
+        rivals typically use (lower backtest MAE than either alone)."""
+        d = self.dist(loc, wname, var)
+        ser = self.series.get((loc, wname, var))
+        if d is None:
+            return None
+        ys = [y for y in sorted(ser) if self.X - 15 <= y <= self.X]
+        vs = [ser[y] for y in ys]
+        half = 0.5 * sum(vs) / len(vs) + 0.5 * ols_predict(ys, vs, self.X + 1)
+        a = 0.5 if var.startswith("precip") else 0.25
+        v = (1 - a) * d.q(0.5) + a * half
+        return max(0.0, v) if (var in COUNT_VARS or var.startswith("precip")) else v
 
     def p_bool(self, loc, wname, bvar):
         """P(warmer/wetter than year X) and the year-X value."""
@@ -579,16 +724,41 @@ def build_claims(F, opp):
                     cands.append((best[0], cp[best[1]], dict(tgt, variable=cvar),
                                   {"kind": "categorical", "value": best[1]},
                                   f"P={cp[best[1]]:.2f} ({cvar}); exp. gain {best[0]:.3f}"))
-    # rank by expected contradiction gain, then by probability of being right
+    # 1) point forecasts on the canonical targets rivals are most likely to duel on
+    by_loc = defaultdict(list)
+    point_keys = set()
+    n_pts = min(MAX_PER_LOC, max(POINTS_PER_LOC, -(-MIN_POINTS // max(1, len(F.locs)))))
+    for loc, (lat, lon) in sorted(F.locs.items()):
+        for wname, var in POINT_TARGETS:
+            if len(by_loc[loc]) >= n_pts:
+                break
+            d = F.dist(loc, wname, var)
+            pv = F.point(loc, wname, var)
+            if d is None or pv is None:
+                continue
+            m1, m2 = [(a, b) for n, a, b in windows() if n == wname][0]
+            ws, we = month_window(Y, m1, m2)
+            tgt = {"location_id": loc, "lat": lat, "lon": lon, "window_start": ws, "window_end": we, "variable": var}
+            by_loc[loc].append((tgt, {"kind": "point", "value": round(pv, 2)}, 0.5,
+                                f"point: 0.75*median + 0.25*15-yr blend (precip 0.5); sd {d.s:.2f}"))
+            point_keys.add((loc, wname, var))
+    # 2) remaining slots: honeypot / offensive claims, ranked by expected contradiction gain
     cands.sort(key=lambda c: (-round(c[0], 4), -c[1]))
-    claims = []
+    n_total = sum(len(v) for v in by_loc.values())
     for ev, p, tgt, a, why in cands:
-        if ev <= 1e-4 and p < 0.75:
-            continue
-        claims.append({"claim_id": f"p1_{len(claims) + 1:03d}", "target": tgt, "assertion": a,
-                       "confidence": round(min(0.99, max(0.01, p)), 3), "rationale": why[:300]})
-        if len(claims) >= MAX_CLAIMS:
+        if n_total >= MAX_CLAIMS:
             break
+        loc = tgt["location_id"]
+        key = (loc, window_name(tgt["window_start"], tgt["window_end"]), tgt["variable"])
+        if key in point_keys or len(by_loc[loc]) >= MAX_PER_LOC or (ev <= 1e-4 and p < 0.75):
+            continue
+        by_loc[loc].append((tgt, a, p, why))
+        n_total += 1
+    claims = []
+    for loc in sorted(by_loc):
+        for tgt, a, p, why in by_loc[loc]:
+            claims.append({"claim_id": f"p1_{len(claims) + 1:03d}", "target": tgt, "assertion": a,
+                           "confidence": round(min(0.99, max(0.01, p)), 3), "rationale": why[:300]})
     return claims, cands
 
 

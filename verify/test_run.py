@@ -102,6 +102,33 @@ class DisjointTests(unittest.TestCase):
         self.assertFalse(self.d(c("07"), c("07"), "hottest_month"))
 
 
+def pt(v):
+    return {"kind": "point", "value": v}
+
+
+class PointDisagreementTests(unittest.TestCase):
+    def test_min_gap_boundaries(self):
+        # Exactly the gap counts, even with float noise (15.30 - 15.05 = 0.2500000000000018 / 0.24999...).
+        self.assertTrue(V.points_disagree("temp_mean_c", pt(15.30), pt(15.05)))
+        self.assertTrue(V.points_disagree("temp_mean_c", pt(0.1 + 0.2), pt(0.05)))
+        self.assertFalse(V.points_disagree("temp_mean_c", pt(15.29), pt(15.05)))
+        self.assertTrue(V.points_disagree("temp_max_c", pt(30.0), pt(30.5)))
+        self.assertFalse(V.points_disagree("temp_max_c", pt(30.0), pt(30.4)))
+        self.assertTrue(V.points_disagree("precip_sum_mm", pt(500), pt(520)))
+        self.assertFalse(V.points_disagree("precip_sum_mm", pt(500), pt(519.9)))
+        self.assertTrue(V.points_disagree("precip_max_day_mm", pt(40), pt(37)))
+        self.assertFalse(V.points_disagree("wind_max_kmh", pt(60), pt(61.9)))
+        self.assertTrue(V.points_disagree("hot_days_ge_30c", pt(10), pt(12)))
+        self.assertFalse(V.points_disagree("frost_days_lt_0c", pt(10), pt(11)))
+        self.assertTrue(V.points_disagree("rainy_days_ge_1mm", pt(150), pt(148)))
+
+    def test_point_never_set_disjoint(self):
+        # A point is only compared with another point, never with a threshold or interval.
+        self.assertFalse(V.assertions_disjoint("temp_mean_c", pt(5), th("gt", 10)))
+        self.assertFalse(V.assertions_disjoint("temp_mean_c", pt(5), iv(10, 20)))
+        self.assertFalse(V.points_disagree("temp_mean_c", pt(5), th("gt", 10)))
+
+
 class ValidationTests(unittest.TestCase):
     def test_window_must_be_in_year_x_plus_1(self):
         for ws, we in [(f"{X}-12-31", f"{Y}-01-31"), (f"{Y}-06-01", f"{Y + 1}-01-01"),
@@ -138,17 +165,46 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(V.ClaimError):
             V.validate_claim(claim("x", loc="grid_10.5_-20.25", lat=10.5, lon=-20.25), X)
 
-    def test_antispam_duplicates_and_cap(self):
+    def test_antispam_duplicates_and_total_cap(self):
         raw = [claim("a"), claim("dup", assertion=th("lt", 0)), claim("bad", var="nope")]
-        raw += [claim(f"m{d}", ws=f"{Y}-01-01", we=(dt.date(Y, 1, 1) + dt.timedelta(days=d)).isoformat())
-                for d in range(200)]
+        # 20 locations x 11 windows = 220 more claims, at most 12 per location including "a".
+        raw += [claim(f"{loc}{d}", loc=loc, ws=f"{Y}-01-01",
+                      we=(dt.date(Y, 1, 2) + dt.timedelta(days=d)).isoformat())
+                for loc in V.CATALOG for d in range(11)]
         acc, rej = V.filter_claims("predict3", raw, X)
         self.assertEqual(len(acc), 150)
         self.assertEqual(acc[0]["claim_id"], "a")  # first claim per key wins
         reasons = [r["reason"] for r in rej]
         self.assertTrue(reasons[0].startswith("duplicate"))
         self.assertTrue(reasons[1].startswith("invalid"))
-        self.assertEqual(sum(r.startswith("exceeds") for r in reasons), 51)
+        self.assertEqual(sum("per predictor" in r for r in reasons), 221 - 150)
+        self.assertFalse(any("claims for" in r for r in reasons))  # no location exceeded 12
+
+    def test_per_location_cap(self):
+        # 15 London claims then 1 Tokyo claim: claims 13-15 for London are rejected, Tokyo kept.
+        raw = [claim(f"l{d}", ws=f"{Y}-01-01", we=(dt.date(Y, 1, 1) + dt.timedelta(days=d)).isoformat())
+               for d in range(15)]
+        raw.append(claim("t0", loc="tokyo_jp"))
+        acc, rej = V.filter_claims("predict3", raw, X)
+        self.assertEqual([c["claim_id"] for c in acc], [f"l{d}" for d in range(12)] + ["t0"])
+        self.assertEqual([r["claim_id"] for r in rej], ["l12", "l13", "l14"])
+        self.assertTrue(all(r["reason"] == "exceeds 12 claims for london_uk" for r in rej))
+        # An invalid or duplicate claim does not use up a location's quota.
+        raw = [claim("bad", assertion=th("eq", 1)), claim("d0"), claim("d0dup")]
+        raw += [claim(f"x{d}", we=(dt.date(Y, 6, 1) + dt.timedelta(days=d)).isoformat()) for d in range(11)]
+        acc, _ = V.filter_claims("predict3", raw, X)
+        self.assertEqual(len(acc), 12)
+
+    def test_point_validation(self):
+        c = V.validate_claim(claim("x", assertion={"kind": "point", "value": 15.3}), X)
+        self.assertEqual(c["assertion"], {"kind": "point", "value": 15.3})
+        V.validate_claim(claim("x", var="hot_days_ge_30c", assertion={"kind": "point", "value": 4}), X)
+        for bad in ({"kind": "point", "value": "15"}, {"kind": "point", "value": True},
+                    {"kind": "point", "value": float("nan")}, {"kind": "point"}):
+            with self.assertRaises(V.ClaimError):
+                V.validate_claim(claim("x", assertion=bad), X)
+        with self.assertRaises(V.ClaimError):  # not for booleans / categoricals
+            V.validate_claim(claim("x", var="warmer_than_year_x", assertion={"kind": "point", "value": 1}), X)
 
     def test_load_missing_empty_bad(self):
         with tempfile.TemporaryDirectory() as td:
@@ -272,6 +328,44 @@ class ScoringTests(unittest.TestCase):
         # One batched year X+1 fetch, no year X fetch (no boolean targets).
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][1:], (f"{Y}-01-01", f"{Y}-12-31"))
+
+    def test_point_duels(self):
+        # Truth: June mean temperature 10.0, June precip 20 * 2.0 = 40 mm.
+        with tempfile.TemporaryDirectory() as td:
+            self.write(td, {
+                "predict1.json": [claim("a1", assertion=pt(10.2)),                       # error 0.2
+                                  claim("a2", var="precip_sum_mm", assertion=pt(30.0)),  # error 10
+                                  claim("a3", var="temp_max_c", assertion=pt(11.5))],    # error 0.5
+                "predict2.json": [claim("b1", assertion=pt(9.7)),                        # error 0.3
+                                  claim("b2", var="precip_sum_mm", assertion=pt(50.0)),  # error 10 -> tie
+                                  claim("b3", var="temp_max_c", assertion=pt(12.2))],    # gap 0.7
+                "predict3.json": [claim("c1", assertion=pt(10.05)),                      # 0.15 from p1: no duel
+                                  claim("c2", var="precip_sum_mm", assertion=pt(45.0)),  # < 20 from both
+                                  claim("c3", var="temp_max_c", assertion=th("gt", 12))],
+            })
+            r = V.run(X, Path(td), self.fetch)
+        pairs = {(c["a"]["claim_id"], c["b"]["claim_id"]): c for c in r["contradictions"]}
+        # c1 vs b1: gap 0.35 -> duel, c1 error 0.05 beats b1 error 0.3. a1 vs c1: gap 0.15 -> none.
+        self.assertEqual(set(pairs), {("a1", "b1"), ("b1", "c1"), ("a2", "b2"), ("a3", "b3")})
+        self.assertEqual(pairs[("a1", "b1")]["status"], "a_wins")
+        self.assertEqual(pairs[("b1", "c1")]["status"], "b_wins")
+        self.assertEqual(pairs[("a2", "b2")]["status"], "tie")
+        self.assertEqual((pairs[("a2", "b2")]["delta_a"], pairs[("a2", "b2")]["delta_b"]), (0, 0))
+        self.assertEqual(pairs[("a3", "b3")]["status"], "b_wins")  # truth 12.0: errors 0.5 vs 0.2
+        self.assertEqual(r["scores_delta"]["predict1"], 0)    # +1 (a1), -1 (a3)
+        self.assertEqual(r["scores_delta"]["predict2"], -1)   # -1 (b1 vs a1), -1 (b1 vs c1), +1 (b3)
+        self.assertEqual(pairs[("a1", "b1")]["kind"], "point")
+        self.assertEqual(r["resolved_count"], 4)
+        self.assertEqual(r["scores_delta"]["predict3"], 1)
+        self.assertEqual(sum(r["scores_delta"].values()), 0)
+
+    def test_point_duel_unresolvable(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.write(td, {"predict1.json": [claim("a", loc="tokyo_jp", assertion=pt(20.0))],
+                            "predict2.json": [claim("b", loc="tokyo_jp", assertion=pt(21.0))]})
+            r = V.run(X, Path(td), self.fetch)
+        self.assertEqual(r["contradictions"][0]["status"], "unresolvable")
+        self.assertEqual(r["resolved_count"], 0)
 
     def test_both_wrong_is_draw(self):
         with tempfile.TemporaryDirectory() as td:

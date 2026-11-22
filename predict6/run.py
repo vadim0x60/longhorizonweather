@@ -16,7 +16,11 @@ Models each yearly target series y_t (one value per trailing year <= X) as
   A late-X El Nino makes us call a warmer X+1 where mean-reversion models call
   cooling; a La Nina makes us call "le baseline" against warming extrapolators.
 
-Claims are thresholds at the naive 15/16-year climatologies that trend and
+Round 3: 100 `point` claims (5 per location: annual temp_mean/max/min, annual
+precip_sum, JJA temp_mean) carrying the model median, then the best-ranked
+thresholds/booleans below, capped at 12 claims per location_id.
+
+Other claims are thresholds at the naive 15/16-year climatologies that trend and
 climatology rivals anchor on (so a disagreement is an exact contradiction),
 plus warmer/wetter-than-year-X booleans. Candidates are ranked by
 (2p - 1) x how often rivals take the opposite side of that kind of target.
@@ -249,6 +253,12 @@ def cat_weight(cat, side):
 
 
 PMIN = 0.60
+MAX_PER_LOC = 12  # CONTRACTS.md Round 3
+# Point forecasts (Round 3 duels, closer to truth wins). Backtest X=2000..2023: on whole-year
+# windows the model median beats 15/16-y climatology, OLS trend and persistence in ~60-64%
+# of duels with gap >= min_gap; on seasons a 50/50 blend with the 10-y mean duels best.
+POINT_SPECS = [("year", "temp_mean_c"), ("year", "temp_mean_max_c"), ("year", "temp_mean_min_c"),
+               ("year", "precip_sum_mm"), ("jja", "temp_mean_c")]
 BOOL_PMIN = 0.70  # booleans near 0.6 lost more contradictions than they won in backtests
 
 
@@ -288,6 +298,15 @@ def candidates(rows, meta, X, enso):
                 model = (f"trend {f['trend']:+.3f}/y, AR phi={f['phi']:.2f},{cyc} fcst {f['mu']:.2f}"
                          f"±{f['sigma']:.2f}")
                 cdf = lambda v: ND.cdf((v - f["mu"]) / f["sigma"])
+                if (win, var) in POINT_SPECS:
+                    pv = f["mu"]
+                    if win != "year" and var in TEMP_VARS:
+                        pv = 0.5 * pv + 0.5 * sum(vs[-10:]) / len(vs[-10:])
+                    pv = max(pv, 0.0) if var == "precip_sum_mm" else pv
+                    out.append((1.0, ("point", var, wclass(win)), {
+                        "target": target(loc, win, var),
+                        "assertion": {"kind": "point", "value": round(pv, 1 if var == "precip_sum_mm" else 2)},
+                        "confidence": 0.5, "rationale": "Point forecast (model median); " + model + "."}))
                 # thresholds at the naive climatologies a trend/climatology rival anchors on
                 b16 = sum(vs) / len(vs)
                 r15 = [v for y, v in zip(ys, vs) if y >= X - 14]
@@ -334,11 +353,19 @@ def main():
         def side(c):
             a = c["assertion"]
             return a.get("op", a.get("value"))
+        points = [c for p, cat, c in cands if cat[0] == "point"]
         ranked = sorted(((2 * p - 1) * (cat_weight(cat, side(c)) + 0.01), i)
                         for i, (p, cat, c) in enumerate(cands)
-                        if p >= (BOOL_PMIN if cat[0] == "bool" else PMIN))
-        for _, i in reversed(ranked):
-            out.append({"claim_id": f"p6_{len(out) + 1:03d}", **cands[i][2]})
+                        if cat[0] != "point" and p >= (BOOL_PMIN if cat[0] == "bool" else PMIN))
+        per_loc, seen = defaultdict(int), set()
+        for c in points + [cands[i][2] for _, i in reversed(ranked)]:
+            t = c["target"]
+            key = (t["location_id"], t["window_start"], t["window_end"], t["variable"])
+            if per_loc[t["location_id"]] >= MAX_PER_LOC or key in seen:
+                continue  # one claim per target: the point claim wins over a threshold
+            seen.add(key)
+            per_loc[t["location_id"]] += 1
+            out.append({"claim_id": f"p6_{len(out) + 1:03d}", **c})
             if len(out) >= MAX_CLAIMS:
                 break
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

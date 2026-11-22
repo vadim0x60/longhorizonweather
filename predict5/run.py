@@ -24,9 +24,13 @@ from collections import defaultdict
 from datetime import date, timedelta
 
 MAX_CLAIMS = 150
-PER_LOCATION = 10
+PER_LOCATION = 12   # CONTRACTS.md round 3: at most 12 claims per location_id
+MIN_POINTS = 60     # CONTRACTS.md round 3: at least 60 point claims
 PRIOR_SLOPE_C_PER_YR = 0.025  # global-mean land warming since 1980, roughly
-PRIOR_WEIGHT_YEARS = 8.0       # prior counts like this many years of slope evidence
+PRIOR_WEIGHT_YEARS = 16.0      # prior counts like this many years of slope evidence (temperatures)
+COUNT_PRIOR_WEIGHT_YEARS = 8.0  # same, for hot/frost day counts
+# ENSO lag helped point skill for daily-mean and daily-min temperatures only (backtest).
+ENSO_VARS = ("temp_mean_c", "temp_mean_min_c")
 ENSO_RIDGE_YEARS = 6.0         # ridge on the ENSO lag coefficient, in years of evidence; None disables
 
 _MDAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
@@ -74,6 +78,18 @@ FAMILY_WEIGHT = {
     "temp_mean_c|gt_q65|quarter": (0.6, 0.6),
     "temp_mean_c|gt_q65|month": (0.3, 0.6),
 }
+
+
+# Point claims, in priority order per location. Backtest X = 1996..2023 of this forecaster vs a
+# 15-year-climatology point forecaster (duels with gap >= min_gap): annual temp_mean_c 152-67,
+# annual temp_mean_max_c 209-102, annual temp_mean_min_c 130-68, seasonal temp_mean_c 593-446,
+# hot days ~even, frost days ~even. Precipitation is not claimed (no edge over climatology).
+POINT_PLAN = [
+    ("temp_mean_c", "year"), ("temp_mean_max_c", "year"), ("temp_mean_min_c", "year"),
+    ("temp_mean_c", "JJA"), ("temp_mean_c", "JF"), ("hot_days_ge_30c", "year"),
+    ("temp_mean_c", "MAM"), ("temp_mean_c", "SON"), ("temp_mean_max_c", "JJA"),
+]
+POINT_SLOTS = 120   # the remaining 30 slots go to the best threshold/boolean claims
 
 
 def phi(z):
@@ -130,6 +146,9 @@ def stat(days, ds, var):
         return float(sum(1 for r in rows if r[1] is not None and r[1] >= 30.0))
     if var == "frost_days_lt_0c":
         return float(sum(1 for r in rows if r[2] is not None and r[2] < 0.0))
+    if var == "precip_sum_mm":
+        xs = [r[3] for r in rows if r[3] is not None]
+        return sum(xs) * len(ds) / len(xs) if xs else None
     raise ValueError(var)
 
 
@@ -163,14 +182,15 @@ def enso_adjust(yrs, ys, pred_fn, enso, x):
     return beta * (enso[x] - nbar), beta
 
 
-def trend_forecast(years, ys, target_year, prior_slope):
+def trend_forecast(years, ys, target_year, prior_slope, prior_weight=None):
     """OLS slope shrunk toward prior_slope; returns (pred, predictive_sd, slope)."""
     n = len(ys)
     ybar = sum(ys) / n
     tbar = sum(years) / n
     sxx = sum((t - tbar) ** 2 for t in years)
     b_ols = sum((t - tbar) * (y - ybar) for t, y in zip(years, ys)) / sxx if sxx else 0.0
-    w_prior = PRIOR_WEIGHT_YEARS ** 3 / 12.0  # sxx of an 8-year evenly spaced series
+    pw = PRIOR_WEIGHT_YEARS if prior_weight is None else prior_weight
+    w_prior = pw ** 3 / 12.0  # sxx of a pw-year evenly spaced series
     b = (sxx * b_ols + w_prior * prior_slope) / (sxx + w_prior)
     resid = [y - (ybar + b * (t - tbar)) for t, y in zip(years, ys)]
     s = math.sqrt(sum(r * r for r in resid) / max(n - 2, 1))
@@ -211,12 +231,13 @@ def build_pool(locs, x, enso=None):
                 ys = [v for _, v in series]
                 base = sum(ys) / len(ys)
                 if var in TEMP_VARS:
-                    prior = PRIOR_SLOPE_C_PER_YR * (1.3 if var == "temp_mean_min_c" else 1.0)
+                    prior, pw = PRIOR_SLOPE_C_PER_YR * (1.3 if var == "temp_mean_min_c" else 1.0), None
                 else:
                     if base < 2.0 or base > 0.95 * len(span[x]):
                         continue
                     prior = (0.02 if var == "hot_days_ge_30c" else -0.02) * base
-                pred, sd, b, fit = trend_forecast(yrs, ys, target_year, prior)
+                    pw = COUNT_PRIOR_WEIGHT_YEARS
+                pred, sd, b, fit = trend_forecast(yrs, ys, target_year, prior, pw)
                 items.append(dict(lid=lid, loc=loc, wname=wname, s=s, e=e, wk=window_kind(wname),
                                   var=var, yrs=yrs, ys=ys, base=base, pred=pred, sd=sd, b=b, fit=fit))
     out = []
@@ -224,8 +245,16 @@ def build_pool(locs, x, enso=None):
         lid, loc, wname, s, e, wk, var = (it[k] for k in ("lid", "loc", "wname", "s", "e", "wk", "var"))
         yrs, ys, base, sd, b = it["yrs"], it["ys"], it["base"], it["sd"], it["b"]
         sd_clim = math.sqrt(sum((v - base) ** 2 for v in ys) / (len(ys) - 1))
-        shift = enso_adjust(yrs, ys, it["fit"], enso, x)[0]
+        shift = enso_adjust(yrs, ys, it["fit"], enso, x)[0] if var in ENSO_VARS else 0.0
         pred = it["pred"] + shift
+        if var not in TEMP_VARS:
+            pred = max(pred, 0.0)
+        # Point forecast: the predictive mean (median of the Normal), for point duels.
+        out.append(_cand(lid, loc, wname, s, e, var,
+                         {"kind": "point", "value": round(pred, 2 if var in TEMP_VARS else 1)}, 1.0,
+                         f"{var}|point|{wk}",
+                         f"point forecast: 15y mean {base:.2f}, trend {b * 10:+.2f}/decade,"
+                         f" ENSO lag {shift:+.2f} -> {pred:.2f} (sd {sd:.2f})"))
         if var in TEMP_VARS:
             info = (f"15y mean {base:.2f}C, trend {b * 10:+.2f}C/decade, ENSO lag {shift:+.2f}C -> {pred:.2f}C (sd {sd:.2f})")
             # Thresholds at points where cold-leaning rivals put their upper bound.
@@ -270,16 +299,26 @@ def build_pool(locs, x, enso=None):
     return out
 
 
-def select(pool, x, weights=None):
-    """Best family per target, ranked by family weight x edge (2p-1)."""
+def select(pool, x, weights=None, point_plan=None):
+    """Point claims from POINT_PLAN first, then the best other family per target,
+    ranked by family weight x edge (2p-1), within the per-location and total caps."""
     weights = FAMILY_WEIGHT if weights is None else weights
-    scored = []
+    point_plan = POINT_PLAN if point_plan is None else point_plan
+    rank = {k: i for i, k in enumerate(point_plan)}
+    points = [c for c in pool if c["assertion"]["kind"] == "point" and (c["var"], c["wname"]) in rank]
+    # Interleave locations so every location gets its top-priority points before anyone's later ones.
+    points.sort(key=lambda c: (rank[(c["var"], c["wname"])], c["lid"]))
+    scored = [(math.inf, c) for c in points[:POINT_SLOTS]]
+    rest = []
     for c in pool:
+        if c["assertion"]["kind"] == "point":
+            continue
         w, min_p = weights.get(c["family"], (0.0, 1.0))
         if w <= 0 or c["p"] < min_p:
             continue
-        scored.append((w * (2 * c["p"] - 1), c))
-    scored.sort(key=lambda sc: (-sc[0], sc[1]["lid"], sc[1]["wname"], sc[1]["var"]))
+        rest.append((w * (2 * c["p"] - 1), c))
+    rest.sort(key=lambda sc: (-sc[0], sc[1]["lid"], sc[1]["wname"], sc[1]["var"]))
+    scored += rest
     seen, per_loc, claims = set(), defaultdict(int), []
     y1 = x + 1
     for _, c in scored:
@@ -300,7 +339,8 @@ def select(pool, x, weights=None):
             },
             "assertion": c["assertion"],
             # Model p runs hot (interannual noise is fat-tailed); shrink toward 0.5.
-            "confidence": round(0.5 + 0.7 * (min(c["p"], 0.99) - 0.5), 3),
+            "confidence": (0.6 if c["assertion"]["kind"] == "point"
+                           else round(0.5 + 0.7 * (min(c["p"], 0.99) - 0.5), 3)),
             "rationale": f"Secular warming extrapolation ({c['wname']}): {c['why']}",
         })
         if len(claims) >= MAX_CLAIMS:

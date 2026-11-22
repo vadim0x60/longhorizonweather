@@ -20,7 +20,18 @@ Calibration was checked by a walk-forward backtest (X=1988..1994 against the rea
 boolean probabilities match observed frequencies per decile, so they are stated as is; line
 probabilities were overconfident (selection on noise), so they are shrunk halfway to 0.5.
 A Nino3.4 regression term made forecasts worse at <= 16 years of history and is not used.
-Stated confidence is capped at 0.90. Runs offline, stdlib only.
+Stated confidence is capped at 0.90.
+
+Point forecasts (CONTRACTS.md point duels, scored by absolute error): the full model mean
+over-reacts to noisy trends and anomalies, so the point is the trailing 16-year climatology
+moved part of the way toward it, clim16 + lambda * (model - clim16), with lambda = 0.5 for
+temperatures and 0.25 for precipitation and day counts (hot days use the trailing median).
+In the walk-forward backtest (X = 1988..1994 and 2003..2012) this beat pure climatology, the
+full model, persistence, OLS extrapolation and the 10-year mean in head-to-head duels.
+
+Each location gets up to POINTS_PER_LOCATION point claims on the most commonly shared targets,
+then calibrated threshold/boolean claims fill up to 12 per location and 150 in total.
+Runs offline, stdlib only.
 """
 
 from __future__ import annotations
@@ -51,6 +62,8 @@ CATALOG = {
 FIELDS = ["temperature_2m_mean", "temperature_2m_max", "temperature_2m_min",
           "precipitation_sum", "wind_speed_10m_max"]
 MAX_CLAIMS = 150
+MAX_PER_LOCATION = 12
+POINTS_PER_LOCATION = 5
 MIN_YEARS = 6
 
 TEMP_VARS = {"temp_mean_c", "temp_mean_max_c", "temp_mean_min_c"}
@@ -87,6 +100,13 @@ BOOLEAN_JOBS = [
     ("warmer_than_year_x", "temp_mean_c", list(WINDOWS)),
     ("wetter_than_year_x", "precip_sum_mm", list(WINDOWS)),
 ]
+# Point targets in priority order (the targets rivals are most likely to share).
+POINT_JOBS = [("temp_mean_c", "year"), ("temp_mean_c", "jja"), ("precip_sum_mm", "year"),
+              ("temp_mean_max_c", "year"), ("temp_mean_min_c", "year"), ("temp_mean_c", "mam"),
+              ("temp_mean_c", "son"), ("rainy_days_ge_1mm", "year"), ("hot_days_ge_30c", "year"),
+              ("frost_days_lt_0c", "year"), ("precip_sum_mm", "jja"), ("temp_mean_c", "jf")]
+POINT_LAMBDA = {v: 0.5 for v in TEMP_VARS}   # others: 0.25
+POINT_DECIMALS = {"precip_sum_mm": 1}        # others: 2
 VAR_WEIGHT = {"temp_mean_c": 1.0, "temp_mean_max_c": 0.7, "temp_mean_min_c": 0.7,
               "hot_days_ge_30c": 0.6, "frost_days_lt_0c": 0.6,
               "warmer_than_year_x": 0.9, "wetter_than_year_x": 0.8}
@@ -164,6 +184,7 @@ AGG = {
     "precip_sum_mm": ("precipitation_sum", sum),
     "hot_days_ge_30c": ("temperature_2m_max", lambda v: sum(x >= 30.0 for x in v)),
     "frost_days_lt_0c": ("temperature_2m_min", lambda v: sum(x < 0.0 for x in v)),
+    "rainy_days_ge_1mm": ("precipitation_sum", lambda v: sum(x >= 1.0 for x in v)),
 }
 
 
@@ -257,19 +278,33 @@ def threshold_candidate(variable, mean, sd, lines):
     return {"kind": "threshold", "op": "gt", "value": hi}, p_gt, f"highest rival line {hi}"
 
 
+def point_forecast(series: dict, year_x: int, variable: str):
+    """Point forecast (value, model mean, sd) for X+1, or None. See the module docstring."""
+    f = forecast(series, year_x, variable)
+    if f is None:
+        return None
+    recent = [v for y, v in series.items() if y >= max(1980, year_x - 15)]
+    clim = statistics.median(recent) if variable == "hot_days_ge_30c" else statistics.mean(recent)
+    lam = 0.0 if variable == "hot_days_ge_30c" else POINT_LAMBDA.get(variable, 0.25)
+    value = clim + lam * (f[0] - clim)
+    if variable not in TEMP_VARS:
+        value = max(value, 0.0)
+    return round(value, POINT_DECIMALS.get(variable, 2)), f[0], f[1]
+
+
 def build_claims(year_x: int, daily, coords):
     y1 = year_x + 1
-    candidates = []
+    candidates, points = [], []
 
-    def add(loc, wname, variable, assertion, p, rationale):
+    def add(loc, wname, variable, assertion, p, rationale, out=None):
         lat, lon = claim_coords(loc, coords.get(loc))
         ws, we = window_dates(y1, wname)
-        candidates.append({
+        (candidates if out is None else out).append({
             "target": {"location_id": loc, "lat": lat, "lon": lon, "window_start": ws.isoformat(),
                        "window_end": we.isoformat(), "variable": variable},
             "assertion": assertion, "confidence": round(min(max(p, 0.5), MAX_CONF), 3),
             "rationale": rationale,
-            "_rank": (p - 0.5) * WINDOW_WEIGHT[wname] * VAR_WEIGHT[variable],
+            "_rank": (p - 0.5) * WINDOW_WEIGHT[wname] * VAR_WEIGHT.get(variable, 0.5),
         })
 
     for loc in sorted(daily):
@@ -291,6 +326,23 @@ def build_claims(year_x: int, daily, coords):
 
         def model(variable, wname):
             return forecast(series(variable, wname), year_x, variable)
+
+        n_points = 0
+        for variable, wname in POINT_JOBS:
+            if n_points >= POINTS_PER_LOCATION:
+                break
+            s = series(variable, wname)
+            if variable in COUNT_VARS and (not s or statistics.mean(s.values()) < 3):
+                continue  # near-zero counts make uninformative duels
+            pf = point_forecast(s, year_x, variable)
+            if pf is None:
+                continue
+            value, mean, sd = pf
+            # Probability mass within +-sd/2 of the point, as a rough confidence for readers.
+            p = 2 * norm_cdf(0.5) - 1
+            add(loc, wname, variable, {"kind": "point", "value": value}, p,
+                f"point = clim16 shrunk toward forecast {mean:.2f}±{sd:.2f} (backtest-tuned blend)", points)
+            n_points += 1
 
         for variable, wnames in THRESHOLD_JOBS:
             for wname in wnames:
@@ -331,8 +383,20 @@ def build_claims(year_x: int, daily, coords):
 
     candidates.sort(key=lambda c: (-c["_rank"], c["target"]["location_id"], c["target"]["window_start"],
                                    c["target"]["window_end"], c["target"]["variable"]))
+    # Points first (they are what Round 3 duels on), then the best other claims within the caps.
+    chosen, per_loc, seen = [], defaultdict(int), set()
+    for c in points + candidates:
+        t = c["target"]
+        key = (t["location_id"], t["window_start"], t["window_end"], t["variable"])
+        if len(chosen) >= MAX_CLAIMS:
+            break
+        if per_loc[t["location_id"]] >= MAX_PER_LOCATION or key in seen:
+            continue  # verify accepts one claim per target; the point claim already holds it
+        seen.add(key)
+        per_loc[t["location_id"]] += 1
+        chosen.append(c)
     claims = []
-    for i, c in enumerate(candidates[:MAX_CLAIMS], 1):
+    for i, c in enumerate(chosen, 1):
         claims.append({"claim_id": f"p4_{i:03d}", "target": c["target"], "assertion": c["assertion"],
                        "confidence": c["confidence"], "rationale": c["rationale"]})
     return claims

@@ -21,14 +21,13 @@ Models (climatology, trend, full, tele, tele2) compete in expanding-window CV ov
 years <= X; the one with the lowest CV MSE is the forecast, and its CV residuals
 (empirical, per window group) give the predictive distribution.
 
-Claims (one per target, <= 150), on the windows other predictors commonly use:
+Claims (one per target, <= 150 total, <= 12 per location_id):
+  * point forecasts (4 per city, >= 60 overall): ridge median blended with the
+    series' shrunk own trend, on annual/JJA/JF temperature and annual precip/counts.
   * warmer/wetter_than_year_x booleans where P(side) >= BOOL_MIN, confidence
     capped by the CV hit rate of such calls.
-  * sharp thresholds at the forecast median: "gt median" when the forecast sits
-    above the naive baselines (climatology mean, last year), else "le median".
-    Under the model each holds with ~50%, but any rival whose whole claim lies on
-    the other side of our median contradicts it and loses with probability
-    > 50% if our forecast is the better one.
+  * thresholds anchored at the trailing-history baseline, only on sides that were
+    calibrated in cross-year backtests (THRESH_SIDES).
   * hottest_month / wettest_month categoricals when the Monte Carlo argmax is
     dominant and the climatological argmax was historically reliable.
 """
@@ -115,6 +114,18 @@ if os.environ.get("P8_TMIN"):  # analysis hook: every side at this probability
                     for v in VARS}        # minimum model probability for an anchored threshold claim
 MIN_PAST = 5              # years of past data needed to standardize a target year
 MAX_CLAIMS = 150
+MAX_PER_LOC = 12          # CONTRACTS.md round 3: at most 12 claims per location_id
+# Point values blend the ridge median with the series' own trend shrunk toward the warming
+# prior. In point duels against naive point forecasters (climatology, persistence, OLS trend,
+# shrunk trend) over X=1996..2022, the blend beat the pure ridge median against every baseline;
+# temperatures did best at 0.75, precipitation and day counts at 0.5.
+PT_BLEND = {"temp": float(os.environ.get("P8_PT_BLEND", "0.75")), "other": float(os.environ.get("P8_PT_BLEND", "0.5"))}
+POINTS_PER_LOC = 4        # point claims per city (>= 60 point claims required overall)
+# point-forecast targets and their priority (how much we trust the model there x popularity)
+POINT_TARGETS = {("temp_mean_c", "ANN"): 1.0, ("temp_mean_max_c", "ANN"): 0.9,
+                 ("temp_mean_min_c", "ANN"): 0.9, ("temp_mean_c", "JJA"): 0.85,
+                 ("precip_sum_mm", "ANN"): 0.8, ("temp_mean_c", "JF"): 0.6,
+                 ("hot_days_ge_30c", "ANN"): 0.5, ("rainy_days_ge_1mm", "ANN"): 0.5}
 MODELS = ["clim", "trend", "full", "tele", "tele2"]
 LAMBDA = {"trend": 0.05, "full": 0.2, "tele": 0.4, "tele2": 0.8}
 LAMBDA = {k: v * float(os.environ.get("P8_LSCALE", "1")) for k, v in LAMBDA.items()}
@@ -544,6 +555,37 @@ def make_claims(days, meta, years, X, indices, log):
         return {"location_id": loc, "lat": lat, "lon": lon, "window_start": "%d-%s" % (T, a),
                 "window_end": "%d-%s" % (T, b), "variable": var}
 
+    # 0. point forecasts: the forecast median, which minimises expected absolute error and so
+    #    is the value most likely to be closer to the truth than a rival's point
+    point_cands = []
+    for (var, win), ww in POINT_TARGETS.items():
+        for loc in fz.locs:
+            f = fc.get(var, loc, win)
+            if f is None:
+                continue
+            fit = f[4]
+            med = fc.value_quantile(f, 0.5)
+            blend = PT_BLEND["temp" if var in TEMPS else "other"]
+            if blend:
+                s = series[var].get((loc, win), {})
+                ys = sorted(s)
+                if len(ys) >= 8:
+                    m = mean([s[y] for y in ys])
+                    ym = mean(ys)
+                    sl = sum((y - ym) * (s[y] - m) for y in ys) / sum((y - ym) ** 2 for y in ys)
+                    prior = WARMING_C_PER_YR if var in TEMPS else 0.0
+                    sl = (sl * len(ys) + prior * 8.0) / (len(ys) + 8.0)
+                    med = (1 - blend) * med + blend * (m + sl * (T - ym))
+            if var in NONNEG:
+                med = max(0.0, med)
+            point_cands.append((ww * (1 + max(0.0, fit["skill"])), loc, {
+                "target": target(loc, win, var),
+                "assertion": {"kind": "point", "value": round(med, 2)},
+                "confidence": 0.5,
+                "rationale": "Ridge-ensemble median blended with shrunk own trend (clim %.2f, CV skill %+.0f%% vs climatology); "
+                             "central 50%% band %.2f..%.2f" % (f[1], 100 * fit["skill"],
+                                                             fc.value_quantile(f, 0.25), fc.value_quantile(f, 0.75))}))
+
     # 1. warmer/wetter than year X
     for bvar, var in (("warmer_than_year_x", "temp_mean_c"), ("wetter_than_year_x", "precip_sum_mm")):
         acc = {}
@@ -649,24 +691,37 @@ def make_claims(days, meta, years, X, indices, log):
 
     if os.environ.get("P8_DUMP"):  # analysis hook: every candidate before selection
         with open(os.environ["P8_DUMP"], "w") as f:
-            json.dump([cl for _, _, cl in cands], f)
+            json.dump([cl for _, _, cl in point_cands + cands], f)
 
-    # highest priority first, round-robin across locations
+    # points first (top POINTS_PER_LOC per city), then the rest round-robin across cities,
+    # never more than MAX_PER_LOC claims per city or MAX_CLAIMS in total
+    out, seen, per_loc = [], set(), defaultdict(int)
+
+    def take(cl):
+        tg = cl["target"]
+        key = (tg["location_id"], tg["window_start"], tg["window_end"], tg["variable"])
+        if key in seen or per_loc[tg["location_id"]] >= MAX_PER_LOC or len(out) >= MAX_CLAIMS:
+            return
+        seen.add(key)
+        per_loc[tg["location_id"]] += 1
+        out.append(dict(claim_id="", **cl))
+
+    pts = defaultdict(list)
+    for pr, loc, cl in point_cands:
+        pts[loc].append((pr, cl))
+    for loc in sorted(pts):
+        for _, cl in sorted(pts[loc], key=lambda x: -x[0])[:POINTS_PER_LOC]:
+            take(cl)
     by_loc = defaultdict(list)
     for pr, loc, cl in cands:
         by_loc[loc].append((pr, cl))
     for l in by_loc:
         by_loc[l].sort(key=lambda x: -x[0])
-    out, seen, i = [], set(), 0
+    i = 0
     while len(out) < MAX_CLAIMS and any(i < len(v) for v in by_loc.values()):
         for l in sorted(by_loc, key=lambda l: -by_loc[l][i][0] if i < len(by_loc[l]) else 0):
-            if i < len(by_loc[l]) and len(out) < MAX_CLAIMS:
-                cl = by_loc[l][i][1]
-                tg = cl["target"]
-                key = (tg["location_id"], tg["window_start"], tg["window_end"], tg["variable"])
-                if key not in seen:
-                    seen.add(key)
-                    out.append(dict(claim_id="", **cl))
+            if i < len(by_loc[l]):
+                take(by_loc[l][i][1])
         i += 1
     return out
 
