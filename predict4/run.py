@@ -30,7 +30,8 @@ Temperatures use prior 0.03 C/yr (0.045 for temp_mean_max_c when X > 1995) and k
 anomalies persist into the next year). Annual
 temperature points also add ENSO_WEIGHT x a lagged-ENSO term (Round 12): the 16 residuals,
 ridge-regressed per location on the previous year's Oct-Dec Nino3.4, evaluated at year X's.
-Precipitation uses prior 0, k = 40, a = 0.2 (0.3 for X > 1995 since Round 13). These come from a Round 5 arena: the ten current
+Precipitation uses prior 0, k = 40, a = 0.2 (0.3 for X > 1995 since Round 13; 0 for JJA
+since Round 16). These come from a Round 5 arena: the ten current
 predictors run offline for X = 1985..1995 and 2003..2023 with a full 16-year history, and each
 candidate formula scored by verify's duel rule against their actual point values and the real
 X+1. Plain 16-year climatology (used in Round 4) lost badly in the fast-warming 2003..2023 era.
@@ -160,6 +161,10 @@ PRECIP_POINT_PARAMS = (0.0, 40.0, 0.2)
 # (X > 1995, no long-mean blend). X=1996..2023 precip duels, 0.2 -> 0.3: vs Round 12 rivals
 # -35 -> +12, vs Round 11 rivals 0 -> +13 (0.1: -95). For X <= 1995 it lost (+1 -> -22).
 PRECIP_RESID_POST1995 = 0.3
+# Round 16: JJA precip points carry none of year X's residual (summer rain does not persist, as
+# predict6 found). JJA point MAE X=1985..2023: 64.3 -> 63.1 mm (X <= 1995), 74.2 -> 72.1 (X > 1995);
+# duels vs Round 15 rivals (18 years) precip -21 -> 0. Older fields had no JJA precip duels.
+PRECIP_RESID_JJA = 0.0
 POINT_DECIMALS = {"precip_sum_mm": 1}        # others: 2
 VAR_WEIGHT = {"temp_mean_c": 1.0, "temp_mean_max_c": 0.7, "temp_mean_min_c": 0.7,
               "hot_days_ge_30c": 0.6, "frost_days_lt_0c": 0.6,
@@ -423,6 +428,8 @@ def point_forecast(series: dict, year_x: int, variable: str, wname: str, sond: d
         prior, k, a = PRECIP_POINT_PARAMS
         if not long_history:
             a = PRECIP_RESID_POST1995
+        if wname == "jja":
+            a = PRECIP_RESID_JJA
     line, resid_x = trend_residual(series, year_x, prior, k)
     value = line + a * resid_x
     if variable in TEMP_VARS and sond and year_x in sond and len(sond) >= MIN_YEARS:

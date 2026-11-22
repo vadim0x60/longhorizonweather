@@ -146,7 +146,7 @@ def focal_means(loc, X, w, var):
     return out
 
 
-def flat_line(loc, X, w, var, k=40.0):
+def flat_line(loc, X, w, var, k=40.0, res_w=None):
     """16-year OLS line at X+1 with its slope shrunk toward 0 (weight k/(n+k)), plus 0.2 of
     year X's residual from it. Rivals' precip points sit near this, so blending in half of it
     duels better: replays X=1981-94 -11 -> +17, X=1995-2023 (7 stations) -8 -> +6."""
@@ -163,11 +163,16 @@ def flat_line(loc, X, w, var, k=40.0):
     vb = sum(v for _, v in pts) / n
     sxx = sum((y - tb) ** 2 for y, _ in pts)
     b = n / (n + k) * (sum((y - tb) * (v - vb) for y, v in pts) / sxx if sxx else 0.0)
-    return vb + b * (X + 1 - tb) + PRECIP_RES_W * (pts[-1][1] - (vb + b * (X - tb)))
+    rw = PRECIP_RES_W if res_w is None else res_w
+    return vb + b * (X + 1 - tb) + rw * (pts[-1][1] - (vb + b * (X - tb)))
 
 
 OWN_SLOPE_K = float(os.environ.get("P2_OSK", "15"))  # pseudo-years toward the annual-mean slope
 OWN_SLOPE_YEARS = 35
+# Round 16: for X > 1995 the annual precip point uses predict6's Round 14 rule: 0.3 x (16-yr median
+# + drift x (last-5 mean - median)) + 0.7 x (shrunk line + 0.4 x year-X residual). Round 15 rivals,
+# two year sets (13 / 11 years over 1982..2024): total +9 / -50 -> -3 / -1 (precip +10 / -54 -> -2 / -5).
+P6_PRECIP = os.environ.get("P2_P6", "1") == "1"
 
 
 def own_slope(loc, X, w, var, fallback):
@@ -348,6 +353,13 @@ def main():
                     ln = flat_line(loc, X, w, var)
                     if ln is not None:
                         med = (1 - PRECIP_LINE_W) * med + PRECIP_LINE_W * ln
+                if var == "precip_sum_mm" and wname == "year" and P6_PRECIP and X - 15 >= 1980:
+                    r = [st[var] for st in (core.window_stats(loc["days"][y], *core.window_md(*w), 0.0)
+                                            for y in range(X - 15, X + 1) if y in loc["days"]) if st]
+                    ln = flat_line(loc, X, w, var, res_w=0.4)
+                    if len(r) >= 12 and ln is not None:
+                        c = sorted(r)[len(r) // 2] if len(r) % 2 else 0.5 * (sorted(r)[len(r) // 2 - 1] + sorted(r)[len(r) // 2])
+                        med = 0.3 * (c + PRECIP_DRIFT * (sum(r[-5:]) / 5 - c)) + 0.7 * ln
                 if var in TEMP3 and SOND_CARRY:
                     sond = clim16(loc, X - 1, (date(X, 9, 1).isoformat(), date(X, 12, 31).isoformat()), var)
                     stx = core.window_stats(loc["days"][X], (9, 1), (12, 31), 0.0)

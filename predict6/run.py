@@ -474,7 +474,9 @@ def point_value(ys, vs, var, f, X, win, sond=None, long_hist=None):
         yy = [y for y, _ in sel]
         ts_line = clim + theil_sen(yy, r) * (X + 1 - sum(yy) / len(yy))
         line += TS_MAX_W * (ts_line - line)
-    w = 0.3
+    # Round 16: annual max leans less on the climatology/model mix (0.3 -> 0.15); its duels
+    # vs Round 13 / 14 / 15 rivals: +6 -> +8, -13 -> +0, -3 -> +9
+    w = 0.15 if var == "temp_mean_max_c" else 0.3
     a = 0.3 if var == "temp_mean_max_c" else 0.2
     return w * mine + (1 - w) * (line + a * res + carry)
 

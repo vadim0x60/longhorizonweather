@@ -17,7 +17,7 @@ Offline, stdlib-only statistical forecaster for year X+1:
   * Claims (contract: >= 60 points, <= 12 per location, <= 150 total):
       - 80 `point` claims for ANN/MAM temp_mean_c and ANN temp_mean_max_c,
         temp_mean_min_c at all 20 locations. Point = clim + lambda*(median - clim),
-        lambda = 1.3 (1.4 for temp_mean_max_c) with >= 16 post-1980 years of record (the shrunk trend under-forecasts,
+        lambda = 1.3 with >= 16 post-1980 years of record (the shrunk trend under-forecasts,
         as predict5's walk-forward lambdas of 1.25..1.5 also find), 0.6 when the 16-year
         window reaches back before 1980, and 0.67*n/16 times that for shorter records. Those years come from the bundled
         predict3/data/era5_daily_pre1980.csv.gz (ERA5 via Open-Meteo, 1964..1979, copied
@@ -35,6 +35,8 @@ history, scored by verify/run.py on local truth, X=1985..2023; total = odd + eve
   lambda 1.3                               total +170 (odd +134, even +36)
   lambda 1.3, temp_mean_max_c 1.4          total +184 (odd +128, even +56; 1985-95 -75, 1998-2023 +248)
   rejected: lambda 1.4 for all (+139), re-adding JJA points (+98), ANN hot-day points (-33).
+  Round 16, vs Round 15 rivals: temp_mean_max_c back to 1.3: +127 -> +137 (1985-95 -46 -> -44,
+  1998-2023 +171 -> +177; vs predict4 -12 -> -2) after predict4 raised its Tmax trend; 1.5: +103.
   1985-95 is about -70 in every variant, almost all from X=1995 (-76).
 Model ablations: Sep-Dec persistence clearly helps; per-location ENSO fits hurt;
 pooled ENSO is neutral-to-slightly-positive for temperature.
@@ -65,7 +67,7 @@ PHI_MIN = 0.1            # floor on the Sep-Dec carry-over (fitted ~0.1 is biase
 PHI_MAX = 0.7            # cap on pooled persistence coefficient
 USE_PRE1980 = True       # fill X-15..1979 from predict3/data/era5_daily_pre1980.csv.gz
 PRE1980_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "era5_daily_pre1980.csv.gz")
-POINT_LAMBDA_VAR = {("ANN", "temp_mean_max_c"): 1.4}  # daily maxima warm fastest (as predict2 found); Round 12 arena +14
+POINT_LAMBDA_VAR = {}  # per-(window, variable) lambda overrides; Tmax 1.4 (Round 12) lost to 1.3 vs Round 15 rivals
 PRE1980_LAMBDA = 0.6     # extra point shrink when the window uses pre-1980 years (early era +32 vs -49 at 1.0)
 SOND_OWN = True          # carry over the variable's own Sep-Dec column (vs Sep-Dec mean temperature): +98 in the arena
 PRECIP_RECENT_W = 0.3    # precip point = clim + w * (last-3-year mean - clim), as in predict6: +54 vs model median

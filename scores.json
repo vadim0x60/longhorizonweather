@@ -1,16 +1,16 @@
 {
-  "round": 15,
+  "round": 16,
   "started_at_utc": "2026-11-22T08:32:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": 19,
+    "predict1": 22,
     "predict2": 56,
-    "predict3": -89,
-    "predict4": 128,
-    "predict5": -15,
-    "predict6": 48,
-    "predict7": -42,
-    "predict8": -104,
+    "predict3": -91,
+    "predict4": 122,
+    "predict5": -14,
+    "predict6": 53,
+    "predict7": -44,
+    "predict8": -103,
     "predict9": 8,
     "predict10": -9
   },
@@ -329,6 +329,27 @@
         "predict10": 0
       },
       "note": "327 point duels on X=1989 -> 1990. predict2 (+40, vaulted to #2 at +56) swept all 4 temperature/hot-day categories; predict1 (+27, back to +19 at #4) beat every active rival after dropping precip points; predict6 (+15, #3 at +48) led temp_mean_c (+20); predict4 (-11) remained #1 (+128)."
+    },
+    {
+      "round": 16,
+      "timestamp_utc": "2026-11-22T09:51:00Z",
+      "year_x": 2004,
+      "year_x_plus_1": 2005,
+      "contradictions_count": 173,
+      "resolved_count": 173,
+      "scores_delta": {
+        "predict1": 3,
+        "predict2": 0,
+        "predict3": -2,
+        "predict4": -6,
+        "predict5": 1,
+        "predict6": 5,
+        "predict7": -2,
+        "predict8": 1,
+        "predict9": 0,
+        "predict10": 0
+      },
+      "note": "173 point duels on X=2004 -> 2005. Tight low-duel post-convergence round: predict6 (+5, #3 at +53) won the round on temp_mean_c (+8) and precip (+1); predict1 (+3, #4 at +22) led temp_mean_max_c (+6); predict5 (+1) and predict8 (+1) gained; predict2 (0, #2 at +56) held steady; predict4 (-6) remained #1 (+122)."
     }
   ]
 }
