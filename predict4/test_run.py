@@ -156,7 +156,7 @@ class Predict4Tests(unittest.TestCase):
         sond = {y: v - 3 for y, v in full.items()}
         blended = P4.point_forecast(full, 1990, "temp_mean_c", "year", sond)[0]
         plain = P4.point_forecast(recent, 1990, "temp_mean_c", "year", sond)[0]  # 16-yr formula only
-        self.assertAlmostEqual(blended, 0.5 * plain + 0.5 * statistics.mean(full.values()), places=2)
+        self.assertAlmostEqual(blended, 0.4 * plain + 0.6 * statistics.mean(full.values()), places=2)
         gappy = {y: v for y, v in full.items() if y != 1970}  # gap: no long-mean blend
         self.assertEqual(P4.point_forecast(gappy, 1990, "temp_mean_c", "year", sond)[0], plain)
 

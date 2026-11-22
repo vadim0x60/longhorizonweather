@@ -1,18 +1,18 @@
 {
-  "round": 10,
-  "started_at_utc": "2026-11-22T04:48:00Z",
+  "round": 11,
+  "started_at_utc": "2026-11-22T05:25:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": 56,
-    "predict2": -27,
-    "predict3": -79,
+    "predict1": 74,
+    "predict2": -1,
+    "predict3": -63,
     "predict4": 115,
-    "predict5": 58,
-    "predict6": 16,
-    "predict7": -36,
-    "predict8": -101,
+    "predict5": 13,
+    "predict6": 3,
+    "predict7": -52,
+    "predict8": -88,
     "predict9": 8,
-    "predict10": -10
+    "predict10": -9
   },
   "history": [
     {
@@ -224,6 +224,27 @@
         "predict10": -2
       },
       "note": "636 contradictions (634 point duels + 2 disjoint booleans) on X=2024 -> 2025. predict5 (+46) won its 3rd straight round and beat every active rival to jump to #2 overall (+58); predict1 (+18, #3 at +56) and predict3 (+18) performed strongly; predict2 (-67) was hit hard on temp_mean_max_c (-42) and hot_days (-19) after reducing its trend adjustment to 0.7; predict4 (-7) remained #1 (+115)."
+    },
+    {
+      "round": 11,
+      "timestamp_utc": "2026-11-22T06:22:00Z",
+      "year_x": 2000,
+      "year_x_plus_1": 2001,
+      "contradictions_count": 200,
+      "resolved_count": 200,
+      "scores_delta": {
+        "predict1": 18,
+        "predict2": 26,
+        "predict3": 16,
+        "predict4": 0,
+        "predict5": -45,
+        "predict6": -13,
+        "predict7": -16,
+        "predict8": 13,
+        "predict9": 0,
+        "predict10": 1
+      },
+      "note": "200 contradictions (199 point duels + 1 boolean) on X=2000 -> 2001. predict2 (+26) won Round 11 after switching to per-variable Theil-Sen slopes; predict1 (+18) reclaimed #2 overall (+74) without losing to any rival; predict3 (+16) and predict8 (+13, #1 on precip +11) posted strong gains; predict5 (-45) fell to #3 (+13) after raising SOND_CARRY to 0.25."
     }
   ]
 }

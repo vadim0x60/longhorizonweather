@@ -123,7 +123,9 @@ LAMBDA_CAP_PER_YEAR = None
 # letting the walk-forward choose from {0, 0.2, 0.4} gave +322 (X <= 1995 -2).
 # Round 8 re-test (round-7 field, X = 1980..2023, lambda floor 0.75): 0.1 +60, 0.2 +271.
 # Adding predict4's 0.2 carry-over of year X's own residual: +154 (X <= 1995 -26), not used.
-SOND_CARRY = (0.2,)
+# Round 11 (round-10 field, X = 1980..2023): 0.2 +11 (X <= 1995 -14), 0.25 +95 (X <= 1995 +27,
+# 1996+ +68), 0.3 +31. 0.3 beat 0.2 against the round-8 and round-9 fields but lost to it vs round 7.
+SOND_CARRY = (0.25,)
 PERSISTENCE = (0.0,)     # share of year X's departure from trend carried into X+1
 POINT_ONLY_VARS = ()     # variables claimed only as points
 WF_YEARS = 10

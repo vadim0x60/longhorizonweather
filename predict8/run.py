@@ -153,6 +153,21 @@ PT_PARAMS = {"temp": (0.4, 1.0, 12, 0.015, 30.0, 0.1, 0.1),
 # The round-9 precipitation setting lost on archive years (X=1985..1992 vs the round-6 field:
 # +5 with the round-8 setting, -17 with the new one), so it keeps the old one there.
 PT_PRECIP_PRE1980 = (0.6, 0.4, 0, 0.0, 30.0, 0.1, 0.0)
+# Round 11 per-target overrides for X >= 1995 (history from 1980 on), against the round-10 field
+# over X=1997..2023 odd (point duels net, 1997-2009 / 2011-2023), keeping only changes that
+# improved both halves: W = base on the mean of the last W years instead of the full-history mean
+# (trend term measured from their centre); E = weight of a lagged-ENSO term (trend residuals
+# ridge-regressed on the previous year's Oct-Dec Nino3.4, as predict5/predict6 do).
+#   temp_mean_min_c ANN: prior .025 + E .5: -29 (-9/-20) -> -4 (+15/-19)
+#   temp_mean_c JJA: W 15: +19 (+7/+12) -> +33 (+16/+17)
+#   temp_mean_max_c ANN: W 15 + E .5: +26 (+5/+21) -> +43 (+8/+35)
+#   precip_sum_mm ANN: A .3, C .6: +39 (-6/+45) -> +77 (+21/+56)
+#   temp_mean_c ANN: nothing tried beat the current setting by more than 1 (left as is).
+PT_OVERRIDES = {("temp_mean_min_c", "ANN"): {"prior": 0.025, "E": 0.5},
+                ("temp_mean_c", "JJA"): {"W": 15},
+                ("temp_mean_max_c", "ANN"): {"W": 15, "E": 0.5},
+                ("precip_sum_mm", "ANN"): {"A": 0.3, "C": 0.6}}
+ENSO_RIDGE = 6.0           # ridge on the ENSO lag coefficient, in multiples of Nino3.4 variance
 PT_SOND_ANN = 0.2          # Sep-Nov carry for annual-window temperature points (see above)
 # Round 10: against the round-9 field over X=1981..1994 that setting lost (-24, -58 on 1981..87;
 # Round 9 scored X=1986). Dropping the ridge (fit on the flat 1964..79 decades) for the history
@@ -632,6 +647,9 @@ def make_claims(days, meta, years, X, indices, log):
     if not os.environ.get("P8_NO_PRE1980"):
         years = sorted(set(years) | set(add_pre1980(series, X)))
     fz = Featurizer(series, meta, indices)
+    nino = indices.get("nino34_anom") or {}
+    enso = {y: mean([nino[y, m] for m in (10, 11, 12)]) for y in {y for y, _ in nino}
+            if all((y, m) in nino for m in (10, 11, 12))}
     fits = {}
     for var in VARS:
         for grp in ("ANN", "SEAS", "MON"):
@@ -678,9 +696,22 @@ def make_claims(days, meta, years, X, indices, log):
         A, C, nlo, prior, k, carry, sond_w = params
         if params is PT_PARAMS["temp"] and win == "ANN":
             sond_w = PT_SOND_ANN
+        ov = PT_OVERRIDES.get((var, win), {}) if params is PT_PARAMS[fam] else {}
+        A, C, prior = ov.get("A", A), ov.get("C", C), ov.get("prior", prior)
         sl = (sl * n_sl + prior * k) / (n_sl + k)
         A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
         med = m + (A * (med - m) if med is not None else 0.0) + C * sl * (T - ym)
+        if ov.get("W"):
+            yw = [y for y in ys if y > X - ov["W"]]
+            med += mean([s[y] for y in yw]) - m + C * sl * (ym - mean(yw))
+        if ov.get("E") and X in enso:
+            pts = [(enso[y - 1], s[y] - (m + sl * (y - ym))) for y in ys if (y - 1) in enso]
+            if len(pts) >= 8:
+                nb = mean([q for q, _ in pts])
+                snn = sum((q - nb) ** 2 for q, _ in pts)
+                if snn:
+                    beta = sum((q - nb) * e for q, e in pts) / (snn + ENSO_RIDGE * snn / len(pts))
+                    med += ov["E"] * beta * (enso[X] - nb)
         if carry and X in s:
             med += carry * (s[X] - (m + sl * (X - ym)))
         if sond_w:

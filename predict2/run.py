@@ -50,6 +50,10 @@ PRECIP_RECENT = ("precip_sum_mm",)
 PRECIP_BASE = os.environ.get("P2_PB", "clim16")  # short post-1980 means mislead early years; replay -14 -> +10
 PRECIP_DRIFT = float(os.environ.get("P2_PD", "0.3"))  # + drift * (last3 - clim16), predict6-style
 PRECIP_LINE_W = float(os.environ.get("P2_PLW", "0.5"))
+# Round 11: Tmax warms faster than the annual mean, so each variable now uses its own (shrunk) slope,
+# and Tmax gets the full trend. Replays vs Round 10 rivals (TA 0.7 annual slope -> this):
+# X=1981-94 +77 -> +59, 1995-2013 odd -33 -> -35, 2014-24 -405 -> -252 (temp_mean_max_c -187 -> -70).
+TREND_ADJ_MAX = float(os.environ.get("P2_TAX", "1.0"))
 TREND_ADJ = float(os.environ.get("P2_TA", "0.7"))  # Round 9 rivals: early +2 -> +87, late20 -26 -> -1, late7 -46 -> -49
 SOND_CARRY = float(os.environ.get("P2_SC", "0.1"))  # + carry * year-X Sep-Dec anomaly, predict4-style; 0.3 lost badly in 1981-94
 PRECIP_MIN_YEAR = int(os.environ.get("P2_PMY", "0"))
@@ -151,6 +155,25 @@ def flat_line(loc, X, w, var, k=40.0):
     return vb + b * (X + 1 - tb) + 0.2 * (pts[-1][1] - (vb + b * (X - tb)))
 
 
+OWN_SLOPE_K = float(os.environ.get("P2_OSK", "15"))  # pseudo-years toward the annual-mean slope
+OWN_SLOPE_YEARS = 35
+
+
+def own_slope(loc, X, w, var, fallback):
+    """Theil-Sen slope of this window/variable over the trailing years <= X, shrunk toward the
+    annual-mean slope with OWN_SLOPE_K pseudo-years (Tmax warms faster than the annual mean)."""
+    md = core.window_md(*w)
+    ys, vs = [], []
+    for y in range(X - OWN_SLOPE_YEARS + 1, X + 1):
+        st = core.window_stats(loc["days"][y], *md, 0.0) if y in loc["days"] else None
+        if st and st.get(var) is not None:
+            ys.append(y)
+            vs.append(st[var])
+    if len(ys) < 10:
+        return fallback
+    return (core.theil_sen(ys, vs) * len(ys) + fallback * OWN_SLOPE_K) / (len(ys) + OWN_SLOPE_K)
+
+
 def seq_history(loc, X, w, var):
     """The 16 yearly values X-15..X of a window stat (input of the sequence LoRA), or None."""
     md = core.window_md(*w)
@@ -232,7 +255,9 @@ def main():
             if base_v is not None and var in TEMP3 and TREND_ADJ:
                 # the 16-yr mean is centred ~8 years before X+1: move it onto the local trend
                 y0 = X - 15 if use16 else max(1980, X - 15)
-                base_v += TREND_ADJ * info["slope"] * (X + 1 - (y0 + X) / 2)
+                sl = own_slope(loc, X, w, var, info["slope"])
+                ta = TREND_ADJ_MAX if var == "temp_mean_max_c" else TREND_ADJ
+                base_v += ta * sl * (X + 1 - (y0 + X) / 2)
             if base_v is not None:
                 lt = LAMBDA_TEMP_SHORT if X - 15 < 1980 else LAMBDA_TEMP  # data-dir history < 16 years
                 med = base_v + LAMBDA.get(var, lt) * (med - base_v)

@@ -129,6 +129,12 @@ LONG_WEIGHT = 0.5
 # 0 +52, 0.25 +164, 0.4 +211, 0.5 +201, 0.6 +150, 0.75 +112, 1.0 -66. Long-mean weight
 # at ENSO_W 0.4: 0.25 +158, 0.5 +211, 0.75 +107. Without the indices file the term is 0.
 ENSO_W = 0.4
+# Round 11, full verify vs the round-10 field, X = 1985..2023 (predict7 total /
+# temp_mean_max_c net): ENSO on max 0 / 0.2 / 0.4 / 0.6 -> +87/-62, +100/-49,
+# +107/-42, +111/-38; MAX_LAM 1.2 / 1.4 / 1.6 -> +137/-12, +140/-9, +54/-95. 1.2 is
+# chosen as the safer side of the 1.4 -> 1.6 cliff (like predict3's 1.2 lambda).
+ENSO_W_MAX = 0.4  # temp_mean_max_c
+MAX_LAM = 1.2     # temp_mean_max_c: point = clim16 + MAX_LAM * (point - clim16)
 ENSO_RIDGE = 6.0
 LONG_FIRST = 1964
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -704,20 +710,25 @@ def build_claims(year_x, data_dir):
                             rpv = residual_point(yrs, vals, target, anom)
                             w1, w2, w3 = BLEND
                             pv = round(w1 * pv + w2 * tcv + w3 * rpv, 2)
+                            pwhy = (f"{w1:.2f} x [{pwhy}] + {w2:.2f} x trend-corrected clim "
+                                    f"{tcv:.2f} (slope {slope:+.3f}/yr over {len(pre)} pre-1980 + "
+                                    f"{len(yrs)} recent yrs) + {w3:.2f} x damped trend-residual "
+                                    f"{rpv:.2f}")
                             long_ys = [y for y in range(LONG_FIRST, 1980) if y in pre]
                             if (hist_years[0] == 1980 and yrs
                                     and len(long_ys) == 1980 - LONG_FIRST):
                                 lm = (sum(pre[y] for y in long_ys) + sum(vals)) / (len(long_ys) + len(vals))
                                 pv = round((1 - LONG_WEIGHT) * pv + LONG_WEIGHT * lm, 2)
                                 pwhy += f"; then {LONG_WEIGHT:.2f} x {LONG_FIRST}..{year_x} mean {lm:.2f}"
-                            if ENSO_W:
-                                es = ENSO_W * enso_shift(yrs, vals, enso, year_x)
+                            ew = ENSO_W_MAX if var == "temp_mean_max_c" else ENSO_W
+                            if var == "temp_mean_max_c" and MAX_LAM != 1.0:
+                                c16 = sum(vals) / len(vals)
+                                pv = round(c16 + MAX_LAM * (pv - c16), 2)
+                                pwhy += f"; departure from 16-yr mean x {MAX_LAM:.2f}"
+                            if ew:
+                                es = ew * enso_shift(yrs, vals, enso, year_x)
                                 pv = round(pv + es, 2)
                                 pwhy += f"; ENSO shift {es:+.2f}"
-                            pwhy = (f"{w1:.2f} x [{pwhy}] + {w2:.2f} x trend-corrected clim "
-                                    f"{tcv:.2f} (slope {slope:+.3f}/yr over {len(pre)} pre-1980 + "
-                                    f"{len(yrs)} recent yrs) + {w3:.2f} x damped trend-residual "
-                                    f"{rpv:.2f}")
                         points.append((POINT_WIN[tag] * POINT_PRIO[var], {
                             "target": {"location_id": lid, "lat": lat, "lon": lon,
                                        "window_start": ws, "window_end": we, "variable": var},

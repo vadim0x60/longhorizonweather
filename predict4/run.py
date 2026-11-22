@@ -35,9 +35,9 @@ X+1. Plain 16-year climatology (used in Round 4) lost badly in the fast-warming 
 When the 16-year window reaches before 1980 (X < 1995), where datacollect has no data, the
 earlier years come from predict4/data/monthly_pre1980.csv (ERA5 monthly aggregates for
 1964..1979, built once by build_pre1980.py). In the arena this added +15 over X = 1985..1990.
-When that file makes the history contiguous back to 1964 (X <= 1995), the point is the average
-of the formula above and the mean of all years 1964..X: in a Round 7 arena against the Round 6
-rivals (X = 1985..1994) this cut annual temperature MAE below predict1's and raised predict4's
+When that file makes the history contiguous back to 1964 (X <= 1995), the point blends the
+formula above with the mean of all years 1964..X (LONG_MEAN_WEIGHT, 0.5 -> 0.6 in Round 11):
+in a Round 7 arena against the Round 6 rivals (X = 1985..1994) this cut annual temperature MAE below predict1's and raised predict4's
 point-duel net from +17 to +114 across all five point targets. Precipitation points give the
 1964..X mean only LONG_MEAN_WEIGHT_PRECIP (0.15, Round 10).
 
@@ -125,7 +125,9 @@ POINT_JOBS = [("temp_mean_c", "year"), ("temp_mean_c", "jja"), ("precip_sum_mm",
 # +43 -> +62 (1985-99 +33 -> +25, 2000-15 -27 -> -10, 2016-22 +37 -> +47); Round 9 grid agreed.
 POINT_PARAMS = {"year": (0.03, 40.0, 0.1), "jja": (0.03, 40.0, 0.1)}
 SOND_CARRY = 0.2   # weight of year X's Sep-Dec residual in temperature points
-LONG_MEAN_WEIGHT = 0.5   # weight of the 1964..X mean when the history is contiguous to 1964
+# Weight of the 1964..X mean when the history is contiguous to 1964. Round 11: 0.5 -> 0.6,
+# X=1985..1995 arena: vs Round 10 rivals +27 -> +64 (0.7: +7), vs Round 9 rivals +52 -> +69.
+LONG_MEAN_WEIGHT = 0.6
 # Round 10: precip points pull less toward the 1964..X mean. X=1985..1995 precip duels:
 # vs Round 9 rivals -35 -> -2, vs Round 8 rivals -19 -> -1; annual MAE 127.1 -> 125.5 mm.
 LONG_MEAN_WEIGHT_PRECIP = 0.15

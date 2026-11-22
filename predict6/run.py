@@ -426,7 +426,9 @@ def point_value(ys, vs, var, f, X, win, sond=None):
     precipitation 0.5 mine + 0.5 line. Round 7 retune against the Round 6 rivals (X=1985..2023):
     precip 0.7 -> 0.5 mine (+25 -> +72), annual temps 0.5 -> 0.3 mine (max +57 -> +74, mean
     +36 -> +39), seasonal Sep-Dec carry 0.2 -> 0.1 (JJA -17 -> -1). Anchoring the history on a
-    1964-79 archive, as several rivals now do, was tried and cut 1985-95 duels from +37 to +7."""
+    1964-79 archive, as several rivals now do, was tried and cut 1985-95 duels from +37 to +7.
+    Round 11 (seasonal points ran cold in the warm 2010s): JJA and Jan-Feb use
+    0.3 mine + 0.7 (line + 0.2 res) + sond, MAM uses mine with lam capped at 0.8 instead of 0.6."""
     sel = [(y, v) for y, v in zip(ys, vs) if y >= X - 15]
     r = [v for _, v in sel]
     clim = sum(r) / len(r)
@@ -435,7 +437,7 @@ def point_value(ys, vs, var, f, X, win, sond=None):
         mine = clim + PRECIP_RECENT_W * (sum(recent) / len(recent) - clim)
         line, res = shrunk_line([y for y, _ in sel], r, X, 0.0)
         return max(0.0, 0.5 * mine + 0.5 * (line + 0.2 * res))
-    cap = (0.5 if var == "temp_mean_min_c" else 0.8) if win == "year" else 0.6
+    cap = (0.5 if var == "temp_mean_min_c" else 0.8) if win == "year" else (0.8 if win == "mam" else 0.6)
     mine = clim + min(cap, 0.05 * len(r)) * (f["mu"] - clim)
     carry = 0.0
     if sond and X in sond and len(sond) >= 3:
@@ -443,9 +445,9 @@ def point_value(ys, vs, var, f, X, win, sond=None):
         carry = 0.2 * shrunk_line(sy, [sond[y] for y in sy], X, 0.03)[1]
     if win == "mam":
         return mine
-    if win != "year":
-        return mine + carry
     line, res = shrunk_line([y for y, _ in sel], r, X, 0.03)
+    if win != "year":  # Round 11: seasons lean 70% on the trend line (Jan-Feb +34, JJA +32)
+        return 0.3 * mine + 0.7 * (line + 0.2 * res) + carry
     if var == "temp_mean_c":
         carry *= 1.5  # Round 8: Sep-Dec weight 0.3 for annual temp_mean_c (-19 -> +9 in duels)
     w = 0.3
