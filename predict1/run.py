@@ -78,7 +78,8 @@ POINT_MIX = {"temp_mean_max_c": (0.0, 0.25), "temp_max_c": (0.0, 0.0),
 POINT_CARRY_DEFAULT = 0.1
 POINT_CARRY = {"hot_days_ge_30c": 0.0, ("temp_mean_c", "year"): 0.15, "temp_mean_max_c": 0.2,
                ("precip_sum_mm", "year"): 0.15, ("temp_mean_c", "son"): 0.05,
-               ("temp_mean_c", "jja"): 0.15}  # round 13: jja 0.1 -> 0.15 (+12 -> +16, +5 -> +14 vs round-11/12 rivals)
+               ("temp_mean_c", "jja"): 0.15,
+               ("precip_sum_mm", "jja"): 0.05}  # round 17: 0.1 -> 0.05 (vs round-16 rivals over 33 years -5 -> +13; 0.0: +10)  # round 13: jja 0.1 -> 0.15 (+12 -> +16, +5 -> +14 vs round-11/12 rivals)
 # Round 13: from X = 1995 on, annual Tmax drops the damped-trend term. (0,.25,c.2) -> (0,0,c.2)
 # from 1995: vs round-11 rivals +6 -> +20, round-12 rivals +0 -> +26; before 1995 it loses
 # (-2 -> -10 both times), so the earlier years keep the trend term.

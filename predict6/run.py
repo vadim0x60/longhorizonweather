@@ -371,6 +371,9 @@ def long_mean(pre, ys, vs, var, win, X):
 
 ENSO_POINT_W = 0.3     # lagged-ENSO point term weight (annual temp_mean/min only); Round 10: 0.5,
                        # Round 13: 0.3 (vs Round 12 rivals: mean +9 -> +19, min +3 -> +13)
+# Round 17: annual temp_mean_c takes 0.2 (temp_mean_c duels vs Round 13/14/15 rivals:
+# +12 -> +16, +10 -> +19, +12 -> +21); temp_mean_min_c keeps 0.3
+ENSO_POINT_W_VAR = {"temp_mean_c": 0.2}
 TS_MAX_W = 0.25        # Round 13: Theil-Sen share of the annual temp_mean_max_c point line
 ENSO_POINT_RIDGE = 3.0  # ridge, in multiples of the sample variance of Nino3.4
 
@@ -517,7 +520,7 @@ def candidates(rows, meta, X, enso):
                     if lm is not None:  # Round 8: annual points meet a 1964..X mean (X <= 1995)
                         pv = (1 - LONG_W[var]) * pv + LONG_W[var] * lm
                     if win == "year" and var in ("temp_mean_c", "temp_mean_min_c"):
-                        pv += ENSO_POINT_W * enso_point_shift(ys, vs, var, X, enso)
+                        pv += ENSO_POINT_W_VAR.get(var, ENSO_POINT_W) * enso_point_shift(ys, vs, var, X, enso)
                     out.append((1.0, ("point", var, wclass(win)), {
                         "target": target(loc, win, var),
                         "assertion": {"kind": "point", "value": round(pv, 2 if var in TEMP_VARS else 1)},
