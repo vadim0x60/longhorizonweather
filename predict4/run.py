@@ -29,7 +29,7 @@ Temperatures use prior 0.03 C/yr and k = 40, a = 0.1 (annual: 0.2 until Round 10
 0.2 x year X's Sep-Dec residual (late-year anomalies persist into the next year). Annual
 temperature points also add ENSO_WEIGHT x a lagged-ENSO term (Round 12): the 16 residuals,
 ridge-regressed per location on the previous year's Oct-Dec Nino3.4, evaluated at year X's.
-Precipitation uses prior 0, k = 40, a = 0.2. These come from a Round 5 arena: the ten current
+Precipitation uses prior 0, k = 40, a = 0.2 (0.3 for X > 1995 since Round 13). These come from a Round 5 arena: the ten current
 predictors run offline for X = 1985..1995 and 2003..2023 with a full 16-year history, and each
 candidate formula scored by verify's duel rule against their actual point values and the real
 X+1. Plain 16-year climatology (used in Round 4) lost badly in the fast-warming 2003..2023 era.
@@ -38,7 +38,8 @@ When the 16-year window reaches before 1980 (X < 1995), where datacollect has no
 earlier years come from predict4/data/monthly_pre1980.csv (ERA5 monthly aggregates for
 1964..1979, built once by build_pre1980.py). In the arena this added +15 over X = 1985..1990.
 When that file makes the history contiguous back to 1964 (X <= 1995), the point blends the
-formula above with the mean of all years 1964..X (LONG_MEAN_WEIGHT, 0.5 -> 0.6 in Round 11):
+formula above with the mean of all years 1964..X (LONG_MEAN_WEIGHT, 0.5 -> 0.6 in Round 11;
+0.4 for temp_mean_max_c since Round 13):
 in a Round 7 arena against the Round 6 rivals (X = 1985..1994) this cut annual temperature MAE below predict1's and raised predict4's
 point-duel net from +17 to +114 across all five point targets. Precipitation points give the
 1964..X mean only LONG_MEAN_WEIGHT_PRECIP (0.15, Round 10).
@@ -130,6 +131,10 @@ SOND_CARRY = 0.2   # weight of year X's Sep-Dec residual in temperature points
 # Weight of the 1964..X mean when the history is contiguous to 1964. Round 11: 0.5 -> 0.6,
 # X=1985..1995 arena: vs Round 10 rivals +27 -> +64 (0.7: +7), vs Round 9 rivals +52 -> +69.
 LONG_MEAN_WEIGHT = 0.6
+# Round 13: annual temp_mean_max_c leans less on the long mean (its 1964..X mean lags the
+# faster Tmax warming). X=1985..1995 temp_mean_max_c duels, 0.6 -> 0.4: vs Round 12 rivals
+# +2 -> +8, vs Round 11 -1 -> +7, vs Round 10 +2 -> +10 (0.8: -12).
+LONG_MEAN_WEIGHT_VAR = {"temp_mean_max_c": 0.4}
 # Round 10: precip points pull less toward the 1964..X mean. X=1985..1995 precip duels:
 # vs Round 9 rivals -35 -> -2, vs Round 8 rivals -19 -> -1; annual MAE 127.1 -> 125.5 mm.
 LONG_MEAN_WEIGHT_PRECIP = 0.15
@@ -143,6 +148,10 @@ ENSO_RIDGE = 6.0   # ridge on the ENSO coefficient, in pseudo-years (beta / (1 +
 ENSO = {}          # {year: Oct-Dec mean Nino3.4 anomaly}, filled by load_daily from the data dir
 LONG_FIRST_YEAR = 1964
 PRECIP_POINT_PARAMS = (0.0, 40.0, 0.2)
+# Round 13: precip points carry more of year X's residual when the history starts after 1980
+# (X > 1995, no long-mean blend). X=1996..2023 precip duels, 0.2 -> 0.3: vs Round 12 rivals
+# -35 -> +12, vs Round 11 rivals 0 -> +13 (0.1: -95). For X <= 1995 it lost (+1 -> -22).
+PRECIP_RESID_POST1995 = 0.3
 POINT_DECIMALS = {"precip_sum_mm": 1}        # others: 2
 VAR_WEIGHT = {"temp_mean_c": 1.0, "temp_mean_max_c": 0.7, "temp_mean_min_c": 0.7,
               "hot_days_ge_30c": 0.6, "frost_days_lt_0c": 0.6,
@@ -397,19 +406,22 @@ def point_forecast(series: dict, year_x: int, variable: str, wname: str, sond: d
     f = forecast(series, year_x, variable)
     if f is None:
         return None
+    long_history = all(y in series for y in range(LONG_FIRST_YEAR, year_x + 1))
     if variable in TEMP_VARS:
         prior, k, a = POINT_PARAMS.get(wname, POINT_PARAMS["year"])
     else:
         prior, k, a = PRECIP_POINT_PARAMS
+        if not long_history:
+            a = PRECIP_RESID_POST1995
     line, resid_x = trend_residual(series, year_x, prior, k)
     value = line + a * resid_x
     if variable in TEMP_VARS and sond and year_x in sond and len(sond) >= MIN_YEARS:
         value += SOND_CARRY * trend_residual(sond, year_x, prior, k)[1]
     if variable in ENSO_VARS and wname == "year" and year_x in ENSO:
         value += ENSO_WEIGHT * enso_shift(series, year_x, prior, k)
-    if all(y in series for y in range(LONG_FIRST_YEAR, year_x + 1)):
+    if long_history:
         long_mean = sum(series[y] for y in range(LONG_FIRST_YEAR, year_x + 1)) / (year_x + 1 - LONG_FIRST_YEAR)
-        lw = LONG_MEAN_WEIGHT if variable in TEMP_VARS else LONG_MEAN_WEIGHT_PRECIP
+        lw = LONG_MEAN_WEIGHT_VAR.get(variable, LONG_MEAN_WEIGHT) if variable in TEMP_VARS else LONG_MEAN_WEIGHT_PRECIP
         value = (1 - lw) * value + lw * long_mean
     if variable not in TEMP_VARS:
         value = max(value, 0.0)

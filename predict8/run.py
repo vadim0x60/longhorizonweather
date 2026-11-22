@@ -184,6 +184,13 @@ PT_TEMP_PRE1980 = (0.0, 1.0, 12, 0.015, 30.0, 0.0, 0.1)
 # local arena for X=1985..1995 (-22 -> -2 on hot days over 1985-88, +43 net over 1985-95) but
 # lost for X=1998..2023 (+24 -> +10), so "auto" shifts only when the history reaches before 1980.
 HOT_MODE = os.environ.get("P8_HOT_MODE", "auto")
+# Round 13 (predict2-style): otherwise blend in this share of the median shifted count over years
+# X-15..X. End-to-end vs round-12 rivals, 8 odd years 1997..2023: hot days +8 -> +16 (total
+# +51 -> +59); vs round-11 rivals, 8 even years 1996..2022: +9 -> +12 (total +98 -> +101).
+# Round 13 grid (round-12 field, 14 odd years; checked on the even years): Theil-Sen slopes, a
+# 16-year ENSO window, ENSO on JJA / temp_mean_c ANN and other trend priors did not win on both
+# year sets, so the round-11/12 point formulas stay.
+HOT_BLEND = float(os.environ.get("P8_HOT_BLEND", "0.5"))
 POINTS_PER_LOC = 6        # point claims per city (>= 60 point claims required overall)
 # point-forecast targets and their priority (how much we trust the model there x popularity)
 # priority = net duel score per target vs rivals' round-4 points (odd X = 1987..2011):
@@ -727,20 +734,26 @@ def make_claims(days, meta, years, X, indices, log):
                 sm, sym = mean([so[y] for y in sy]), mean(sy)
                 ss = sum((y - sym) * (so[y] - sm) for y in sy) / sum((y - sym) ** 2 for y in sy)
                 med += sond_w * (so[X] - (sm + ss * (X - sym)))
-        if var == "hot_days_ge_30c" and (HOT_MODE == "shift" or (HOT_MODE == "auto" and min(ys) < 1980)):
+        full_shift = HOT_MODE == "shift" or (HOT_MODE == "auto" and min(ys) < 1980)
+        if var == "hot_days_ge_30c" and (full_shift or HOT_BLEND):
             # shift each history year's daily highs so its mean high matches our annual
             # mean-high point forecast, count days >= 30 C, and take the median count
             tx = point_value("temp_mean_max_c", "ANN", loc)
             if tx is not None:
                 counts = []
                 for y, md in days[loc].items():
+                    if not full_shift and y <= X - 16:
+                        continue  # blend mode: years X-15..X, as predict2 does
                     v = [r[TX] for r in md.values() if r[TX] is not None]
                     if len(v) >= 360:
                         sh = tx[0] - mean(v)
                         counts.append(sum(1 for x in v if x + sh >= 30.0))
-                if len(counts) >= 1:
+                if full_shift and len(counts) >= 1:
                     counts.sort()
                     med = quantile(counts, 0.5)
+                elif len(counts) >= 8:
+                    counts.sort()
+                    med = (1 - HOT_BLEND) * med + HOT_BLEND * quantile(counts, 0.5)
         if var in NONNEG:
             med = max(0.0, med)
         return med, f, ys, s

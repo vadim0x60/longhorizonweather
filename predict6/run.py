@@ -368,7 +368,9 @@ def long_mean(pre, ys, vs, var, win, X):
     return (sum(old) + sum(new)) / (len(old) + len(new))
 
 
-ENSO_POINT_W = 0.5     # Round 10: weight of the lagged-ENSO point term (annual temp_mean/min only)
+ENSO_POINT_W = 0.3     # lagged-ENSO point term weight (annual temp_mean/min only); Round 10: 0.5,
+                       # Round 13: 0.3 (vs Round 12 rivals: mean +9 -> +19, min +3 -> +13)
+TS_MAX_W = 0.25        # Round 13: Theil-Sen share of the annual temp_mean_max_c point line
 ENSO_POINT_RIDGE = 3.0  # ridge, in multiples of the sample variance of Nino3.4
 
 
@@ -451,6 +453,12 @@ def point_value(ys, vs, var, f, X, win, sond=None):
         return 0.3 * mine + 0.7 * (line + 0.2 * res) + carry
     if var == "temp_mean_c":
         carry *= 1.5  # Round 8: Sep-Dec weight 0.3 for annual temp_mean_c (-19 -> +9 in duels)
+    if var == "temp_mean_max_c":
+        # Round 13: pull the line a quarter of the way to a Theil-Sen (median-slope) line through
+        # the same 16-y centroid; annual max duels vs Round 12 rivals -16 -> +11 (0.1..0.3 all > 0)
+        yy = [y for y, _ in sel]
+        ts_line = clim + theil_sen(yy, r) * (X + 1 - sum(yy) / len(yy))
+        line += TS_MAX_W * (ts_line - line)
     w = 0.3
     a = 0.3 if var == "temp_mean_max_c" else 0.2
     return w * mine + (1 - w) * (line + a * res + carry)

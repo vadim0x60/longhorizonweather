@@ -50,6 +50,8 @@ PRECIP_RECENT = ("precip_sum_mm",)
 PRECIP_BASE = os.environ.get("P2_PB", "clim16")  # short post-1980 means mislead early years; replay -14 -> +10
 PRECIP_DRIFT = float(os.environ.get("P2_PD", "0.3"))  # + drift * (last3 - clim16), predict6-style
 PRECIP_LINE_W = float(os.environ.get("P2_PLW", "0.5"))
+# Round 12 rivals, two year sets (13 / 11 years over 1982..2024): 0.2 -> 0.3 precip +4 -> +20 / -63 -> -47.
+PRECIP_RES_W = float(os.environ.get("P2_PRW", "0.3"))
 # Round 11: Tmax warms faster than the annual mean, so each variable now uses its own (shrunk) slope,
 # and Tmax gets the full trend. Replays vs Round 10 rivals (TA 0.7 annual slope -> this):
 # X=1981-94 +77 -> +59, 1995-2013 odd -33 -> -35, 2014-24 -405 -> -252 (temp_mean_max_c -187 -> -70).
@@ -152,7 +154,7 @@ def flat_line(loc, X, w, var, k=40.0):
     vb = sum(v for _, v in pts) / n
     sxx = sum((y - tb) ** 2 for y, _ in pts)
     b = n / (n + k) * (sum((y - tb) * (v - vb) for y, v in pts) / sxx if sxx else 0.0)
-    return vb + b * (X + 1 - tb) + 0.2 * (pts[-1][1] - (vb + b * (X - tb)))
+    return vb + b * (X + 1 - tb) + PRECIP_RES_W * (pts[-1][1] - (vb + b * (X - tb)))
 
 
 OWN_SLOPE_K = float(os.environ.get("P2_OSK", "15"))  # pseudo-years toward the annual-mean slope
@@ -194,6 +196,47 @@ def hot_shift(loc, X, tmax_point):
     counts.sort()
     n = len(counts)
     return counts[n // 2] if n % 2 else 0.5 * (counts[n // 2 - 1] + counts[n // 2])
+
+
+# Round 13 (predict4-style lagged ENSO on annual temperature points). Round 12 rivals, two year
+# sets: total -3 -> +13 / -186 -> -139; with PRECIP_RES_W 0.3 as well: +29 / -123. Weight 0.8: +12.
+ENSO_W = float(os.environ.get("P2_EW", "0.4"))
+ENSO_RIDGE = 6.0
+
+
+def load_nino_ond(data_dir, X):
+    """{year: Oct-Dec mean Nino3.4 anomaly} for years <= X from indices_monthly.json."""
+    p = os.path.join(data_dir, "indices_monthly.json")
+    if not os.path.exists(p):
+        return {}
+    with open(p) as fh:
+        rows = json.load(fh).get("series", {}).get("nino34_anom", [])
+    m = {(int(r["date"][:4]), int(r["date"][5:7])): r["value"] for r in rows
+         if r.get("value") is not None and int(r["date"][:4]) <= X}
+    return {y: sum(m[y, k] for k in (10, 11, 12)) / 3 for y, _ in m if all((y, k) in m for k in (10, 11, 12))}
+
+
+def enso_shift(loc, X, w, var, slope, nino):
+    """Per-location lagged ENSO term: residuals of X-15..X from the clim16 + slope line,
+    ridge-regressed on the previous year's Oct-Dec Nino3.4, evaluated at year X's value."""
+    md = core.window_md(*w)
+    ser = {}
+    for y in range(X - 15, X + 1):
+        st = core.window_stats(loc["days"][y], *md, 0.0) if y in loc["days"] else None
+        if st and st.get(var) is not None:
+            ser[y] = st[var]
+    if len(ser) < 10:
+        return 0.0
+    ym, vm = sum(ser) / len(ser), sum(ser.values()) / len(ser)
+    pts = [(nino[y - 1], v - (vm + slope * (y - ym))) for y, v in ser.items() if y - 1 in nino]
+    if len(pts) < 8:
+        return 0.0
+    nb = sum(e for e, _ in pts) / len(pts)
+    snn = sum((e - nb) ** 2 for e, _ in pts)
+    if not snn:
+        return 0.0
+    beta = sum((e - nb) * r for e, r in pts) / (snn * (1 + ENSO_RIDGE / len(pts)))
+    return beta * (nino[X] - nb)
 
 
 def seq_history(loc, X, w, var):
@@ -247,6 +290,7 @@ def main():
         except Exception as e:  # never fail the run on the optional LLM step
             print("regime model skipped: %r" % (e,), file=sys.stderr)
 
+    nino_ond = load_nino_ond(a.data_dir, X)
     cands, seq_req = [], []
     for lid, loc in sorted(locs.items()):
         if X not in core.complete_years(loc["days"]):
@@ -300,6 +344,8 @@ def main():
                     stx = core.window_stats(loc["days"][X], (9, 1), (12, 31), 0.0)
                     if sond is not None and stx and stx.get(var) is not None:
                         med += SOND_CARRY * (stx[var] - sond)
+                if var in TEMP3 and wname == "year" and ENSO_W and X in nino_ond:
+                    med += ENSO_W * enso_shift(loc, X, w, var, sl, nino_ond)
             hist = seq_history(loc, X, w, var)
             if hist:
                 seq_req.append((len(cands), hist, var, wname, loc["lat"]))

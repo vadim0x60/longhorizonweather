@@ -76,7 +76,13 @@ POINT_MIX = {"temp_mean_max_c": (0.0, 0.25), "temp_max_c": (0.0, 0.0),
 # +41 -> +127; earlier years: +62 -> +43, still positive). Hot days and JJA lost, so c = 0.
 POINT_CARRY_DEFAULT = 0.1
 POINT_CARRY = {"hot_days_ge_30c": 0.0, ("temp_mean_c", "year"): 0.15, "temp_mean_max_c": 0.2,
-               ("precip_sum_mm", "year"): 0.15, ("temp_mean_c", "son"): 0.05}
+               ("precip_sum_mm", "year"): 0.15, ("temp_mean_c", "son"): 0.05,
+               ("temp_mean_c", "jja"): 0.15}  # round 13: jja 0.1 -> 0.15 (+12 -> +16, +5 -> +14 vs round-11/12 rivals)
+# Round 13: from X = 1995 on, annual Tmax drops the damped-trend term. (0,.25,c.2) -> (0,0,c.2)
+# from 1995: vs round-11 rivals +6 -> +20, round-12 rivals +0 -> +26; before 1995 it loses
+# (-2 -> -10 both times), so the earlier years keep the trend term.
+LATE_FROM = 1995
+POINT_MIX_LATE = {("temp_mean_max_c", "year"): (0.0, 0.0)}
 MIN_P = 0.7  # offensive bets only with a real edge: backtests vs. rivals' claims lose below ~0.7
 DEF_W = 0.5  # weight of "honeypot" value: a likely-true claim on a target rivals often claim
 WIN_PRIOR = {"year": 0.3, "jja": 0.2, "mam": 0.1, "son": 0.1, "jf": 0.05}
@@ -536,6 +542,8 @@ class Forecaster:
         vs = [ser[y] for y in ys]
         half = 0.5 * sum(vs) / len(vs) + 0.5 * ols_predict(ys, vs, self.X + 1)
         a, b = POINT_MIX.get((var, wname), POINT_MIX.get(var, POINT_MIX_DEFAULT))
+        if self.X >= LATE_FROM:
+            a, b = POINT_MIX_LATE.get((var, wname), (a, b))
         v = (1 - a - b) * d.q(0.5) + a * half + (b * self.damped_trend(ser, var, wname) if b else 0.0)
         v += POINT_CARRY.get((var, wname), POINT_CARRY.get(var, POINT_CARRY_DEFAULT)) * (ser[self.X] - v)
         if var == "hot_days_ge_30c" and wname == "year":

@@ -160,6 +160,27 @@ class Predict4Tests(unittest.TestCase):
         gappy = {y: v for y, v in full.items() if y != 1970}  # gap: no long-mean blend
         self.assertEqual(P4.point_forecast(gappy, 1990, "temp_mean_c", "year", sond)[0], plain)
 
+    def test_precip_point_carry_by_era(self):
+        # 16-year window, slope shrunk toward 0 with k = 40; year X's residual carried 0.3 after
+        # 1995 (no long-mean blend), 0.2 when the history is contiguous back to 1964.
+        rng = random.Random(5)
+        s = {y: 600 + 4 * (y - 2005) + rng.gauss(0, 80) for y in range(1990, 2021)}
+        ys = list(range(2005, 2021))
+        tb, vb = statistics.mean(ys), statistics.mean(s[y] for y in ys)
+        b = 16 / 56 * sum((y - tb) * (s[y] - vb) for y in ys) / sum((y - tb) ** 2 for y in ys)
+        resid = s[2020] - (vb + b * (2020 - tb))
+        line = vb + b * (2021 - tb)
+        got = P4.point_forecast(s, 2020, "precip_sum_mm", "year")[0]
+        self.assertAlmostEqual(got, line + 0.3 * resid, places=1)
+        self.assertNotAlmostEqual(got, line + 0.2 * resid, places=0)
+        early = {1964: 600.0} | {y - 25: v for y, v in s.items()}  # contiguous 1964..1995
+        e_ys = list(range(1980, 1996))
+        etb, evb = statistics.mean(e_ys), statistics.mean(early[y] for y in e_ys)
+        eb = 16 / 56 * sum((y - etb) * (early[y] - evb) for y in e_ys) / sum((y - etb) ** 2 for y in e_ys)
+        e_pt = evb + eb * (1996 - etb) + 0.2 * (early[1995] - (evb + eb * (1995 - etb)))
+        expect = 0.85 * e_pt + 0.15 * statistics.mean(early.values())
+        self.assertAlmostEqual(P4.point_forecast(early, 1995, "precip_sum_mm", "year")[0], expect, places=1)
+
     def test_enso_term_tracks_lagged_nino(self):
         # Annual temperature = 10 + 0.5 x the previous year's Oct-Dec Nino3.4: the term should
         # recover 0.5, damped by the ridge factor 1 / (1 + 6/16), times (Nino[X] - its mean).
