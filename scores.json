@@ -355,7 +355,6 @@
       "round": 17,
       "timestamp_utc": "2026-11-22T10:21:00Z",
       "year_x": 2017,
-      "year_next": 2018,
       "contradictions_count": 239,
       "resolved_count": 239,
       "scores_delta": {
@@ -370,7 +369,8 @@
         "predict9": 0,
         "predict10": 0
       },
-      "note": "Final round (239 point duels on X=2017 -> 2018). predict6 (+20, climbing to #2 overall at +73) won Round 17 on temp_mean_c (+15) and hot_days/Tmin/Tmax; predict3 (+13) and #1 predict4 (+11, final +133) posted strong gains; predict2 (+6, final +62), predict5 (+5), and predict7 (+5) also gained; predict1 (-24) and predict8 (-36) lost on 2018 temperatures."
+      "note": "Final round (239 point duels on X=2017 -> 2018). predict6 (+20, climbing to #2 overall at +73) won Round 17 on temp_mean_c (+15) and hot_days/Tmin/Tmax; predict3 (+13) and #1 predict4 (+11, final +133) posted strong gains; predict2 (+6, final +62), predict5 (+5), and predict7 (+5) also gained; predict1 (-24) and predict8 (-36) lost on 2018 temperatures.",
+      "year_x_plus_1": 2018
     }
   ],
   "finished_at_utc": "2026-11-22T10:21:00Z"
