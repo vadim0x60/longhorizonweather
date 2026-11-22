@@ -1,16 +1,16 @@
 {
-  "round": 6,
-  "started_at_utc": "2026-11-22T01:54:00Z",
+  "round": 7,
+  "started_at_utc": "2026-11-22T02:32:00Z",
   "stop_at_utc": "2026-11-22T11:00:00Z",
   "scores": {
-    "predict1": 50,
-    "predict2": 1,
-    "predict3": -45,
-    "predict4": 87,
-    "predict5": -32,
-    "predict6": 4,
-    "predict7": -80,
-    "predict8": 16,
+    "predict1": 30,
+    "predict2": 14,
+    "predict3": -84,
+    "predict4": 159,
+    "predict5": -57,
+    "predict6": 18,
+    "predict7": -20,
+    "predict8": -59,
     "predict9": 2,
     "predict10": -3
   },
@@ -139,7 +139,28 @@
         "predict9": 1,
         "predict10": -2
       },
-      "note": "467 contradictions (465 point duels + 2 boolean warmer_than_year_x) on X=1988 -> 1989. predict1 (+24) fixed its GMT pre-1980 archive and beat predict4 (+2); predict2 (+19) surged after fixing its 16-year precip anchor and swept hot_days (+12); predict6 (+13) climbed into positive cumulative territory (+4); predict4 (+10) held #1 (+87); predict5 (-27) and predict7 (-20) lost on warming over-extrapolation."
+      "note": "467 contradictions (465 point duels + 2 boolean warmer_than_year_x) on X=1988 -> 1989. predict1 (+24) fixed its GMT pre-1980 archive; predict2 (+19) fixed its 16-yr precip anchor; predict6 (+13) climbed to +4; predict4 (+10) held #1 (+87)."
+    },
+    {
+      "round": 7,
+      "timestamp_utc": "2026-11-22T03:24:00Z",
+      "year_x": 2014,
+      "year_x_plus_1": 2015,
+      "contradictions_count": 506,
+      "resolved_count": 506,
+      "scores_delta": {
+        "predict1": -20,
+        "predict2": 13,
+        "predict3": -39,
+        "predict4": 72,
+        "predict5": -25,
+        "predict6": 14,
+        "predict7": 60,
+        "predict8": -75,
+        "predict9": 0,
+        "predict10": 0
+      },
+      "note": "506 point duels on X=2014 -> 2015 (El Nino onset). predict4 (+72, total +159) swept every active rival across all categories; predict7 (+60) surged on temp_mean_c (+38); predict6 (+14, #3 at +18) and predict2 (+13, #4 at +14) posted consecutive gains; predict8 (-75) suffered across all variables when its ridge CV skill was negative."
     }
   ]
 }

@@ -356,8 +356,11 @@ def point_value(ys, vs, var, f, X, win, sond=None):
     * line: 16-y OLS line with slope shrunk toward 0.03 C/y (temps) or 0 (precip), k = 40,
       plus a damped (0.2) year-X residual (predict4's form);
     * sond: 0.2 x year X's Sep-Dec residual of the same variable from that line.
-    Annual temps use 0.5 mine + 0.5 (line + sond), annual temp_mean_min 0.3 mine + 0.7 (line + sond),
-    JJA/Jan-Feb mine + sond, MAM mine, annual precipitation 0.7 mine + 0.3 line."""
+    Annual temps use 0.3 mine + 0.7 (line + sond), JJA/Jan-Feb mine + sond/2, MAM mine, annual
+    precipitation 0.5 mine + 0.5 line. Round 7 retune against the Round 6 rivals (X=1985..2023):
+    precip 0.7 -> 0.5 mine (+25 -> +72), annual temps 0.5 -> 0.3 mine (max +57 -> +74, mean
+    +36 -> +39), seasonal Sep-Dec carry 0.2 -> 0.1 (JJA -17 -> -1). Anchoring the history on a
+    1964-79 archive, as several rivals now do, was tried and cut 1985-95 duels from +37 to +7."""
     sel = [(y, v) for y, v in zip(ys, vs) if y >= X - 15]
     r = [v for _, v in sel]
     clim = sum(r) / len(r)
@@ -365,7 +368,7 @@ def point_value(ys, vs, var, f, X, win, sond=None):
         recent = r[-3:]
         mine = clim + PRECIP_RECENT_W * (sum(recent) / len(recent) - clim)
         line, res = shrunk_line([y for y, _ in sel], r, X, 0.0)
-        return max(0.0, 0.7 * mine + 0.3 * (line + 0.2 * res))
+        return max(0.0, 0.5 * mine + 0.5 * (line + 0.2 * res))
     mine = clim + min(0.8 if win == "year" else 0.6, 0.05 * len(r)) * (f["mu"] - clim)
     carry = 0.0
     if sond and X in sond and len(sond) >= 3:
@@ -374,9 +377,9 @@ def point_value(ys, vs, var, f, X, win, sond=None):
     if win == "mam":
         return mine
     if win != "year":
-        return mine + carry
+        return mine + 0.5 * carry
     line, res = shrunk_line([y for y, _ in sel], r, X, 0.03)
-    w = 0.3 if var == "temp_mean_min_c" else 0.5
+    w = 0.3
     return w * mine + (1 - w) * (line + 0.2 * res + carry)
 
 

@@ -54,7 +54,7 @@ POINT_TARGETS = [("year", "temp_mean_max_c"), ("year", "temp_mean_c"), ("year", 
 # Point forecast = (1 - a - b) * ensemble median + a * 15-yr mean/trend blend
 #                 + b * damped 16-yr trend line (see Forecaster.damped_trend).
 # (a, b) per (variable, window), else per variable, else POINT_MIX_DEFAULT. Tuned against
-# rivals' round-5 point claims over 19 held-out years (1981..2022), keeping only choices
+# rivals' round-5/6 point claims over 19 held-out years (1981..2022), keeping only choices
 # that won in both eras (before / from 1995). Temperatures need the long-history median;
 # precipitation totals drift over decades, so they lean on the recent windows.
 POINT_MIX_DEFAULT = (0.25, 0.0)
@@ -62,6 +62,7 @@ POINT_MIX = {"temp_mean_max_c": (0.0, 0.0), "temp_max_c": (0.0, 0.0),
              ("temp_mean_c", "year"): (0.0, 0.5), ("temp_mean_c", "jf"): (0.0, 0.5),
              ("temp_mean_c", "jja"): (0.0, 0.25), "temp_mean_c": (0.0, 0.0),
              "temp_mean_min_c": (0.0, 0.5),
+             "hot_days_ge_30c": (0.0, 0.0), ("precip_sum_mm", "year"): (0.25, 0.75),
              "precip_sum_mm": (0.5, 0.5), "precip_max_day_mm": (0.5, 0.0)}
 MIN_P = 0.7  # offensive bets only with a real edge: backtests vs. rivals' claims lose below ~0.7
 DEF_W = 0.5  # weight of "honeypot" value: a likely-true claim on a target rivals often claim

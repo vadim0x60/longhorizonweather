@@ -128,6 +128,17 @@ MAX_PER_LOC = 12          # CONTRACTS.md round 3: at most 12 claims per location
 #   precipitation keeps the round-4 setting A=.6 C=.4 (odd +105 / even +95, best on both halves);
 #   day counts A=1 C=.3 NLO=12 (odd +49 / even -2; round-4 setting +3 / -6).
 PT_PARAMS = {"temp": (0.8, 1.0, 12), "precip": (0.6, 0.4, 0), "count": (1.0, 0.3, 12)}
+# When the history reaches back before 1980 (X < 1995, via pre1980_monthly.csv) the 1964..79
+# decades were nearly flat, so a separate trend term only adds noise: temperature points use the
+# ridge (which has its own trend features) plus 0.1 x year X's residual from the trend line. In
+# duels vs the round-6 field over X=1985..1995: -12 with PT_PARAMS["temp"], +62 with this; for
+# X >= 1998 this setting would lose (-15 vs +1), so it is only used with the pre-1980 archive.
+PT_TEMP_PRE1980 = (0.8, 0.0, 12)
+PT_CARRY_PRE1980 = 0.1
+# Hot-day points from shifted daily highs (see point_value) beat the count-series formula in the
+# local arena for X=1985..1995 (-22 -> -2 on hot days over 1985-88, +43 net over 1985-95) but
+# lost for X=1998..2023 (+24 -> +10), so "auto" shifts only when the history reaches before 1980.
+HOT_MODE = os.environ.get("P8_HOT_MODE", "auto")
 PT_PRIOR = float(os.environ.get("P8_PT_PRIOR", "0.0"))
 PT_K = float(os.environ.get("P8_PT_K", "30"))
 POINTS_PER_LOC = 6        # point claims per city (>= 60 point claims required overall)
@@ -620,30 +631,57 @@ def make_claims(days, meta, years, X, indices, log):
     point_cands = []
     short = not any(fits.values())  # history too short for any CV fit (X <= ~1988)
     targets = {**POINT_TARGETS, **(SHORT_POINT_TARGETS if short else {})}
+    def point_value(var, win, loc):
+        """(value, ridge forecast or None, history years) for a point claim, or None."""
+        f = fc.get(var, loc, win)
+        s = series[var].get((loc, win), {})
+        ys = sorted(s)
+        if not ys:
+            return None
+        if var in COUNTS and sum(1 for y in ys if s[y] == 0) > 0.3 * len(ys):
+            return None
+        # without a CV-fitted ridge (short history): history mean + damped trend term
+        med = fc.value_quantile(f, 0.5) if f else None
+        m = mean([s[y] for y in ys])
+        ym = mean(ys)
+        sxx = sum((y - ym) ** 2 for y in ys)
+        sl = sum((y - ym) * (s[y] - m) for y in ys) / sxx if len(ys) >= 3 else 0.0
+        n_sl = len(ys) if len(ys) >= 3 else 0
+        prior = PT_PRIOR if var in TEMPS else 0.0
+        sl = (sl * n_sl + prior * PT_K) / (n_sl + PT_K)
+        A, C, nlo = PT_PARAMS["temp" if var in TEMPS else ("count" if var in COUNTS else "precip")]
+        carry = 0.0
+        if var in TEMPS and min(ys) < 1980 and not os.environ.get("P8_NO_EARLY"):
+            (A, C, nlo), carry = PT_TEMP_PRE1980, PT_CARRY_PRE1980
+        A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
+        med = m + (A * (med - m) if med is not None else 0.0) + C * sl * (T - ym)
+        if carry and X in s:
+            med += carry * (s[X] - (m + sl * (X - ym)))
+        if var == "hot_days_ge_30c" and (HOT_MODE == "shift" or (HOT_MODE == "auto" and min(ys) < 1980)):
+            # shift each history year's daily highs so its mean high matches our annual
+            # mean-high point forecast, count days >= 30 C, and take the median count
+            tx = point_value("temp_mean_max_c", "ANN", loc)
+            if tx is not None:
+                counts = []
+                for y, md in days[loc].items():
+                    v = [r[TX] for r in md.values() if r[TX] is not None]
+                    if len(v) >= 360:
+                        sh = tx[0] - mean(v)
+                        counts.append(sum(1 for x in v if x + sh >= 30.0))
+                if len(counts) >= 1:
+                    counts.sort()
+                    med = quantile(counts, 0.5)
+        if var in NONNEG:
+            med = max(0.0, med)
+        return med, f, ys, s
+
     for (var, win), ww in targets.items():
         for loc in fz.locs:
-            f = fc.get(var, loc, win)
-            s = series[var].get((loc, win), {})
-            ys = sorted(s)
-            if not ys:
+            pv = point_value(var, win, loc)
+            if pv is None:
                 continue
-            if var in COUNTS and sum(1 for y in ys if s[y] == 0) > 0.3 * len(ys):
-                continue
-            # without a CV-fitted ridge (short history): history mean + damped trend term
-            med = fc.value_quantile(f, 0.5) if f else None
+            med, f, ys, s = pv
             skill = f[4]["skill"] if f else 0.0
-            m = mean([s[y] for y in ys])
-            ym = mean(ys)
-            sxx = sum((y - ym) ** 2 for y in ys)
-            sl = sum((y - ym) * (s[y] - m) for y in ys) / sxx if len(ys) >= 3 else 0.0
-            n_sl = len(ys) if len(ys) >= 3 else 0
-            prior = PT_PRIOR if var in TEMPS else 0.0
-            sl = (sl * n_sl + prior * PT_K) / (n_sl + PT_K)
-            A, C, nlo = PT_PARAMS["temp" if var in TEMPS else ("count" if var in COUNTS else "precip")]
-            A *= min(1.0, max(0.0, (len(ys) - nlo) / (16.0 - nlo)))
-            med = m + (A * (med - m) if med is not None else 0.0) + C * sl * (T - ym)
-            if var in NONNEG:
-                med = max(0.0, med)
             how = ("history mean moved toward the ridge median (CV skill %+.0f%% vs climatology) plus damped trend"
                    % (100 * skill)) if f else "history mean plus damped trend (history too short for CV)"
             point_cands.append((ww, loc, {

@@ -17,6 +17,7 @@ Offline, stdlib only, reads only --data-dir (dates <= X-12-31).
 """
 import argparse
 import csv
+import gzip
 import json
 import math
 import os
@@ -24,9 +25,16 @@ from collections import defaultdict
 from datetime import date, timedelta
 
 MAX_CLAIMS = 150
+HERE = os.path.dirname(os.path.abspath(__file__))
+PRE1980_PATH = os.path.join(HERE, "data", "pre1980_daily.csv.gz")  # Open-Meteo archive, 1964..1979
+# Round 7 backtest (corrected data, round-6 field, X = 1980..2023): without the archive -278
+# (X <= 1995 -302), with it +56 (X <= 1995 +32, X = 1988 -26 -> +4); 1996+ unchanged at +24.
+USE_PRE1980 = True
+HISTORY_START = 1964 if USE_PRE1980 else 1980
 PER_LOCATION = 12   # CONTRACTS.md round 3: at most 12 claims per location_id
 MIN_POINTS = 60     # CONTRACTS.md round 3: at least 60 point claims
-MIN_YEARS = 5       # shortest usable history (X = 1984 has only 1980..1984)
+MIN_YEARS = 1       # shortest usable history (X = 1980 has only 1980 itself)
+WF_MIN_YEARS = 5    # shortest history used inside the walk-forward and Sep-Dec fits
 PRIOR_SLOPE_C_PER_YR = 0.025  # global-mean land warming since 1980, roughly
 PRIOR_WEIGHT_YEARS = 16.0      # prior counts like this many years of slope evidence (temperatures)
 COUNT_PRIOR_WEIGHT_YEARS = 8.0  # same, for hot/frost day counts
@@ -102,6 +110,10 @@ POINT_PLAN = [
 # been under-forecasting the last WF_YEARS years.
 DAMPINGS = (0.5, 0.75, 1.0, 1.25, 1.5)
 DEFAULT_DAMPING = 0.5
+# lambda <= this * years of history; None = no cap. Round 7 backtest (corrected data, round-6
+# field, X = 1980..2023): caps of 0.05 / 0.075 / 0.1 per year gave -409 / -313 / -269 vs -278
+# uncapped without the pre-1980 archive, and change nothing once it is used, so it stays off.
+LAMBDA_CAP_PER_YEAR = None
 # Weight of year X's Sep-Dec departure from its own shrunk trend, added to temperature points
 # (late-year ocean/ENSO anomalies persist). Round 6 backtest vs the round-5 rival field,
 # X = 1985..2023: none +277, fixed 0.1 +606 (X <= 1995 +76, 1996+ +530), 0.2 +548, 0.3 +530;
@@ -139,6 +151,17 @@ def load_daily(data_dir, max_date):
                     v = r.get(c, "")
                     vals.append(float(v) if v not in ("", None, "nan", "NaN") else None)
                 loc["days"][d] = tuple(vals)
+    # Bundled 1964..1979 archive (predict5/data), merged only for locations in --data-dir and only
+    # before the data dir's own first day, so it fills the years datacollect starts after.
+    if USE_PRE1980 and os.path.exists(PRE1980_PATH) and locs:
+        first = min(min(l["days"]) for l in locs.values())
+        with gzip.open(PRE1980_PATH, "rt", newline="") as f:
+            for r in csv.DictReader(f):
+                d = r["date"]
+                loc = locs.get(r["location_id"])
+                if loc is None or d >= first or d > max_date:
+                    continue
+                loc["days"][d] = tuple(float(r[c]) if r[c] not in ("", "nan", "NaN") else None for c in FIELDS)
     return locs
 
 
@@ -238,7 +261,7 @@ def sond_resid(sond, year, prior, pw):
     if not sond:
         return 0.0
     sub = [(t, v) for t, v in zip(*sond) if year - 15 <= t <= year]
-    if len(sub) < MIN_YEARS or sub[-1][0] != year:
+    if len(sub) < WF_MIN_YEARS or sub[-1][0] != year:
         return 0.0
     sy, sv = [t for t, _ in sub], [v for _, v in sub]
     fit = trend_forecast(sy, sv, year + 1, prior, pw)[3]
@@ -257,7 +280,7 @@ def point_damping(items, enso, x):
             if t <= x - WF_YEARS:
                 continue
             sub = [(a, b) for a, b in zip(yrs[:j], ys[:j]) if a >= t - 16]
-            if len(sub) < MIN_YEARS:
+            if len(sub) < WF_MIN_YEARS:
                 continue
             sy, sv = [a for a, _ in sub], [b for _, b in sub]
             base = sum(sv) / len(sv)
@@ -281,7 +304,7 @@ def build_pool(locs, x, enso=None):
     """Every candidate claim, possibly several per target (one per family)."""
     enso = enso or {}
     target_year = x + 1
-    hist_years = list(range(max(1980, x - 15), x + 1))
+    hist_years = list(range(max(HISTORY_START, x - 15), x + 1))
     items = []
     for lid, loc in locs.items():
         days = loc["days"]
@@ -318,13 +341,15 @@ def build_pool(locs, x, enso=None):
     for it in items:
         lid, loc, wname, s, e, wk, var = (it[k] for k in ("lid", "loc", "wname", "s", "e", "wk", "var"))
         yrs, ys, base, sd, b = it["yrs"], it["ys"], it["base"], it["sd"], it["b"]
-        sd_clim = math.sqrt(sum((v - base) ** 2 for v in ys) / (len(ys) - 1))
+        sd_clim = math.sqrt(sum((v - base) ** 2 for v in ys) / (len(ys) - 1)) if len(ys) > 1 else sd
         shift = enso_adjust(yrs, ys, it["fit"], enso, x)[0] if var in ENSO_VARS else 0.0
         pred = it["pred"] + shift
         if var not in TEMP_VARS:
             pred = max(pred, 0.0)
         # Point forecast: 15y mean plus the walk-forward-chosen share of the trend + ENSO departure.
         lm, kp, kc = lam.get((var, wk), (DEFAULT_DAMPING, 0.0, 0.0))
+        if LAMBDA_CAP_PER_YEAR is not None:
+            lm = min(lm, LAMBDA_CAP_PER_YEAR * len(yrs))  # short records: trust the trend less
         pv = (base + lm * (pred - base) + kp * (ys[-1] - it["fit"](yrs[-1]))
               + kc * sond_resid(it["sond"], x, it["prior"], it["pw"]))
         if var not in TEMP_VARS:

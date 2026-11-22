@@ -15,24 +15,27 @@ Offline, stdlib-only statistical forecaster for year X+1:
   * Mean model also carries a pooled lag-1 persistence of each variable's own
     detrended anomaly (helps precipitation and day counts).
   * Claims (contract: >= 60 points, <= 12 per location, <= 150 total):
-      - 100 `point` claims for ANN/JJA temp_mean_c and ANN precip_sum_mm,
-        temp_mean_max_c, temp_mean_min_c at all 20 locations. Point = clim +
-        lambda*(median - clim), lambda = 1 with >= 16 years of record, else 0.67*n/16:
-        short records (X near 1980) give noisy trends that lost Round 4 (X=1987).
-        Precipitation points use clim + 0.3*(last-3-year mean - clim) instead;
+      - 100 `point` claims for ANN/JJA/SON temp_mean_c and ANN temp_mean_max_c,
+        temp_mean_min_c at all 20 locations. Point = clim + lambda*(median - clim),
+        lambda = 1 with >= 16 years of record (else 0.67*n/16), times 0.6 when the
+        16-year window reaches back before 1980. Those years come from the bundled
+        predict3/data/era5_daily_pre1980.csv.gz (ERA5 via Open-Meteo, 1964..1979, copied
+        from predict2/data; it matches predict4's monthly archive to 5e-5), used only to
+        fill X-15..1979, so every record is 16 years long;
       - directional thresholds halfway between the trailing climatology and our
         median, only when P >= 0.65;
       - warmer/wetter-than-year-X booleans when P >= 0.65; hottest/wettest month.
     Non-point claims are ranked by how many rival claims a target attracts (POP,
     measured offline on past years) times the expected net margin.
 
-Dev-time evaluation (rivals' Round 5 code run offline with Tinker off, scored by
+Dev-time evaluation (rivals' Round 6 code run offline with Tinker off, scored by
 verify/run.py on locally collected truth, X=1985..1995 and 1998..2023):
-  Round 5 settings                        early +10  late +307  total +317
-  + own-column Sep-Dec carry-over         early  +2  late +413  total +415
-  + precip point clim + 0.3*(last3-clim)  early +33  late +436  total +469 (odd +351, even +118)
-The simulation reproduces live Round 5 (X=1985: predict4 -9, predict6 -2, as scored live);
-these settings give +7 there.
+  Round 6 settings                        early -14  late +213  total +199
+  SON temp points instead of precip       early -19  late +278  total +259
+  + pre-1980 fill, lambda x0.6 there      early +32  late +278  total +310 (odd +284, even +26)
+  (pre-1980 fill at full lambda: early -49; tighter trend prior and no-ENSO were not better.)
+The simulation reproduces live Round 6 (X=1988: -15 vs -13 live, with the same per-rival
+and per-variable losses); these settings give -2 there.
 Model ablations: Sep-Dec persistence clearly helps; per-location ENSO fits hurt;
 pooled ENSO is neutral-to-slightly-positive for temperature.
 
@@ -42,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import datetime as dt
 import json
 import math
@@ -58,6 +62,9 @@ LAMBDA = 0.5             # threshold position between climatology (0) and our me
 THRESHOLD_WEIGHT = 0.3   # base ranking weight of threshold claims relative to booleans
 SIGMA_INFLATE = 1.00     # calibrated so out-of-sample z-scores have ~unit spread (backtests X=2006..2023)
 PHI_MAX = 0.7            # cap on pooled persistence coefficient
+USE_PRE1980 = True       # fill X-15..1979 from predict3/data/era5_daily_pre1980.csv.gz
+PRE1980_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "era5_daily_pre1980.csv.gz")
+PRE1980_LAMBDA = 0.6     # extra point shrink when the window uses pre-1980 years (early era +32 vs -49 at 1.0)
 SOND_OWN = True          # carry over the variable's own Sep-Dec column (vs Sep-Dec mean temperature): +98 in the arena
 PRECIP_RECENT_W = 0.3    # precip point = clim + w * (last-3-year mean - clim), as in predict6: +54 vs model median
 OWN_LAG = True           # pooled lag-1 persistence of each variable's own detrended anomaly
@@ -68,9 +75,10 @@ OTHER_TREND_SHRINK = 0.5  # extra shrink of EB-weighted trends for non-temperatu
 BOOL_MIN_CONF = 0.65
 # Round 3: point duels (closer to truth wins once two points differ by min_gap). Point claims go on the
 # most contested numeric targets for every location; >= 60 are required by the contract.
-POINT_PAIRS = [("ANN", "temp_mean_c"), ("JJA", "temp_mean_c"), ("ANN", "precip_sum_mm"), ("ANN", "temp_mean_max_c"), ("ANN", "temp_mean_min_c")]
+POINT_PAIRS = [("ANN", "temp_mean_c"), ("JJA", "temp_mean_c"), ("ANN", "temp_mean_max_c"), ("ANN", "temp_mean_min_c"), ("SON", "temp_mean_c")]
+# ANN precip_sum_mm points were dropped in Round 7: -34 net vs Round 6 rivals (SON temp_mean_c: +116 net).
 MIN_POINTS = 60
-POINT_LAMBDA = {"temp": (0.67, 16), "other": (0.67, 16)}  # (short-record scale, full-record years): lambda = 1 at >= 16 yrs, else scale*n/16
+POINT_LAMBDA = {"temp": (1.0, 0.67, 16), "other": (1.0, 0.67, 16)}  # (lambda at full record, short-record scale, full-record years): point = clim + lambda*(median - clim)
 POINT_PRIORITY = 100.0   # points are placed before any other claim
 POINT_CONF = 0.59        # backtest share of point duels won vs naive climatology/trend/persistence points
 THR_MIN_CONF = 0.65
@@ -157,6 +165,20 @@ def load(data_dir):
             loc = r["location_id"]
             meta[loc] = (float(r["lat"]), float(r["lon"]))
             daily[loc][r["date"]] = {k: (float(r[k]) if r[k] != "" else None) for k in r if k not in ("location_id", "lat", "lon", "date")}
+    if USE_PRE1980:
+        # Short records (X < 1995): fill the trailing 16-year window X-15..1979 from a bundled
+        # ERA5 daily archive (Open-Meteo, same schema and GMT aggregation as datacollect),
+        # every row dated <= 1979-12-31 < X.
+        first = min(int(d[:4]) for loc in daily for d in daily[loc])
+        lo = X - 15
+        if lo < first:
+            with gzip.open(PRE1980_PATH, "rt") as f:
+                for r in csv.DictReader(f):
+                    y = int(r["date"][:4])
+                    if r["date"] > "1979-12-31":
+                        raise AssertionError("pre-1980 archive row after 1979")
+                    if lo <= y < first and r["location_id"] in daily:
+                        daily[r["location_id"]][r["date"]] = {k: (float(r[k]) if r[k] != "" else None) for k in r if k not in ("location_id", "lat", "lon", "date")}
     nino = {}
     p = os.path.join(data_dir, "indices_monthly.json")
     if os.path.exists(p):
@@ -432,9 +454,11 @@ def make_claims(X, daily, meta, models):
             # Predictive median: minimises expected absolute error, which decides point duels.
             med = inverse(m["tf"], m["mu"])
             clim = sum(m["raw"].values()) / len(m["raw"])
-            short_scale, n_full = POINT_LAMBDA["temp" if var in TEMP_VARS else "other"]
+            full, short_scale, n_full = POINT_LAMBDA["temp" if var in TEMP_VARS else "other"]
             n = len(m["raw"])
-            lam = 1.0 if n >= n_full else short_scale * n / n_full  # short records: trust trends less
+            lam = full * (1.0 if n >= n_full else short_scale * n / n_full)  # short records: trust trends less
+            if min(m["raw"]) < 1980:
+                lam *= PRE1980_LAMBDA  # pre-satellite ERA5 years make the trend less trustworthy
             pv = clim + lam * (med - clim)
             if var == "precip_sum_mm" and PRECIP_RECENT_W is not None:
                 # ERA5 rainfall drifts over a few years; the last 3 years beat the sqrt-space model here.

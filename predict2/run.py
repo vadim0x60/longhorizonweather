@@ -47,6 +47,8 @@ LAMBDA_TEMP = float(os.environ.get("P2_LT", "0.4"))  # 0.25 -> 0.4: replay +55 -
 POINT_BASE = os.environ.get("P2_BASE", "focal")
 PRECIP_RECENT = ("precip_sum_mm",)
 PRECIP_BASE = os.environ.get("P2_PB", "clim16")  # short post-1980 means mislead early years; replay -14 -> +10
+PRECIP_DRIFT = float(os.environ.get("P2_PD", "0.3"))  # + drift * (last3 - clim16), predict6-style
+SOND_CARRY = float(os.environ.get("P2_SC", "0.1"))  # + carry * year-X Sep-Dec anomaly, predict4-style; 0.3 lost badly in 1981-94
 PRECIP_MIN_YEAR = int(os.environ.get("P2_PMY", "0"))
 EPS = 0.01  # threshold margin so "le m" / "gt m" stay disjoint from rivals' gt/le at m
 TEMP3 = ("temp_mean_c", "temp_mean_max_c", "temp_mean_min_c")
@@ -206,6 +208,18 @@ def main():
             base_v = clim16(loc, X, w, var) if use16 else (fm[0] if fm else None)
             if base_v is not None:
                 med = base_v + LAMBDA.get(var, LAMBDA_TEMP) * (med - base_v)
+                c16 = clim16(loc, X, w, var)
+                if var == "precip_sum_mm" and PRECIP_DRIFT and c16 is not None:
+                    last3 = [core.window_stats(loc["days"][y], *core.window_md(*w), 0.0) for y in (X - 2, X - 1, X)
+                             if y in loc["days"]]
+                    last3 = [st[var] for st in last3 if st and st.get(var) is not None]
+                    if len(last3) == 3:
+                        med += PRECIP_DRIFT * (sum(last3) / 3 - c16)
+                if var in TEMP3 and SOND_CARRY:
+                    sond = clim16(loc, X - 1, (date(X, 9, 1).isoformat(), date(X, 12, 31).isoformat()), var)
+                    stx = core.window_stats(loc["days"][X], (9, 1), (12, 31), 0.0)
+                    if sond is not None and stx and stx.get(var) is not None:
+                        med += SOND_CARRY * (stx[var] - sond)
             hist = seq_history(loc, X, w, var)
             if hist:
                 seq_req.append((len(cands), hist, var, wname, loc["lat"]))

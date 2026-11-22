@@ -149,6 +149,17 @@ class Predict4Tests(unittest.TestCase):
         self.assertAlmostEqual(pre[("london_uk", "precip_sum_mm", "jja")][1975], 13.5)
         self.assertNotIn(("london_uk", "temp_mean_c", "year"), pre)  # incomplete year
 
+    def test_long_mean_blend_needs_contiguous_history(self):
+        rng = random.Random(7)
+        full = {y: 10 + 0.02 * (y - 1964) + rng.gauss(0, 0.4) for y in range(1964, 1991)}
+        recent = {y: v for y, v in full.items() if y >= 1975}
+        sond = {y: v - 3 for y, v in full.items()}
+        blended = P4.point_forecast(full, 1990, "temp_mean_c", "year", sond)[0]
+        plain = P4.point_forecast(recent, 1990, "temp_mean_c", "year", sond)[0]  # 16-yr formula only
+        self.assertAlmostEqual(blended, 0.5 * plain + 0.5 * statistics.mean(full.values()), places=2)
+        gappy = {y: v for y, v in full.items() if y != 1970}  # gap: no long-mean blend
+        self.assertEqual(P4.point_forecast(gappy, 1990, "temp_mean_c", "year", sond)[0], plain)
+
     def test_ignores_rows_after_year_x(self):
         a = self.run_p4(leak_value=99.0)
         b = self.run_p4(leak_value=-50.0)
